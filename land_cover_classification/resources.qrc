@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/plugins/land_cover_classification" >
+        <file>icon.png</file>
+    </qresource>
+</RCC>
