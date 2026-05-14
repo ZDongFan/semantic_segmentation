@@ -21,8 +21,8 @@ zip_build/
 Thumbs.db
 
 # 模型权重(单文件常达数百 MB,由用户自行准备,不入仓库)
-land_cover_classification/models/semantic_segmentation/**/*.pdmodel
-land_cover_classification/models/semantic_segmentation/**/*.pdiparams
-land_cover_classification/models/semantic_segmentation/**/*.pdiparams.info
+land_cover_classification/models/semantic_segmentation/*
+land_cover_classification/models/semantic_segmentation/*
+land_cover_classification/models/semantic_segmentation/*
 # 但保留 .gitkeep 以便仓库保留这个空目录
 !land_cover_classification/models/semantic_segmentation/.gitkeep
