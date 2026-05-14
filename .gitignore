@@ -1,0 +1,28 @@
+# Python 字节码与优化文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 编译后的翻译文件
+*.qm
+
+# Plugin Builder / pb_tool 构建产物
+build/
+dist/
+*.egg-info/
+zip_build/
+
+# 编辑器目录
+.vscode/
+.idea/
+
+# 系统垃圾文件
+.DS_Store
+Thumbs.db
+
+# 模型权重(单文件常达数百 MB,由用户自行准备,不入仓库)
+land_cover_classification/models/semantic_segmentation/**/*.pdmodel
+land_cover_classification/models/semantic_segmentation/**/*.pdiparams
+land_cover_classification/models/semantic_segmentation/**/*.pdiparams.info
+# 但保留 .gitkeep 以便仓库保留这个空目录
+!land_cover_classification/models/semantic_segmentation/.gitkeep
