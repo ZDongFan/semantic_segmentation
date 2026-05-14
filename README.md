@@ -1,0 +1,2 @@
+# semantic_segmentation
+用QGIS插件实现地物分类功能
