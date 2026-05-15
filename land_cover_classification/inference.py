@@ -124,6 +124,9 @@ class SegmenterTask(QgsTask):
             else:
                 self._run_plain(prepared, predictor, lut, cv2)
 
+            if self.isCanceled():
+                return False
+
             self.setProgress(100)
             return True
         except Exception as exc:  # noqa: BLE001 — 将异常传给 UI 线程显示
@@ -212,6 +215,8 @@ class SegmenterTask(QgsTask):
             return
 
         result = predictor.predict(resized)
+        if self.isCanceled():
+            return
         # 单个 ndarray 输入时 PaddleRS 可能返回包含单元素的列表,这里统一展开。
         if isinstance(result, list):
             result = result[0]
