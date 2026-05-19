@@ -26,3 +26,8 @@ land_cover_classification/models/semantic_segmentation/*
 land_cover_classification/models/semantic_segmentation/*
 # 但保留 .gitkeep 以便仓库保留这个空目录
 !land_cover_classification/models/semantic_segmentation/.gitkeep
+
+# mcp调试插件
+land_cover_classification/qgis-mcp-main
+land_cover_classification/.mcp.json
+land_cover_classification/qgis-mcp-main.zip

@@ -16,6 +16,7 @@ import math
 import os
 import os.path as osp
 import shutil
+import sys
 import tempfile
 
 from qgis.core import QgsTask, QgsMessageLog, Qgis
@@ -26,6 +27,28 @@ _LOG_TAG = "LandCoverClassification"
 
 def _log(message, level=Qgis.Info):
     QgsMessageLog.logMessage(message, _LOG_TAG, level)
+
+
+class _NullStream:
+    """提供最小 write/flush 接口的空流对象。"""
+
+    def write(self, *_args, **_kwargs):
+        return 0
+
+    def flush(self):
+        return None
+
+
+def _ensure_std_streams():
+    # 修复问题:
+    # 1. QGIS 重开后, QgsTask 后台线程中的 sys.stdout / sys.stderr 可能为 None。
+    # 2. PaddleRS 在模型加载早期会调用 sys.stdout.flush() 输出 warning/info。
+    # 3. 当标准流为 None 时, 会在后台任务里触发
+    #    "'NoneType' object has no attribute 'flush'" 并导致推理提前失败。
+    if sys.stdout is None:
+        sys.stdout = _NullStream()
+    if sys.stderr is None:
+        sys.stderr = _NullStream()
 
 
 def _adaptive_block_size():
@@ -86,6 +109,7 @@ class SegmenterTask(QgsTask):
     # --------------------------------------------------------------- QgsTask
     def run(self):
         try:
+            _ensure_std_streams()
             self._temp_dir = tempfile.mkdtemp(prefix="lcc_")
             self.setProgress(2)
 
