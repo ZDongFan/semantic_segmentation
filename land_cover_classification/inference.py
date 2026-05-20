@@ -144,7 +144,7 @@ class SegmenterTask(QgsTask):
 
             # 3. 推理
             if self.is_georef:
-                self._run_georef(prepared, predictor, slider_predict, lut, cv2)
+                self._run_georef(prepared, predictor, slider_predict, lut)
             else:
                 self._run_plain(prepared, predictor, lut, cv2)
 
@@ -164,7 +164,7 @@ class SegmenterTask(QgsTask):
             shutil.rmtree(self._temp_dir, ignore_errors=True)
 
     # --------------------------------------------------------- 带地理坐标分支
-    def _run_georef(self, prepared, predictor, slider_predict, lut, cv2):
+    def _run_georef(self, prepared, predictor, slider_predict, lut):
         block_size = _adaptive_block_size()
         slider_dir = osp.join(self._temp_dir, "slider_out")
         os.makedirs(slider_dir, exist_ok=True)
@@ -192,18 +192,12 @@ class SegmenterTask(QgsTask):
                     produced))
         self.setProgress(80)
 
-        label_map = cv2.imread(produced, cv2.IMREAD_UNCHANGED)
-        if label_map is None:
-            raise IOError("无法读取 slider_predict 的输出:{}".format(
-                produced))
-        color_rgb = lut[label_map]
-        self._write_georef_tiff(color_rgb)
+        self._write_georef_tiff(produced, lut)
         self.setProgress(95)
 
-    def _write_georef_tiff(self, color_rgb):
-        """写出 3 波段 RGB GeoTIFF,继承输入影像的地理元数据。"""
+    def _write_georef_tiff(self, label_map_path, lut):
+        """分块读取标签 GeoTIFF 并写出 3 波段 RGB GeoTIFF。"""
         from osgeo import gdal
-        import numpy as np
 
         src = gdal.Open(self.input_path)
         if src is None:
@@ -211,22 +205,54 @@ class SegmenterTask(QgsTask):
                 self.input_path))
         gt = src.GetGeoTransform()
         proj = src.GetProjection()
-        src = None
+        label_ds = gdal.Open(label_map_path)
+        if label_ds is None:
+            src = None
+            raise IOError("无法打开 slider_predict 的输出:{}".format(
+                label_map_path))
 
-        height, width = color_rgb.shape[:2]
+        label_band = label_ds.GetRasterBand(1)
+        width = label_ds.RasterXSize
+        height = label_ds.RasterYSize
+
         driver = gdal.GetDriverByName("GTiff")
         dst = driver.Create(self.output_path, width, height, 3,
                             gdal.GDT_Byte,
                             ["COMPRESS=LZW", "TILED=YES"])
+        if dst is None:
+            src = None
+            label_ds = None
+            raise IOError("创建输出 GeoTIFF 失败:{}".format(self.output_path))
         if gt is not None:
             dst.SetGeoTransform(gt)
         if proj:
             dst.SetProjection(proj)
-        # color_rgb 形状为 HxWx3,通道顺序为 RGB
-        for i in range(3):
-            dst.GetRasterBand(i + 1).WriteArray(color_rgb[:, :, i])
+
+        chunk_size = 1024
+        total_rows = max(1, height)
+        out_bands = [dst.GetRasterBand(i + 1) for i in range(3)]
+
+        for yoff in range(0, height, chunk_size):
+            ysize = min(chunk_size, height - yoff)
+            for xoff in range(0, width, chunk_size):
+                xsize = min(chunk_size, width - xoff)
+                label_block = label_band.ReadAsArray(xoff, yoff, xsize, ysize)
+                if label_block is None:
+                    dst = None
+                    label_ds = None
+                    src = None
+                    raise IOError(
+                        "读取 slider_predict 输出块失败:{} ({}, {}, {}, {})".
+                        format(label_map_path, xoff, yoff, xsize, ysize))
+
+                color_block = lut[label_block]
+                for idx, out_band in enumerate(out_bands):
+                    out_band.WriteArray(color_block[:, :, idx], xoff, yoff)
+
+            progress = 80 + int(15 * (yoff + ysize) / total_rows)
+            self.setProgress(min(progress, 95))
+
         dst.FlushCache()
-        dst = None
 
     # ---------------------------------------------------------- 普通图像分支
     def _run_plain(self, prepared, predictor, lut, cv2):
