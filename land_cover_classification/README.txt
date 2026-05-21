@@ -1,10 +1,10 @@
 Plugin Builder Results
 
-Your plugin LandCoverClassification was created in:
-    D:/item\land_cover_classification
+Your plugin LandCoverClassification was created in the current project
+workspace.
 
 Your QGIS plugin directory is located at:
-    C:/Users/1/AppData/Roaming/QGIS/QGIS3/profiles/default/python/plugins
+    <QGIS profile>/python/plugins
 
 What's Next:
 

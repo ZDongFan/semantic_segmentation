@@ -96,31 +96,40 @@ class SegmenterTask(QgsTask):
     """在后台执行一次 PaddleRS 分割推理。"""
 
     def __init__(self, description, model_path, input_path, output_path,
-                 preprocess_flags, is_georef):
+                 preprocess_flags, is_georef, progress_callback=None):
         super().__init__(description, QgsTask.CanCancel)
         self.model_path = model_path
         self.input_path = input_path
         self.output_path = output_path
         self.preprocess_flags = preprocess_flags or {}
         self.is_georef = is_georef
+        self.progress_callback = progress_callback
         self.exception = None
         self._temp_dir = None
 
     # --------------------------------------------------------------- QgsTask
+    def _set_progress(self, progress):
+        self.setProgress(progress)
+        if self.progress_callback is not None:
+            try:
+                self.progress_callback(progress)
+            except Exception as exc:  # noqa: BLE001 - progress is best effort.
+                _log("Progress callback failed:{}".format(exc), Qgis.Warning)
+
     def run(self):
         try:
             _ensure_std_streams()
             self._temp_dir = tempfile.mkdtemp(prefix="lcc_")
-            self.setProgress(2)
+            self._set_progress(2)
 
             # 1. 可选预处理
             from . import preprocess
-            self.setProgress(5)
+            self._set_progress(5)
             if self.isCanceled():
                 return False
             prepared = preprocess.apply_chain(
                 self.input_path, self.preprocess_flags, self._temp_dir)
-            self.setProgress(15)
+            self._set_progress(15)
             if self.isCanceled():
                 return False
 
@@ -136,7 +145,7 @@ class SegmenterTask(QgsTask):
             _log("加载 predictor:{}(use_gpu={})".format(
                 self.model_path, use_gpu))
             predictor = pdrs.deploy.Predictor(self.model_path, use_gpu=use_gpu)
-            self.setProgress(30)
+            self._set_progress(30)
             if self.isCanceled():
                 return False
 
@@ -151,7 +160,7 @@ class SegmenterTask(QgsTask):
             if self.isCanceled():
                 return False
 
-            self.setProgress(100)
+            self._set_progress(100)
             return True
         except Exception as exc:  # noqa: BLE001 — 将异常传给 UI 线程显示
             self.exception = exc
@@ -190,10 +199,10 @@ class SegmenterTask(QgsTask):
             raise IOError(
                 "slider_predict 未生成预期的输出文件:{}".format(
                     produced))
-        self.setProgress(80)
+        self._set_progress(80)
 
         self._write_georef_tiff(produced, lut)
-        self.setProgress(95)
+        self._set_progress(95)
 
     def _write_georef_tiff(self, label_map_path, lut):
         """分块读取标签 GeoTIFF 并写出 3 波段 RGB GeoTIFF。"""
@@ -250,7 +259,7 @@ class SegmenterTask(QgsTask):
                     out_band.WriteArray(color_block[:, :, idx], xoff, yoff)
 
             progress = 80 + int(15 * (yoff + ysize) / total_rows)
-            self.setProgress(min(progress, 95))
+            self._set_progress(min(progress, 95))
 
         dst.FlushCache()
 
@@ -260,7 +269,7 @@ class SegmenterTask(QgsTask):
         if img is None:
             raise IOError("cv2 无法读取影像:{}".format(prepared))
         resized = cv2.resize(img, (512, 512))
-        self.setProgress(50)
+        self._set_progress(50)
         if self.isCanceled():
             return
 
@@ -271,10 +280,10 @@ class SegmenterTask(QgsTask):
         if isinstance(result, list):
             result = result[0]
         label_map = result["label_map"]
-        self.setProgress(80)
+        self._set_progress(80)
 
         color_rgb = lut[label_map]
         color_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
         if not cv2.imwrite(self.output_path, color_bgr):
             raise IOError("cv2.imwrite 写出失败:{}".format(self.output_path))
-        self.setProgress(95)
+        self._set_progress(95)
