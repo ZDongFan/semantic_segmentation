@@ -31,9 +31,9 @@ python -m pip install --upgrade python-dateutil
 
 ## GPU(CUDA)
 
-把 `paddlepaddle` 换成 `paddlepaddle-gpu==2.4.2.post<CUDA 版本>`
-(例如 CUDA 11.7 对应 `paddlepaddle-gpu==2.4.2.post117`),并到
-<https://www.paddlepaddle.org.cn/install/quick> 选择对应平台的 `-f`
+把 `paddlepaddle` 换成 `paddlepaddle_gpu==2.4.2.post<CUDA 版本>`
+(例如 CUDA 11.7 对应 `paddlepaddle_gpu==2.4.2.post117`),并到
+<https://www.paddlepaddle.org.cn/install/old> 选择对应平台的 `-f`
 镜像源 URL。
 
 ## GDAL

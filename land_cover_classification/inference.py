@@ -18,6 +18,8 @@ import os.path as osp
 import shutil
 import sys
 import tempfile
+import threading
+import time
 
 from qgis.core import QgsTask, QgsMessageLog, Qgis
 
@@ -179,17 +181,28 @@ class SegmenterTask(QgsTask):
         os.makedirs(slider_dir, exist_ok=True)
         _log("执行 slider_predict(block_size={}, overlap=64)".format(
             block_size))
-        slider_predict(
-            predict_func=predictor.predict,
-            img_file=prepared,
-            save_dir=slider_dir,
-            block_size=block_size,
-            overlap=64,
-            transforms=None,
-            merge_strategy="keep_last",
-            batch_size=1,
-            invalid_value=0,
+        progress_stop = threading.Event()
+        progress_thread = threading.Thread(
+            target=self._report_slider_progress,
+            args=(prepared, block_size, 64, progress_stop),
         )
+        progress_thread.daemon = True
+        progress_thread.start()
+        try:
+            slider_predict(
+                predict_func=predictor.predict,
+                img_file=prepared,
+                save_dir=slider_dir,
+                block_size=block_size,
+                overlap=64,
+                transforms=None,
+                merge_strategy="keep_last",
+                batch_size=1,
+                invalid_value=0,
+            )
+        finally:
+            progress_stop.set()
+            progress_thread.join(1.0)
         if self.isCanceled():
             return
 
@@ -203,6 +216,44 @@ class SegmenterTask(QgsTask):
 
         self._write_georef_tiff(produced, lut)
         self._set_progress(95)
+
+    def _report_slider_progress(self, image_path, block_size, overlap, stop_event):
+        """在 PaddleRS slider_predict 运行期间回报估算进度。"""
+        total_blocks = self._estimate_slider_block_count(
+            image_path, block_size, overlap)
+        if total_blocks <= 0:
+            total_blocks = 1
+        # 当前 PaddleRS slider_predict 没有暴露逐窗口回调。这里让界面保持推进，
+        # 但把 80-100% 留给已确认完成的滑窗推理和写出阶段。
+        estimated_seconds = max(8.0, min(300.0, total_blocks * 0.8))
+        start_time = time.time()
+        last_progress = 30
+        while not stop_event.wait(1.0):
+            if self.isCanceled():
+                return
+            elapsed = time.time() - start_time
+            ratio = 1.0 - math.exp(-elapsed / estimated_seconds)
+            progress = 30 + int(49 * ratio)
+            progress = max(last_progress, min(progress, 79))
+            if progress > last_progress:
+                self._set_progress(progress)
+                last_progress = progress
+
+    def _estimate_slider_block_count(self, image_path, block_size, overlap):
+        try:
+            from osgeo import gdal
+        except ImportError:
+            return 0
+        ds = gdal.Open(image_path)
+        if ds is None:
+            return 0
+        width = ds.RasterXSize
+        height = ds.RasterYSize
+        ds = None
+        stride = max(1, block_size - overlap)
+        x_blocks = max(1, int(math.ceil(max(1, width - overlap) / stride)))
+        y_blocks = max(1, int(math.ceil(max(1, height - overlap) / stride)))
+        return x_blocks * y_blocks
 
     def _write_georef_tiff(self, label_map_path, lut):
         """分块读取标签 GeoTIFF 并写出 3 波段 RGB GeoTIFF。"""

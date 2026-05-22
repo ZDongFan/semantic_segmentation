@@ -77,7 +77,7 @@ def installation_hint(missing):
     else:
         lines.extend([
             "请前往以下页面选择对应平台的安装包:",
-            "  https://www.paddlepaddle.org.cn/install/quick",
+            "  https://www.paddlepaddle.org.cn/install/old",
             "然后安装 paddlepaddle==2.4.2,再执行(把路径替换为本机 QGIS 插件目录):",
             "  python -m pip install -r "
             ".../python/plugins/land_cover_classification/vendor/PaddleRS"
@@ -87,8 +87,8 @@ def installation_hint(missing):
     lines.extend([
         "",
         "如使用 GPU,请把 `paddlepaddle` 换成 "
-        "`paddlepaddle-gpu==2.4.2.post<CUDA 版本>`,",
-        "并到 https://www.paddlepaddle.org.cn/install/quick 选对应镜像源 URL。",
+        "`paddlepaddle_gpu==2.4.2.post<CUDA 版本>`,",
+        "并到 https://www.paddlepaddle.org.cn/install/old 选对应镜像源 URL。",
         "",
         "安装完成后请重启 QGIS。",
     ])
