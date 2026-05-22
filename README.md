@@ -30,7 +30,7 @@
 ## 仓库结构
 
 ```text
-new_semantic_segmentation/
+semantic_segmentation/
 ├─ README.md                           # 项目说明文档
 ├─ LICENSE                             # 开源许可证
 ├─ docs/                               # 额外文档
