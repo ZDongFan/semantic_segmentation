@@ -18,8 +18,6 @@ import os.path as osp
 import shutil
 import sys
 import tempfile
-import threading
-import time
 
 from qgis.core import QgsTask, QgsMessageLog, Qgis
 
@@ -181,28 +179,34 @@ class SegmenterTask(QgsTask):
         os.makedirs(slider_dir, exist_ok=True)
         _log("执行 slider_predict(block_size={}, overlap=64)".format(
             block_size))
-        progress_stop = threading.Event()
-        progress_thread = threading.Thread(
-            target=self._report_slider_progress,
-            args=(prepared, block_size, 64, progress_stop),
+        total_blocks = self._estimate_slider_block_count(
+            prepared, block_size, 64)
+        completed_blocks = [0]
+        last_progress = [30]
+
+        def predict_with_progress(batch_data, transforms=None):
+            result = predictor.predict(batch_data, transforms=transforms)
+            completed_blocks[0] = min(
+                total_blocks, completed_blocks[0] + len(batch_data))
+            progress = 30 + int(49 * completed_blocks[0] /
+                                max(1, total_blocks))
+            progress = min(progress, 79)
+            if progress > last_progress[0]:
+                self._set_progress(progress)
+                last_progress[0] = progress
+            return result
+
+        slider_predict(
+            predict_func=predict_with_progress,
+            img_file=prepared,
+            save_dir=slider_dir,
+            block_size=block_size,
+            overlap=64,
+            transforms=None,
+            merge_strategy="keep_last",
+            batch_size=1,
+            invalid_value=0,
         )
-        progress_thread.daemon = True
-        progress_thread.start()
-        try:
-            slider_predict(
-                predict_func=predictor.predict,
-                img_file=prepared,
-                save_dir=slider_dir,
-                block_size=block_size,
-                overlap=64,
-                transforms=None,
-                merge_strategy="keep_last",
-                batch_size=1,
-                invalid_value=0,
-            )
-        finally:
-            progress_stop.set()
-            progress_thread.join(1.0)
         if self.isCanceled():
             return
 
@@ -217,28 +221,6 @@ class SegmenterTask(QgsTask):
         self._write_georef_tiff(produced, lut)
         self._set_progress(95)
 
-    def _report_slider_progress(self, image_path, block_size, overlap, stop_event):
-        """在 PaddleRS slider_predict 运行期间回报估算进度。"""
-        total_blocks = self._estimate_slider_block_count(
-            image_path, block_size, overlap)
-        if total_blocks <= 0:
-            total_blocks = 1
-        # 当前 PaddleRS slider_predict 没有暴露逐窗口回调。这里让界面保持推进，
-        # 但把 80-100% 留给已确认完成的滑窗推理和写出阶段。
-        estimated_seconds = max(8.0, min(300.0, total_blocks * 0.8))
-        start_time = time.time()
-        last_progress = 30
-        while not stop_event.wait(1.0):
-            if self.isCanceled():
-                return
-            elapsed = time.time() - start_time
-            ratio = 1.0 - math.exp(-elapsed / estimated_seconds)
-            progress = 30 + int(49 * ratio)
-            progress = max(last_progress, min(progress, 79))
-            if progress > last_progress:
-                self._set_progress(progress)
-                last_progress = progress
-
     def _estimate_slider_block_count(self, image_path, block_size, overlap):
         try:
             from osgeo import gdal
@@ -251,8 +233,8 @@ class SegmenterTask(QgsTask):
         height = ds.RasterYSize
         ds = None
         stride = max(1, block_size - overlap)
-        x_blocks = max(1, int(math.ceil(max(1, width - overlap) / stride)))
-        y_blocks = max(1, int(math.ceil(max(1, height - overlap) / stride)))
+        x_blocks = max(1, int(math.ceil(width / float(stride))))
+        y_blocks = max(1, int(math.ceil(height / float(stride))))
         return x_blocks * y_blocks
 
     def _write_georef_tiff(self, label_map_path, lut):
