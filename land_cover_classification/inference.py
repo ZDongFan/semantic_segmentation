@@ -16,6 +16,7 @@ import math
 import os
 import os.path as osp
 import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -60,14 +61,32 @@ def _adaptive_block_size():
 
     if (paddle.device.is_compiled_with_cuda()
             and paddle.device.get_device().startswith("gpu")):
-        gpu_mb = paddle.device.cuda.max_memory_allocated() / 1024 / 1024
-        if gpu_mb <= 0:
+        device = paddle.device.get_device()
+        try:
+            device_id = int(device.split(":", 1)[1])
+        except (IndexError, ValueError):
+            device_id = 0
+
+        try:
+            output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    str(device_id),
+                ],
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+            )
+            gpu_mb = float(output.strip().splitlines()[0])
+        except (OSError, subprocess.CalledProcessError, ValueError, IndexError):
             return 512
-        ratio = 0.3
-        base_mb = 8192
-        base_block = 512
-        calculated = int(base_block * math.sqrt((gpu_mb * ratio) / base_mb))
-        return max(256, (calculated // 32) * 32)
+        if gpu_mb >= 10000:
+            return 1024
+        if gpu_mb >= 6000:
+            return 768
+        return 512
     return 512
 
 
