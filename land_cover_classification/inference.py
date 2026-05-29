@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """地物分类插件的后台推理任务。
 
-`SegmenterTask` 在 QgsTask 中运行 PaddleRS 推理,因此 QGIS 主线程
-(以及地图画布)不会被阻塞。流程:
+`SegmenterTask` 仍以 QgsTask 形式组织推理流程，但实际由独立 Python
+子进程直接调用 `run()` 执行，以隔离 PaddleRS / 原生库异常，避免拖垮
+QGIS 主进程。当前流程:
 
   1. 可选的预处理链
   2. 加载 predictor(若可用则使用 GPU)
   3. 带地理坐标的 TIFF 走 `slider_predict`;普通 RGB 图像 resize 到
-     512×512 再走一次 `predict()`
-  4. 用 PaddleRS 自带的 256 色 LUT 给标签图上色
-  5. 写出结果(带地理坐标输入对应输出 GeoTIFF,否则输出 PNG/TIFF)
+     512×512 推理后再按原尺寸回采样
+  4. 输出单波段类别编号 GeoTIFF，供 QGIS 对话框后续矢量化、确认和导出
 """
 
 import math
@@ -126,14 +126,13 @@ class SegmenterTask(QgsTask):
         self.exception = None
         self._temp_dir = None
 
-    # --------------------------------------------------------------- QgsTask
     def _set_progress(self, progress):
         self.setProgress(progress)
         if self.progress_callback is not None:
             try:
                 self.progress_callback(progress)
-            except Exception as exc:  # noqa: BLE001 - progress is best effort.
-                _log("Progress callback failed:{}".format(exc), Qgis.Warning)
+            except Exception as exc:  # noqa: BLE001 - 进度回调失败不应中断推理。
+                _log("进度回调执行失败:{}".format(exc), Qgis.Warning)
 
     def run(self):
         try:
@@ -158,7 +157,6 @@ class SegmenterTask(QgsTask):
             import paddle
             import paddlers as pdrs
             from paddlers.tasks.utils.slider_predict import slider_predict
-            from paddlers.tasks.utils.visualize import get_color_map_list
 
             use_gpu = paddle.device.is_compiled_with_cuda()
             _log("加载 predictor:{}(use_gpu={})".format(
@@ -168,20 +166,18 @@ class SegmenterTask(QgsTask):
             if self.isCanceled():
                 return False
 
-            lut = np.array(get_color_map_list(256), dtype=np.uint8)
-
             # 3. 推理
             if self.is_georef:
-                self._run_georef(prepared, predictor, slider_predict, lut)
+                self._run_georef(prepared, predictor, slider_predict)
             else:
-                self._run_plain(prepared, predictor, lut, cv2)
+                self._run_plain(prepared, predictor, cv2, np)
 
             if self.isCanceled():
                 return False
 
             self._set_progress(100)
             return True
-        except Exception as exc:  # noqa: BLE001 — 将异常传给 UI 线程显示
+        except Exception as exc:  # noqa: BLE001
             self.exception = exc
             _log("SegmenterTask 失败:{}".format(exc), Qgis.Critical)
             return False
@@ -191,8 +187,8 @@ class SegmenterTask(QgsTask):
         if self._temp_dir and osp.isdir(self._temp_dir):
             shutil.rmtree(self._temp_dir, ignore_errors=True)
 
-    # --------------------------------------------------------- 带地理坐标分支
-    def _run_georef(self, prepared, predictor, slider_predict, lut):
+    def _run_georef(self, prepared, predictor, slider_predict):
+        """带地理坐标输入走滑窗预测，并保留原始地理参考。"""
         block_size = _adaptive_block_size()
         slider_dir = osp.join(self._temp_dir, "slider_out")
         os.makedirs(slider_dir, exist_ok=True)
@@ -237,7 +233,7 @@ class SegmenterTask(QgsTask):
                     produced))
         self._set_progress(80)
 
-        self._write_georef_tiff(produced, lut)
+        self._write_georef_label_tiff(produced)
         self._set_progress(95)
 
     def _estimate_slider_block_count(self, image_path, block_size, overlap):
@@ -256,30 +252,32 @@ class SegmenterTask(QgsTask):
         y_blocks = max(1, int(math.ceil(height / float(stride))))
         return x_blocks * y_blocks
 
-    def _write_georef_tiff(self, label_map_path, lut):
-        """分块读取标签 GeoTIFF 并写出 3 波段 RGB GeoTIFF。"""
+    def _write_georef_label_tiff(self, label_map_path):
+        """把滑窗输出的类别图写成单波段 GeoTIFF，并复制输入地理参考。"""
         from osgeo import gdal
 
         src = gdal.Open(self.input_path)
         if src is None:
-            raise IOError("重新打开输入获取地理元数据失败:{}".format(
+            raise IOError("无法重新打开输入影像以读取地理参考信息:{}".format(
                 self.input_path))
         gt = src.GetGeoTransform()
         proj = src.GetProjection()
+
         label_ds = gdal.Open(label_map_path)
         if label_ds is None:
             src = None
             raise IOError("无法打开 slider_predict 的输出:{}".format(
                 label_map_path))
 
-        label_band = label_ds.GetRasterBand(1)
-        width = label_ds.RasterXSize
-        height = label_ds.RasterYSize
-
         driver = gdal.GetDriverByName("GTiff")
-        dst = driver.Create(self.output_path, width, height, 3,
-                            gdal.GDT_Byte,
-                            ["COMPRESS=LZW", "TILED=YES"])
+        dst = driver.Create(
+            self.output_path,
+            label_ds.RasterXSize,
+            label_ds.RasterYSize,
+            1,
+            gdal.GDT_Byte,
+            ["COMPRESS=LZW", "TILED=YES"],
+        )
         if dst is None:
             src = None
             label_ds = None
@@ -289,34 +287,20 @@ class SegmenterTask(QgsTask):
         if proj:
             dst.SetProjection(proj)
 
-        chunk_size = 1024
-        total_rows = max(1, height)
-        out_bands = [dst.GetRasterBand(i + 1) for i in range(3)]
-
-        for yoff in range(0, height, chunk_size):
-            ysize = min(chunk_size, height - yoff)
-            for xoff in range(0, width, chunk_size):
-                xsize = min(chunk_size, width - xoff)
-                label_block = label_band.ReadAsArray(xoff, yoff, xsize, ysize)
-                if label_block is None:
-                    dst = None
-                    label_ds = None
-                    src = None
-                    raise IOError(
-                        "读取 slider_predict 输出块失败:{} ({}, {}, {}, {})".
-                        format(label_map_path, xoff, yoff, xsize, ysize))
-
-                color_block = lut[label_block]
-                for idx, out_band in enumerate(out_bands):
-                    out_band.WriteArray(color_block[:, :, idx], xoff, yoff)
-
-            progress = 80 + int(15 * (yoff + ysize) / total_rows)
-            self._set_progress(min(progress, 95))
-
+        data = label_ds.GetRasterBand(1).ReadAsArray()
+        if data is None:
+            src = None
+            label_ds = None
+            dst = None
+            raise IOError("无法读取类别栅格:{}".format(label_map_path))
+        dst.GetRasterBand(1).WriteArray(data.astype("uint8"))
         dst.FlushCache()
+        src = None
+        label_ds = None
+        dst = None
 
-    # ---------------------------------------------------------- 普通图像分支
-    def _run_plain(self, prepared, predictor, lut, cv2):
+    def _run_plain(self, prepared, predictor, cv2, np):
+        """普通影像走整图预测，并把类别图回采样到原始尺寸。"""
         img = cv2.imread(prepared, cv2.IMREAD_COLOR)
         if img is None:
             raise IOError("cv2 无法读取影像:{}".format(prepared))
@@ -328,14 +312,35 @@ class SegmenterTask(QgsTask):
         result = predictor.predict(resized)
         if self.isCanceled():
             return
-        # 单个 ndarray 输入时 PaddleRS 可能返回包含单元素的列表,这里统一展开。
         if isinstance(result, list):
             result = result[0]
         label_map = result["label_map"]
+        label_map = cv2.resize(
+            label_map.astype(np.uint8),
+            (img.shape[1], img.shape[0]),
+            interpolation=cv2.INTER_NEAREST)
         self._set_progress(80)
 
-        color_rgb = lut[label_map]
-        color_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
-        if not cv2.imwrite(self.output_path, color_bgr):
-            raise IOError("cv2.imwrite 写出失败:{}".format(self.output_path))
+        self._write_plain_label_tiff(label_map, np)
         self._set_progress(95)
+
+    def _write_plain_label_tiff(self, label_map, np):
+        """把普通影像预测得到的类别图写成单波段 GeoTIFF。"""
+        from osgeo import gdal
+
+        height, width = label_map.shape[:2]
+        driver = gdal.GetDriverByName("GTiff")
+        dst = driver.Create(
+            self.output_path,
+            width,
+            height,
+            1,
+            gdal.GDT_Byte,
+            ["COMPRESS=LZW", "TILED=YES"],
+        )
+        if dst is None:
+            raise IOError("无法创建类别 GeoTIFF:{}".format(
+                self.output_path))
+        dst.GetRasterBand(1).WriteArray(label_map.astype(np.uint8))
+        dst.FlushCache()
+        dst = None

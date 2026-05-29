@@ -171,7 +171,7 @@ def main(argv=None):
         ok = task.run()
         task.finished(ok)
         if ok:
-            _emit("done", output_path=params["output_path"])
+            _emit("done", label_path=params["output_path"])
             return 0
         message = str(task.exception) if task.exception else "推理失败。"
         _emit("error", message=message)

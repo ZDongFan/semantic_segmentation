@@ -6,19 +6,35 @@ import os
 import sys
 import tempfile
 
-from qgis.PyQt import uic
+from qgis.PyQt import sip, uic
 from qgis.PyQt import QtWidgets
-from qgis.PyQt.QtCore import QProcess, QProcessEnvironment, QSettings, QUrl
-from qgis.PyQt.QtGui import QDesktopServices
+from qgis.PyQt.QtCore import (
+    QProcess,
+    QProcessEnvironment,
+    QSettings,
+    QUrl,
+    QVariant,
+)
+from qgis.PyQt.QtGui import QColor, QDesktopServices
 
 from qgis.core import (
     QgsApplication,
+    QgsCategorizedSymbolRenderer,
+    QgsFeature,
+    QgsField,
+    QgsFillSymbol,
     QgsMapLayerProxyModel,
+    QgsProject,
+    QgsRendererCategory,
+    QgsVectorFileWriter,
+    QgsVectorLayer,
+    QgsWkbTypes,
     Qgis,
 )
 from qgis.gui import QgsFileWidget
 
 from .inference import is_georeferenced
+from .model_scan import get_model_info
 from .model_scan import scan as scan_models
 
 
@@ -27,6 +43,13 @@ FORM_CLASS, _ = uic.loadUiType(
                  "land_cover_classification_dialog_base.ui"))
 
 SETTINGS_GROUP = "LandCoverClassification"
+FIELD_CLASS_ID = "class_id"
+FIELD_CLASS_NAME = "class_name"
+FIELD_REVIEW_STATUS = "review_status"
+FIELD_SOURCE_ID = "source_id"
+BACKGROUND_CLASS_NAMES = {"sliding"}
+STATUS_PENDING = "待确认"
+STATUS_CONFIRMED = "已确认"
 
 
 def _default_model_root():
@@ -102,14 +125,6 @@ def _qgis_relative_path(*parts):
 def _qgis_pkg_data_path():
     try:
         path = QgsApplication.pkgDataPath()
-    except AttributeError:
-        path = None
-    return path if path and os.path.isdir(path) else None
-
-
-def _qgis_plugin_path():
-    try:
-        path = QgsApplication.pluginPath()
     except AttributeError:
         path = None
     return path if path and os.path.isdir(path) else None
@@ -218,6 +233,20 @@ def _env_passthrough_keys():
     return keys
 
 
+def _shape_base_files(path):
+    base, _ext = os.path.splitext(path)
+    return [
+        base + ext for ext in (
+            ".shp", ".shx", ".dbf", ".prj", ".cpg", ".qpj", ".sbn", ".sbx")
+    ]
+
+
+def _remove_existing_shapefile(path):
+    for candidate in _shape_base_files(path):
+        if os.path.exists(candidate):
+            os.remove(candidate)
+
+
 class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def __init__(self, iface, parent=None):
@@ -227,14 +256,21 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process = None
         self._params_file = None
         self._launcher_file = None
-        self._output_path = None
         self._process_error_message = ""
+        self._label_path = None
+        self._draft_path = None
+        self._draft_layer = None
+        self._draft_layer_id = None
+        self._final_layer = None
+        self._final_layer_id = None
+        self._input_layer = None
+        self._input_path = None
+        self._class_labels = []
 
         self._init_defaults()
         self._wire_signals()
         self._refresh_models()
 
-    # --------------------------------------------------------------- 初始化
     def _init_defaults(self):
         settings = QSettings()
         default_root = _default_model_root()
@@ -248,10 +284,14 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.inputFileWidget.setFilter(
             "影像文件 (*.tif *.tiff *.png *.jpg *.jpeg)")
         self.outputFileWidget.setStorageMode(QgsFileWidget.SaveFile)
-        self.outputFileWidget.setFilter(
-            "GeoTIFF (*.tif);;PNG (*.png);;JPEG (*.jpg)")
+        self.outputFileWidget.setFilter("Shapefile 文件 (*.shp)")
+        self.rasterFileWidget.setStorageMode(QgsFileWidget.SaveFile)
+        self.rasterFileWidget.setFilter("GeoTIFF 影像 (*.tif *.tiff)")
 
         self.layerRadio.setChecked(True)
+        self.confirmSelectedBtn.setEnabled(False)
+        self.confirmAllBtn.setEnabled(False)
+        self.exportRasterBtn.setEnabled(False)
         self._on_input_source_changed()
 
     def _wire_signals(self):
@@ -262,14 +302,18 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.layerRadio.toggled.connect(self._on_input_source_changed)
         self.fileRadio.toggled.connect(self._on_input_source_changed)
-        self.layerCombo.layerChanged.connect(self._suggest_output_path)
-        self.inputFileWidget.fileChanged.connect(self._suggest_output_path)
+        self.layerCombo.layerChanged.connect(self._suggest_output_paths)
+        self.inputFileWidget.fileChanged.connect(self._suggest_output_paths)
 
         self.runBtn.clicked.connect(self._on_run)
         self.cancelBtn.clicked.connect(self._on_cancel)
+        self.confirmSelectedBtn.clicked.connect(self._on_confirm_selected)
+        self.confirmAllBtn.clicked.connect(self._on_confirm_all)
+        self.exportRasterBtn.clicked.connect(self._on_export_raster)
         self.closeBtn.clicked.connect(self.close)
+        QgsProject.instance().layersWillBeRemoved.connect(
+            self._on_layers_will_be_removed)
 
-    # ------------------------------------------------------------- 辅助方法
     def _persist_model_root(self):
         QSettings().setValue(
             "{}/model_root".format(SETTINGS_GROUP), self.modelRootEdit.text())
@@ -278,23 +322,20 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.modelCombo.clear()
         root = self.modelRootEdit.text().strip()
         if not root or not os.path.isdir(root):
-            self.statusLabel.setText(
-                self.tr("模型根目录不存在:{}").format(root))
+            self.statusLabel.setText("模型根目录不存在:{}".format(root))
             return
         models = scan_models(root)
         if not models:
-            self.statusLabel.setText(
-                self.tr("目录 {} 下未发现可用的分割模型").format(root))
+            self.statusLabel.setText("目录 {} 下未发现可用的分割模型".format(root))
             return
         for entry in models:
             self.modelCombo.addItem(entry["name"], entry["path"])
-        self.statusLabel.setText(
-            self.tr("已发现 {} 个模型").format(len(models)))
+        self.statusLabel.setText("已发现 {} 个模型".format(len(models)))
 
     def _on_browse_model_root(self):
         current = self.modelRootEdit.text().strip() or _default_model_root()
         chosen = QtWidgets.QFileDialog.getExistingDirectory(
-            self, self.tr("选择模型根目录"), current)
+            self, "选择模型根目录", current)
         if chosen:
             self.modelRootEdit.setText(chosen)
             self._persist_model_root()
@@ -316,7 +357,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         layer_mode = self.layerRadio.isChecked()
         self.layerCombo.setEnabled(layer_mode)
         self.inputFileWidget.setEnabled(not layer_mode)
-        self._suggest_output_path()
+        self._suggest_output_paths()
 
     def _resolve_input_path(self):
         if self.layerRadio.isChecked():
@@ -327,48 +368,70 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         path = self.inputFileWidget.filePath().strip()
         return path or None
 
-    def _suggest_output_path(self, *args, **kwargs):
-        if self.outputFileWidget.filePath().strip():
-            return
+    def _resolve_input_layer(self):
+        if self.layerRadio.isChecked():
+            return self.layerCombo.currentLayer()
+        return None
+
+    def _suggest_output_paths(self, *args, **kwargs):
         src = self._resolve_input_path()
         if not src or not os.path.exists(src):
             return
-        base, ext = os.path.splitext(src)
-        suggested = "{}_seg{}".format(base, ".tif" if ext.lower()
-                                      in (".tif", ".tiff") else ext or ".png")
-        self.outputFileWidget.setFilePath(suggested)
+        base, _ext = os.path.splitext(src)
+        if not self.outputFileWidget.filePath().strip():
+            self.outputFileWidget.setFilePath("{}_final.shp".format(base))
+        if not self.rasterFileWidget.filePath().strip():
+            self.rasterFileWidget.setFilePath("{}_final.tif".format(base))
 
-    # ------------------------------------------------------------------ 运行
     def _on_run(self):
         if self.modelCombo.count() == 0:
-            self._warn(self.tr("尚未选择模型。"))
+            self._warn("尚未选择模型。")
             return
         model_path = self.modelCombo.currentData()
         if not model_path or not os.path.isdir(model_path):
-            self._warn(self.tr("所选模型路径无效。"))
+            self._warn("所选模型路径无效。")
             return
 
         input_path = self._resolve_input_path()
         if not input_path:
-            self._warn(self.tr("请选择输入图层或输入文件。"))
+            self._warn("请选择输入图层或输入文件。")
             return
         if not os.path.exists(input_path):
-            self._warn(self.tr("输入文件不存在:{}").format(
-                input_path))
+            self._warn("输入文件不存在:{}".format(input_path))
             return
 
-        output_path = self.outputFileWidget.filePath().strip()
-        if not output_path:
-            self._warn(self.tr("请选择输出文件路径。"))
+        vector_path = self.outputFileWidget.filePath().strip()
+        if not vector_path:
+            self._warn("请选择最终 Shapefile 输出路径。")
             return
-        out_dir = os.path.dirname(output_path) or "."
+        if os.path.splitext(vector_path)[1].lower() != ".shp":
+            vector_path = os.path.splitext(vector_path)[0] + ".shp"
+            self.outputFileWidget.setFilePath(vector_path)
+        out_dir = os.path.dirname(vector_path) or "."
         if not os.path.isdir(out_dir):
             try:
                 os.makedirs(out_dir, exist_ok=True)
             except OSError as exc:
-                self._warn(self.tr("无法创建输出目录:{}").
-                           format(exc))
+                self._warn("无法创建输出目录:{}".format(exc))
                 return
+
+        if os.path.exists(vector_path):
+            answer = QtWidgets.QMessageBox.question(
+                self, "覆盖确认",
+                "最终 Shapefile 已存在，确认后会覆盖同名结果。是否继续？")
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+            try:
+                _remove_existing_shapefile(vector_path)
+            except OSError as exc:
+                self._warn("无法覆盖已有 Shapefile:{}".format(exc))
+                return
+
+        self._class_labels = self._read_class_labels(model_path)
+        self._input_layer = self._resolve_input_layer()
+        self._input_path = input_path
+        self._final_layer = None
+        self._final_layer_id = None
 
         flags = {
             "clahe": self.claheCheck.isChecked(),
@@ -377,17 +440,25 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "gaussian": self.gaussianCheck.isChecked(),
         }
         georef = is_georeferenced(input_path)
-        self._start_inference_process(model_path, input_path, output_path,
-                                      flags, georef)
+        self._start_inference_process(model_path, input_path, flags, georef)
 
-    def _start_inference_process(self, model_path, input_path, output_path,
-                                 flags, georef):
-        self._output_path = output_path
+    def _read_class_labels(self, model_path):
+        try:
+            info = get_model_info(model_path)
+            labels = info.get("_Attributes", {}).get("labels") or []
+            return [str(label) for label in labels]
+        except Exception:
+            return []
+
+    def _start_inference_process(self, model_path, input_path, flags, georef):
         self._process_error_message = ""
+        fd, self._label_path = tempfile.mkstemp(
+            prefix="lcc_label_", suffix=".tif")
+        os.close(fd)
         params = {
             "model_path": model_path,
             "input_path": input_path,
-            "output_path": output_path,
+            "output_path": self._label_path,
             "preprocess_flags": flags,
             "is_georef": georef,
         }
@@ -407,8 +478,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.runBtn.setEnabled(False)
         self.cancelBtn.setEnabled(True)
+        self.confirmSelectedBtn.setEnabled(False)
+        self.confirmAllBtn.setEnabled(False)
+        self.exportRasterBtn.setEnabled(False)
         self.progressBar.setValue(0)
-        self.statusLabel.setText(self.tr("运行中({}模式)...").format(
+        self.statusLabel.setText("运行中({}模式)...".format(
             "带地理坐标" if georef else "普通图像"))
 
         runner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -515,7 +589,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def _on_cancel(self):
         if self._process is not None:
             self._process.kill()
-            self.statusLabel.setText(self.tr("正在取消..."))
+            self.statusLabel.setText("正在取消...")
 
     def _on_process_output(self):
         if self._process is None:
@@ -535,8 +609,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             elif event == "error":
                 self._process_error_message = payload.get("message", "")
             elif event == "done":
-                self._output_path = payload.get(
-                    "output_path", self._output_path)
+                self._label_path = payload.get("label_path", self._label_path)
 
     def _on_process_finished(self, exit_code, exit_status):
         if self._process is None:
@@ -546,33 +619,512 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         else:
             msg = self._process_error_message
             if not msg:
-                msg = self.tr("推理子进程异常退出(exit_code={})。").format(
-                    exit_code)
+                msg = "推理子进程异常退出(exit_code={})。".format(exit_code)
             self.statusLabel.setText(msg)
-            self.iface.messageBar().pushCritical("地物分类",
-                                                 msg)
+            self.iface.messageBar().pushCritical("地物分类", msg)
         self._cleanup_process()
 
     def _on_process_completed(self):
-        output_path = self._output_path
-        self.statusLabel.setText(self.tr("完成:{}").format(output_path))
-        self.progressBar.setValue(100)
-        layer_name = os.path.splitext(os.path.basename(output_path))[0]
-        layer = self.iface.addRasterLayer(output_path, layer_name)
-        if layer is None or not layer.isValid():
-            self.iface.messageBar().pushWarning(
-                "地物分类",
-                self.tr("结果已写出,但无法作为图层加载:{}").
-                format(output_path))
-        else:
+        try:
+            self.statusLabel.setText("正在生成可编辑草稿层...")
+            self.progressBar.setValue(100)
+            self._load_reference_input_layer()
+            self._draft_layer = self._create_draft_layer(self._label_path)
+            self._place_layer_above_input(self._draft_layer)
+            self.confirmSelectedBtn.setEnabled(True)
+            self.confirmAllBtn.setEnabled(True)
+            self.exportRasterBtn.setEnabled(True)
+            self.statusLabel.setText("草稿层已生成，请编辑后确认对象。")
             self.iface.messageBar().pushSuccess(
-                "地物分类",
-                self.tr("分割结果已加载为图层:{}").format(layer_name))
+                "地物分类", "可编辑草稿层已加载。")
+        except Exception as exc:  # noqa: BLE001
+            self._warn("生成草稿层失败:{}".format(exc))
+
+    def _load_reference_input_layer(self):
+        if self._input_layer is not None and self._input_layer.isValid():
+            return
+        if not self._input_path:
+            return
+        name = os.path.splitext(os.path.basename(self._input_path))[0]
+        layer = self.iface.addRasterLayer(self._input_path, name)
+        if layer is not None and layer.isValid():
+            self._input_layer = layer
+
+    def _create_draft_layer(self, label_path):
+        draft_fd, self._draft_path = tempfile.mkstemp(
+            prefix="lcc_draft_", suffix=".gpkg")
+        os.close(draft_fd)
+        if os.path.exists(self._draft_path):
+            os.remove(self._draft_path)
+        self._polygonize_to_gpkg(label_path, self._draft_path)
+        layer = QgsVectorLayer(
+            "{}|layername=draft".format(self._draft_path),
+            "地物分类草稿",
+            "ogr")
+        if not layer.isValid():
+            raise IOError("无法加载草稿图层:{}".format(self._draft_path))
+        QgsProject.instance().addMapLayer(layer, False)
+        self._draft_layer_id = layer.id()
+        self._prepare_draft_fields(layer)
+        self._apply_vector_style(layer, draft=True)
+        return layer
+
+    def _polygonize_to_gpkg(self, label_path, gpkg_path):
+        from osgeo import gdal, ogr, osr
+
+        src = gdal.Open(label_path)
+        if src is None:
+            raise IOError("无法打开类别栅格:{}".format(label_path))
+        driver = ogr.GetDriverByName("GPKG")
+        ds = driver.CreateDataSource(gpkg_path)
+        if ds is None:
+            src = None
+            raise IOError("无法创建草稿 GeoPackage:{}".format(gpkg_path))
+        srs = None
+        proj = src.GetProjection()
+        if proj:
+            srs = osr.SpatialReference()
+            srs.ImportFromWkt(proj)
+        layer = ds.CreateLayer("draft", srs=srs, geom_type=ogr.wkbPolygon)
+        layer.CreateField(ogr.FieldDefn(FIELD_CLASS_ID, ogr.OFTInteger))
+        field_index = layer.GetLayerDefn().GetFieldIndex(FIELD_CLASS_ID)
+        result = gdal.Polygonize(src.GetRasterBand(1), None, layer,
+                                 field_index, [], callback=None)
+        ds = None
+        src = None
+        if result != 0:
+            raise IOError("类别栅格矢量化失败。")
+
+    def _prepare_draft_fields(self, layer):
+        provider = layer.dataProvider()
+        existing = [field.name() for field in layer.fields()]
+        new_fields = []
+        if FIELD_CLASS_NAME not in existing:
+            new_fields.append(QgsField(FIELD_CLASS_NAME, QVariant.String,
+                                       "", 80))
+        if FIELD_REVIEW_STATUS not in existing:
+            new_fields.append(QgsField(FIELD_REVIEW_STATUS, QVariant.String,
+                                       "", 20))
+        if FIELD_SOURCE_ID not in existing:
+            new_fields.append(QgsField(FIELD_SOURCE_ID, QVariant.Int))
+        if new_fields:
+            provider.addAttributes(new_fields)
+            layer.updateFields()
+
+        updates = []
+        background_fids = []
+        for feature in layer.getFeatures():
+            class_id = self._safe_int(feature[FIELD_CLASS_ID], 0)
+            if self._is_background_class_id(class_id):
+                background_fids.append(feature.id())
+                continue
+            updates.append({
+                "fid": feature.id(),
+                FIELD_CLASS_NAME: self._class_name(class_id),
+                FIELD_REVIEW_STATUS: STATUS_PENDING,
+                FIELD_SOURCE_ID: int(feature.id()),
+            })
+        if updates or background_fids:
+            layer.startEditing()
+            if background_fids:
+                layer.deleteFeatures(background_fids)
+            for item in updates:
+                fid = item.pop("fid")
+                for name, value in item.items():
+                    layer.changeAttributeValue(
+                        fid, layer.fields().indexFromName(name), value)
+            layer.commitChanges()
+
+    def _place_layer_above_input(self, layer):
+        root = QgsProject.instance().layerTreeRoot()
+        input_node = (root.findLayer(self._input_layer.id())
+                      if self._input_layer is not None else None)
+        if input_node is None:
+            root.insertLayer(0, layer)
+            return
+        parent = input_node.parent()
+        index = parent.children().index(input_node)
+        parent.insertLayer(index, layer)
+
+    def _on_confirm_selected(self):
+        if not self._ensure_draft_layer():
+            return
+        features = list(self._draft_layer.selectedFeatures())
+        if not features:
+            self._warn("请先在草稿层选择要确认的对象。")
+            return
+        self._confirm_features(features, delete_missing=False)
+
+    def _on_confirm_all(self):
+        if not self._ensure_draft_layer():
+            return
+        features = list(self._draft_layer.getFeatures())
+        if not features:
+            self._warn("草稿层中没有可确认对象。")
+            return
+        self._confirm_features(features, delete_missing=True)
+
+    def _confirm_features(self, features, delete_missing):
+        if not self._commit_layer_if_needed(self._draft_layer):
+            return
+        final_layer = self._ensure_final_layer()
+        if final_layer is None:
+            return
+        if not final_layer.isEditable():
+            if not final_layer.startEditing():
+                self._warn("最终结果图层无法进入编辑状态。")
+                return
+
+        final_by_source = self._final_features_by_source(final_layer)
+        current_sources = set()
+        confirmed_count = 0
+        for feature in features:
+            source_id = self._safe_int(feature[FIELD_SOURCE_ID], feature.id())
+            current_sources.add(source_id)
+            class_id = self._safe_int(feature[FIELD_CLASS_ID], 0)
+            if self._is_background_class_id(class_id):
+                if source_id in final_by_source:
+                    final_layer.deleteFeature(final_by_source[source_id].id())
+                continue
+            attrs = self._final_attrs_from_draft(feature, source_id)
+            if source_id in final_by_source:
+                final_feature = final_by_source[source_id]
+                final_layer.changeGeometry(final_feature.id(),
+                                           feature.geometry())
+                for name, value in attrs.items():
+                    final_layer.changeAttributeValue(
+                        final_feature.id(),
+                        final_layer.fields().indexFromName(name),
+                        value)
+            else:
+                new_feature = QgsFeature(final_layer.fields())
+                new_feature.setGeometry(feature.geometry())
+                for name, value in attrs.items():
+                    new_feature.setAttribute(name, value)
+                final_layer.addFeature(new_feature)
+            confirmed_count += 1
+
+        if delete_missing:
+            draft_sources = {
+                self._safe_int(feature[FIELD_SOURCE_ID], feature.id())
+                for feature in self._draft_layer.getFeatures()
+                if not self._is_background_class_id(
+                    self._safe_int(feature[FIELD_CLASS_ID], 0))
+            }
+            delete_ids = [
+                feature.id()
+                for source_id, feature in final_by_source.items()
+                if source_id not in draft_sources
+            ]
+            if delete_ids:
+                final_layer.deleteFeatures(delete_ids)
+
+        if not final_layer.commitChanges():
+            self._warn("写入最终结果图层失败:{}".format(
+                final_layer.commitErrors()))
+            final_layer.rollBack()
+            return
+        final_layer.triggerRepaint()
+        self._mark_draft_confirmed(current_sources)
+        self._apply_vector_style(final_layer, draft=False)
+        self.statusLabel.setText("已确认 {} 个对象。".format(confirmed_count))
+        self.iface.messageBar().pushSuccess(
+            "地物分类", "最终结果图层已更新。")
+
+    def _ensure_draft_layer(self):
+        if not self._layer_is_usable(self._draft_layer):
+            self._warn("当前没有可用的草稿图层。")
+            return False
+        return True
+
+    def _commit_layer_if_needed(self, layer):
+        if not self._layer_is_usable(layer):
+            return False
+        if layer.isEditable():
+            if not layer.commitChanges():
+                self._warn("提交草稿层编辑失败:{}".format(layer.commitErrors()))
+                layer.rollBack()
+                return False
+        return True
+
+    def _layer_is_usable(self, layer):
+        if layer is None:
+            return False
+        if sip.isdeleted(layer):
+            return False
+        return layer.isValid()
+
+    def _on_layers_will_be_removed(self, layer_ids):
+        if self._draft_layer_id in layer_ids:
+            self._draft_layer = None
+            self._draft_layer_id = None
+        if self._final_layer_id in layer_ids:
+            self._final_layer = None
+            self._final_layer_id = None
+
+    def _ensure_final_layer(self):
+        path = self.outputFileWidget.filePath().strip()
+        if not path:
+            self._warn("请选择最终 Shapefile 输出路径。")
+            return None
+        if os.path.splitext(path)[1].lower() != ".shp":
+            path = os.path.splitext(path)[0] + ".shp"
+            self.outputFileWidget.setFilePath(path)
+
+        if self._layer_is_usable(self._final_layer):
+            return self._final_layer
+        self._final_layer = None
+        self._final_layer_id = None
+        if os.path.exists(path):
+            layer = QgsVectorLayer(path, "最终分割结果", "ogr")
+            if layer.isValid():
+                self._final_layer = layer
+                self._final_layer_id = layer.id()
+                if QgsProject.instance().mapLayer(layer.id()) is None:
+                    QgsProject.instance().addMapLayer(layer)
+                self._ensure_final_fields(layer)
+                self._apply_vector_style(layer, draft=False)
+                return layer
+        self._create_empty_final_shapefile(path)
+        layer = QgsVectorLayer(path, "最终分割结果", "ogr")
+        if not layer.isValid():
+            self._warn("无法创建最终 Shapefile:{}".format(path))
+            return None
+        QgsProject.instance().addMapLayer(layer)
+        self._final_layer = layer
+        self._final_layer_id = layer.id()
+        self._apply_vector_style(layer, draft=False)
+        return layer
+
+    def _create_empty_final_shapefile(self, path):
+        for candidate in _shape_base_files(path):
+            if os.path.exists(candidate):
+                os.remove(candidate)
+        geom_name = QgsWkbTypes.displayString(self._draft_layer.wkbType())
+        crs = self._draft_layer.crs()
+        uri = geom_name
+        if crs.isValid() and crs.authid():
+            uri = "{}?crs={}".format(geom_name, crs.authid())
+        memory = QgsVectorLayer(uri, "final_template", "memory")
+        provider = memory.dataProvider()
+        provider.addAttributes(self._final_fields())
+        memory.updateFields()
+        self._write_vector_layer(memory, path)
+
+    def _ensure_final_fields(self, layer):
+        provider = layer.dataProvider()
+        existing = [field.name() for field in layer.fields()]
+        new_fields = [
+            field for field in self._final_fields()
+            if field.name() not in existing
+        ]
+        if new_fields:
+            provider.addAttributes(new_fields)
+            layer.updateFields()
+
+    def _final_fields(self):
+        return [
+            QgsField(FIELD_CLASS_ID, QVariant.Int),
+            QgsField(FIELD_CLASS_NAME, QVariant.String, "", 80),
+            QgsField(FIELD_SOURCE_ID, QVariant.Int),
+        ]
+
+    def _write_vector_layer(self, layer, path):
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = "ESRI Shapefile"
+        options.fileEncoding = "UTF-8"
+        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(
+            layer, path, QgsProject.instance().transformContext(), options)
+        if isinstance(result, tuple):
+            error = result[0]
+        else:
+            error = result
+        if error != QgsVectorFileWriter.NoError:
+            raise IOError("写出 Shapefile 失败:{}".format(path))
+
+    def _final_features_by_source(self, layer):
+        mapping = {}
+        if layer.fields().indexFromName(FIELD_SOURCE_ID) < 0:
+            return mapping
+        for feature in layer.getFeatures():
+            source_id = self._safe_int(feature[FIELD_SOURCE_ID], None)
+            if source_id is not None:
+                mapping[source_id] = feature
+        return mapping
+
+    def _final_attrs_from_draft(self, feature, source_id):
+        class_id = self._safe_int(feature[FIELD_CLASS_ID], 0)
+        return {
+            FIELD_CLASS_ID: class_id,
+            FIELD_CLASS_NAME: self._class_name(class_id),
+            FIELD_SOURCE_ID: source_id,
+        }
+
+    def _mark_draft_confirmed(self, source_ids):
+        if not source_ids:
+            return
+        layer = self._draft_layer
+        if not layer.isEditable():
+            if not layer.startEditing():
+                self._warn("草稿层无法进入编辑状态。")
+                return
+        status_idx = layer.fields().indexFromName(FIELD_REVIEW_STATUS)
+        for feature in layer.getFeatures():
+            source_id = self._safe_int(feature[FIELD_SOURCE_ID], feature.id())
+            if source_id in source_ids:
+                layer.changeAttributeValue(
+                    feature.id(), status_idx, STATUS_CONFIRMED)
+        layer.commitChanges()
+        layer.triggerRepaint()
+
+    def _on_export_raster(self):
+        if not self._layer_is_usable(self._final_layer):
+            self._warn("请先确认对象，生成最终结果图层。")
+            return
+        if self._final_layer.isEditable() and not self._final_layer.commitChanges():
+            self._warn("提交最终结果图层编辑失败:{}".format(
+                self._final_layer.commitErrors()))
+            self._final_layer.rollBack()
+            return
+        path = self.rasterFileWidget.filePath().strip()
+        if not path:
+            self._warn("请选择栅格图像导出路径。")
+            return
+        if os.path.splitext(path)[1].lower() not in (".tif", ".tiff"):
+            path = os.path.splitext(path)[0] + ".tif"
+            self.rasterFileWidget.setFilePath(path)
+        out_dir = os.path.dirname(path) or "."
+        if not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        try:
+            self._rasterize_final_layer(path)
+            self.iface.addRasterLayer(path, os.path.splitext(
+                os.path.basename(path))[0])
+            self.iface.messageBar().pushSuccess(
+                "地物分类", "最终栅格图像已导出。")
+        except Exception as exc:  # noqa: BLE001
+            self._warn("导出栅格图像失败:{}".format(exc))
+
+    def _rasterize_final_layer(self, path):
+        from osgeo import gdal
+
+        template = gdal.Open(self._input_path)
+        if template is None:
+            raise IOError("无法打开原始影像作为栅格模板:{}".format(
+                self._input_path))
+        driver = gdal.GetDriverByName("GTiff")
+        dst = driver.Create(
+            path,
+            template.RasterXSize,
+            template.RasterYSize,
+            1,
+            gdal.GDT_Byte,
+            ["COMPRESS=LZW", "TILED=YES"],
+        )
+        if dst is None:
+            template = None
+            raise IOError("无法创建栅格图像:{}".format(path))
+        gt = template.GetGeoTransform()
+        proj = template.GetProjection()
+        if gt is not None:
+            dst.SetGeoTransform(gt)
+        if proj:
+            dst.SetProjection(proj)
+        band = dst.GetRasterBand(1)
+        band.Fill(self._background_class_id())
+        source = self._final_layer.source().split("|", 1)[0]
+        vector_ds = gdal.OpenEx(source, gdal.OF_VECTOR)
+        if vector_ds is None:
+            dst = None
+            template = None
+            raise IOError("无法打开最终矢量图层:{}".format(source))
+        vector_layer = vector_ds.GetLayer(0)
+        result = gdal.RasterizeLayer(
+            dst, [1], vector_layer,
+            options=["ATTRIBUTE={}".format(FIELD_CLASS_ID)])
+        vector_ds = None
+        dst.FlushCache()
+        dst = None
+        template = None
+        if result != 0:
+            raise IOError("最终矢量图层栅格化失败。")
+
+    def _apply_vector_style(self, layer, draft):
+        categories = []
+        values = self._known_class_ids(layer)
+        for class_id in values:
+            color = self._class_color(class_id)
+            alpha = "90" if draft else "170"
+            symbol = QgsFillSymbol.createSimple({
+                "color": "{},{},{},{}".format(
+                    color.red(), color.green(), color.blue(), alpha),
+                "outline_color": "30,30,30,220",
+                "outline_width": "0.3",
+            })
+            label = self._class_name(class_id)
+            categories.append(QgsRendererCategory(class_id, symbol, label))
+        renderer = QgsCategorizedSymbolRenderer(FIELD_CLASS_ID, categories)
+        layer.setRenderer(renderer)
+        layer.triggerRepaint()
+
+    def _known_class_ids(self, layer):
+        values = set()
+        for feature in layer.getFeatures():
+            class_id = self._safe_int(feature[FIELD_CLASS_ID], 0)
+            if not self._is_background_class_id(class_id):
+                values.add(class_id)
+        if not values and self._class_labels:
+            values = {
+                class_id for class_id in range(len(self._class_labels))
+                if not self._is_background_class_id(class_id)
+            }
+        return sorted(values)
+
+    def _class_name(self, class_id):
+        if 0 <= class_id < len(self._class_labels):
+            return self._class_labels[class_id]
+        return str(class_id)
+
+    def _is_background_class_id(self, class_id):
+        return (
+            self._class_name(class_id).strip().lower()
+            in BACKGROUND_CLASS_NAMES
+        )
+
+    def _background_class_id(self):
+        for class_id, label in enumerate(self._class_labels):
+            if str(label).strip().lower() in BACKGROUND_CLASS_NAMES:
+                return class_id
+        return 0
+
+    def _class_color(self, class_id):
+        colors = [
+            QColor(230, 25, 75),
+            QColor(60, 180, 75),
+            QColor(0, 130, 200),
+            QColor(245, 130, 48),
+            QColor(145, 30, 180),
+            QColor(70, 240, 240),
+            QColor(240, 50, 230),
+            QColor(210, 245, 60),
+            QColor(250, 190, 190),
+            QColor(0, 128, 128),
+        ]
+        return colors[class_id % len(colors)]
+
+    def _safe_int(self, value, default):
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     def _on_process_error(self, error):
         if error == QProcess.Crashed:
             return
-        msg = self.tr("无法启动推理子进程:{}").format(error)
+        msg = "无法启动推理子进程:{}".format(error)
         self.statusLabel.setText(msg)
         self.iface.messageBar().pushCritical("地物分类", msg)
         self._cleanup_process()
@@ -596,7 +1148,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._process.deleteLater()
         self._process = None
 
-    # ----------------------------------------------------------------- 工具
     def _warn(self, message):
         self.statusLabel.setText(message)
         self.iface.messageBar().pushMessage(

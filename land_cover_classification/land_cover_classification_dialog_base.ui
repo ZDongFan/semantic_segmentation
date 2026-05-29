@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>560</width>
-    <height>520</height>
+    <height>610</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -169,12 +169,22 @@
       <item row="0" column="0">
        <widget class="QLabel" name="outputFileLabel">
         <property name="text">
-         <string>文件</string>
+         <string>最终矢量</string>
         </property>
        </widget>
       </item>
       <item row="0" column="1">
        <widget class="QgsFileWidget" name="outputFileWidget"/>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="rasterFileLabel">
+        <property name="text">
+         <string>最终栅格</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QgsFileWidget" name="rasterFileWidget"/>
       </item>
      </layout>
     </widget>
@@ -216,6 +226,36 @@
         </size>
        </property>
       </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="confirmSelectedBtn">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="text">
+        <string>确认选中对象</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="confirmAllBtn">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="text">
+        <string>全部确认</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="exportRasterBtn">
+       <property name="enabled">
+        <bool>false</bool>
+       </property>
+       <property name="text">
+        <string>导出栅格</string>
+       </property>
+      </widget>
      </item>
      <item>
       <widget class="QPushButton" name="runBtn">
