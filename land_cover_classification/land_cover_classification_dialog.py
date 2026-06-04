@@ -49,6 +49,8 @@ FIELD_REVIEW_STATUS = "review_status"
 FIELD_SOURCE_ID = "source_id"
 BACKGROUND_CLASS_NAMES = {"sliding"}
 DRAFT_SIMPLIFY_PIXEL_TOLERANCE = 5
+OUTPUT_FORMAT_RASTER = "raster"
+OUTPUT_FORMAT_VECTOR = "vector"
 STATUS_PENDING = "待确认"
 STATUS_CONFIRMED = "已确认"
 
@@ -248,11 +250,41 @@ def _remove_existing_shapefile(path):
             os.remove(candidate)
 
 
+class _MirroredLabel:
+
+    def __init__(self, *widgets):
+        self._widgets = widgets
+
+    def setText(self, text):
+        for widget in self._widgets:
+            widget.setText(text)
+
+    def text(self):
+        return self._widgets[0].text()
+
+
+class _MirroredProgressBar:
+
+    def __init__(self, *widgets):
+        self._widgets = widgets
+
+    def setValue(self, value):
+        for widget in self._widgets:
+            widget.setValue(value)
+
+    def value(self):
+        return self._widgets[0].value()
+
+
 class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def __init__(self, iface, parent=None):
         super().__init__(parent)
         self.setupUi(self)
+        self.statusLabel = _MirroredLabel(
+            self.statusLabel, self.exportStatusLabel)
+        self.progressBar = _MirroredProgressBar(
+            self.progressBar, self.exportProgressBar)
         self.iface = iface
         self._process = None
         self._params_file = None
@@ -284,9 +316,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.inputFileWidget.setStorageMode(QgsFileWidget.GetFile)
         self.inputFileWidget.setFilter(
             "影像文件 (*.tif *.tiff *.png *.jpg *.jpeg)")
-        self.outputFileWidget.setStorageMode(QgsFileWidget.SaveFile)
+        self.outputDirWidget.setStorageMode(QgsFileWidget.GetDirectory)
         self.outputFileWidget.setFilter("Shapefile 文件 (*.shp)")
-        self.rasterFileWidget.setStorageMode(QgsFileWidget.SaveFile)
+        self.outputFormatCombo.setItemData(0, OUTPUT_FORMAT_RASTER)
+        self.outputFormatCombo.setItemData(1, OUTPUT_FORMAT_VECTOR)
         self.rasterFileWidget.setFilter("GeoTIFF 影像 (*.tif *.tiff)")
 
         self.layerRadio.setChecked(True)
@@ -312,6 +345,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.confirmAllBtn.clicked.connect(self._on_confirm_all)
         self.exportRasterBtn.clicked.connect(self._on_export_raster)
         self.closeBtn.clicked.connect(self.close)
+        self.exportCloseBtn.clicked.connect(self.close)
         QgsProject.instance().layersWillBeRemoved.connect(
             self._on_layers_will_be_removed)
 
@@ -1043,6 +1077,165 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 os.path.basename(path))[0])
             self.iface.messageBar().pushSuccess(
                 "地物分类", "最终栅格图像已导出。")
+        except Exception as exc:  # noqa: BLE001
+            self._warn("导出栅格图像失败:{}".format(exc))
+
+    def _selected_output_format(self):
+        value = self.outputFormatCombo.currentData()
+        return value or OUTPUT_FORMAT_RASTER
+
+    def _output_directory_path(self):
+        return self.outputDirWidget.filePath().strip()
+
+    def _output_base_name(self):
+        src = self._resolve_input_path() or self._input_path
+        if not src:
+            return "land_cover_result"
+        return os.path.splitext(os.path.basename(src))[0]
+
+    def _vector_output_path(self):
+        out_dir = self._output_directory_path()
+        if not out_dir:
+            return ""
+        return os.path.join(out_dir, "{}_final.shp".format(
+            self._output_base_name()))
+
+    def _raster_output_path(self):
+        out_dir = self._output_directory_path()
+        if not out_dir:
+            return ""
+        return os.path.join(out_dir, "{}_final.tif".format(
+            self._output_base_name()))
+
+    def _suggest_output_paths(self, *args, **kwargs):
+        src = self._resolve_input_path()
+        if not src or not os.path.exists(src):
+            return
+        out_dir = os.path.dirname(src)
+        if out_dir and not self.outputDirWidget.filePath().strip():
+            self.outputDirWidget.setFilePath(out_dir)
+        self.outputFileWidget.setFilePath(self._vector_output_path())
+        self.rasterFileWidget.setFilePath(self._raster_output_path())
+
+    def _on_run(self):
+        if self.modelCombo.count() == 0:
+            self._warn("尚未选择模型。")
+            return
+        model_path = self.modelCombo.currentData()
+        if not model_path or not os.path.isdir(model_path):
+            self._warn("所选模型路径无效。")
+            return
+
+        input_path = self._resolve_input_path()
+        if not input_path:
+            self._warn("请选择输入图层或输入文件。")
+            return
+        if not os.path.exists(input_path):
+            self._warn("输入文件不存在:{}".format(input_path))
+            return
+
+        out_dir = self._output_directory_path()
+        if not out_dir:
+            self._warn("请选择导出目录。")
+            return
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as exc:
+            self._warn("无法创建导出目录:{}".format(exc))
+            return
+
+        vector_path = self._vector_output_path()
+        self.outputFileWidget.setFilePath(vector_path)
+        self.rasterFileWidget.setFilePath(self._raster_output_path())
+        if os.path.exists(vector_path):
+            answer = QtWidgets.QMessageBox.question(
+                self, "覆盖确认",
+                "最终 Shapefile 已存在，确认后会覆盖同名结果。是否继续？")
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+            try:
+                _remove_existing_shapefile(vector_path)
+            except OSError as exc:
+                self._warn("无法覆盖已有 Shapefile:{}".format(exc))
+                return
+
+        self._class_labels = self._read_class_labels(model_path)
+        self._input_layer = self._resolve_input_layer()
+        self._input_path = input_path
+        self._final_layer = None
+        self._final_layer_id = None
+
+        flags = {
+            "clahe": self.claheCheck.isChecked(),
+            "sharpen": self.sharpenCheck.isChecked(),
+            "median": self.medianCheck.isChecked(),
+            "gaussian": self.gaussianCheck.isChecked(),
+        }
+        georef = is_georeferenced(input_path)
+        self._start_inference_process(model_path, input_path, flags, georef)
+
+    def _ensure_final_layer(self):
+        path = self._vector_output_path()
+        if not path:
+            self._warn("请选择导出目录。")
+            return None
+        self.outputFileWidget.setFilePath(path)
+
+        if self._layer_is_usable(self._final_layer):
+            return self._final_layer
+        self._final_layer = None
+        self._final_layer_id = None
+        if os.path.exists(path):
+            layer = QgsVectorLayer(path, "最终分割结果", "ogr")
+            if layer.isValid():
+                self._final_layer = layer
+                self._final_layer_id = layer.id()
+                if QgsProject.instance().mapLayer(layer.id()) is None:
+                    QgsProject.instance().addMapLayer(layer)
+                self._ensure_final_fields(layer)
+                self._apply_vector_style(layer, draft=False)
+                return layer
+        self._create_empty_final_shapefile(path)
+        layer = QgsVectorLayer(path, "最终分割结果", "ogr")
+        if not layer.isValid():
+            self._warn("无法创建最终 Shapefile:{}".format(path))
+            return None
+        QgsProject.instance().addMapLayer(layer)
+        self._final_layer = layer
+        self._final_layer_id = layer.id()
+        self._apply_vector_style(layer, draft=False)
+        return layer
+
+    def _on_export_raster(self):
+        if not self._layer_is_usable(self._final_layer):
+            self._warn("请先确认对象，生成最终结果图层。")
+            return
+        if self._final_layer.isEditable() and not self._final_layer.commitChanges():
+            self._warn("提交最终结果图层编辑失败:{}".format(
+                self._final_layer.commitErrors()))
+            self._final_layer.rollBack()
+            return
+
+        if self._selected_output_format() == OUTPUT_FORMAT_VECTOR:
+            path = self._vector_output_path()
+            self.iface.messageBar().pushSuccess(
+                "地物分类", "最终 Shapefile 已导出:{}".format(path))
+            return
+
+        path = self._raster_output_path()
+        if not path:
+            self._warn("请选择导出目录。")
+            return
+        self.rasterFileWidget.setFilePath(path)
+        out_dir = os.path.dirname(path) or "."
+        if not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        try:
+            self._rasterize_final_layer(path)
+            self.iface.addRasterLayer(path, os.path.splitext(
+                os.path.basename(path))[0])
+            self.iface.messageBar().pushSuccess(
+                "地物分类", "最终栅格图像已导出:{}".format(path))
         except Exception as exc:  # noqa: BLE001
             self._warn("导出栅格图像失败:{}".format(exc))
 

@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="UTF-8"?>
 <ui version="4.0">
  <class>LandCoverClassificationDialogBase</class>
  <widget class="QDialog" name="LandCoverClassificationDialogBase">
@@ -15,273 +15,402 @@
   </property>
   <layout class="QVBoxLayout" name="rootLayout">
    <item>
-    <widget class="QGroupBox" name="modelGroup">
-     <property name="title">
-      <string>模型</string>
+    <widget class="QTabWidget" name="mainTabWidget">
+     <property name="currentIndex">
+      <number>0</number>
      </property>
-     <layout class="QGridLayout" name="modelLayout">
-      <item row="0" column="0">
-       <widget class="QLabel" name="modelRootLabel">
-        <property name="text">
-         <string>模型根目录</string>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="1">
-       <widget class="QLineEdit" name="modelRootEdit"/>
-      </item>
-      <item row="0" column="2">
-       <widget class="QToolButton" name="browseModelRootBtn">
-        <property name="text">
-         <string>...</string>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="3">
-       <widget class="QPushButton" name="openModelDirBtn">
-        <property name="text">
-         <string>打开目录</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="modelLabel">
-        <property name="text">
-         <string>模型</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="1" colspan="2">
-       <widget class="QComboBox" name="modelCombo"/>
-      </item>
-      <item row="1" column="3">
-       <widget class="QPushButton" name="refreshModelsBtn">
-        <property name="text">
-         <string>刷新</string>
-        </property>
-       </widget>
-      </item>
-     </layout>
+     <widget class="QWidget" name="inferenceTab">
+      <attribute name="title">
+       <string>推理</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="inferenceLayout">
+       <item>
+        <widget class="QGroupBox" name="modelGroup">
+         <property name="title">
+          <string>模型</string>
+         </property>
+         <layout class="QGridLayout" name="modelLayout">
+          <item row="0" column="0">
+           <widget class="QLabel" name="modelRootLabel">
+            <property name="text">
+             <string>模型根目录</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QLineEdit" name="modelRootEdit"/>
+          </item>
+          <item row="0" column="2">
+           <widget class="QToolButton" name="browseModelRootBtn">
+            <property name="text">
+             <string>...</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="3">
+           <widget class="QPushButton" name="openModelDirBtn">
+            <property name="text">
+             <string>打开目录</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="modelLabel">
+            <property name="text">
+             <string>模型</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1" colspan="2">
+           <widget class="QComboBox" name="modelCombo"/>
+          </item>
+          <item row="1" column="3">
+           <widget class="QPushButton" name="refreshModelsBtn">
+            <property name="text">
+             <string>刷新</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="inputGroup">
+         <property name="title">
+          <string>输入</string>
+         </property>
+         <layout class="QGridLayout" name="inputLayout">
+          <item row="0" column="0" colspan="2">
+           <widget class="QRadioButton" name="layerRadio">
+            <property name="text">
+             <string>使用当前 QGIS 栅格图层</string>
+            </property>
+            <property name="checked">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="layerComboLabel">
+            <property name="text">
+             <string>图层</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QgsMapLayerComboBox" name="layerCombo"/>
+          </item>
+          <item row="2" column="0" colspan="2">
+           <widget class="QRadioButton" name="fileRadio">
+            <property name="text">
+             <string>从磁盘选择影像文件</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0">
+           <widget class="QLabel" name="inputFileLabel">
+            <property name="text">
+             <string>文件</string>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="1">
+           <widget class="QgsFileWidget" name="inputFileWidget"/>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="preprocessGroup">
+         <property name="title">
+          <string>预处理(按顺序应用)</string>
+         </property>
+         <layout class="QHBoxLayout" name="preprocessLayout">
+          <item>
+           <widget class="QCheckBox" name="claheCheck">
+            <property name="text">
+             <string>CLAHE 直方图均衡</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="sharpenCheck">
+            <property name="text">
+             <string>锐化</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="medianCheck">
+            <property name="text">
+             <string>中值滤波</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="gaussianCheck">
+            <property name="text">
+             <string>高斯滤波</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="preprocessSpacer">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>20</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="progressGroup">
+         <property name="title">
+          <string>推理进度</string>
+         </property>
+         <layout class="QVBoxLayout" name="progressLayout">
+          <item>
+           <widget class="QProgressBar" name="progressBar">
+            <property name="value">
+             <number>0</number>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="statusLabel">
+            <property name="text">
+             <string>空闲</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="inferenceButtonsLayout">
+         <item>
+          <spacer name="inferenceButtonsSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="runBtn">
+           <property name="text">
+            <string>运行</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="cancelBtn">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="text">
+            <string>取消</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="closeBtn">
+           <property name="text">
+            <string>关闭</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <spacer name="inferenceSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="exportTab">
+      <attribute name="title">
+       <string>编辑与导出</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="exportLayout">
+       <item>
+        <widget class="QGroupBox" name="workflowGroup">
+         <property name="title">
+          <string>输出设置</string>
+         </property>
+         <layout class="QGridLayout" name="workflowLayout">
+          <item row="0" column="0">
+           <widget class="QLabel" name="outputFormatLabel">
+            <property name="text">
+             <string>导出格式</string>
+            </property>
+           </widget>
+          </item>
+          <item row="0" column="1">
+           <widget class="QComboBox" name="outputFormatCombo">
+            <item>
+             <property name="text">
+              <string>Raster (GeoTIFF)</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>Vector (Shapefile)</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+          <item row="1" column="0">
+           <widget class="QLabel" name="outputDirLabel">
+            <property name="text">
+             <string>导出目录</string>
+            </property>
+           </widget>
+          </item>
+          <item row="1" column="1">
+           <widget class="QgsFileWidget" name="outputDirWidget"/>
+          </item>
+          <item row="2" column="0" colspan="2">
+           <widget class="QLabel" name="workflowHintLabel">
+            <property name="text">
+             <string>推理后会生成草稿矢量，请确认对象后再导出所选格式。</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="3" column="0" colspan="2">
+           <widget class="QgsFileWidget" name="outputFileWidget">
+            <property name="visible">
+             <bool>false</bool>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="0" colspan="2">
+           <widget class="QgsFileWidget" name="rasterFileWidget">
+            <property name="visible">
+             <bool>false</bool>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <widget class="QGroupBox" name="exportProgressGroup">
+         <property name="title">
+          <string>编辑与导出状态</string>
+         </property>
+         <layout class="QVBoxLayout" name="exportProgressLayout">
+          <item>
+           <widget class="QProgressBar" name="exportProgressBar">
+            <property name="value">
+             <number>0</number>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QLabel" name="exportStatusLabel">
+            <property name="text">
+             <string>空闲</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="exportButtonsLayout">
+         <item>
+          <spacer name="exportButtonsSpacer">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+         <item>
+          <widget class="QPushButton" name="confirmSelectedBtn">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="text">
+            <string>确认选中对象</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="confirmAllBtn">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="text">
+            <string>全部确认</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="exportRasterBtn">
+           <property name="enabled">
+            <bool>false</bool>
+           </property>
+           <property name="text">
+            <string>导出结果</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="exportCloseBtn">
+           <property name="text">
+            <string>关闭</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <spacer name="exportSpacer">
+         <property name="orientation">
+          <enum>Qt::Vertical</enum>
+         </property>
+         <property name="sizeHint" stdset="0">
+          <size>
+           <width>20</width>
+           <height>40</height>
+          </size>
+         </property>
+        </spacer>
+       </item>
+      </layout>
+     </widget>
     </widget>
-   </item>
-   <item>
-    <widget class="QGroupBox" name="inputGroup">
-     <property name="title">
-      <string>输入</string>
-     </property>
-     <layout class="QGridLayout" name="inputLayout">
-      <item row="0" column="0" colspan="2">
-       <widget class="QRadioButton" name="layerRadio">
-        <property name="text">
-         <string>使用当前 QGIS 栅格图层</string>
-        </property>
-        <property name="checked">
-         <bool>true</bool>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="layerComboLabel">
-        <property name="text">
-         <string>图层</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="1">
-       <widget class="QgsMapLayerComboBox" name="layerCombo"/>
-      </item>
-      <item row="2" column="0" colspan="2">
-       <widget class="QRadioButton" name="fileRadio">
-        <property name="text">
-         <string>从磁盘选择影像文件</string>
-        </property>
-       </widget>
-      </item>
-      <item row="3" column="0">
-       <widget class="QLabel" name="inputFileLabel">
-        <property name="text">
-         <string>文件</string>
-        </property>
-       </widget>
-      </item>
-      <item row="3" column="1">
-       <widget class="QgsFileWidget" name="inputFileWidget"/>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QGroupBox" name="preprocessGroup">
-     <property name="title">
-      <string>预处理(按顺序应用)</string>
-     </property>
-     <layout class="QHBoxLayout" name="preprocessLayout">
-      <item>
-       <widget class="QCheckBox" name="claheCheck">
-        <property name="text">
-         <string>CLAHE 直方图均衡</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QCheckBox" name="sharpenCheck">
-        <property name="text">
-         <string>锐化</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QCheckBox" name="medianCheck">
-        <property name="text">
-         <string>中值滤波</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QCheckBox" name="gaussianCheck">
-        <property name="text">
-         <string>高斯滤波</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <spacer name="preprocessSpacer">
-        <property name="orientation">
-         <enum>Qt::Horizontal</enum>
-        </property>
-        <property name="sizeHint" stdset="0">
-         <size>
-          <width>40</width>
-          <height>20</height>
-         </size>
-        </property>
-       </spacer>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QGroupBox" name="outputGroup">
-     <property name="title">
-      <string>输出</string>
-     </property>
-     <layout class="QGridLayout" name="outputLayout">
-      <item row="0" column="0">
-       <widget class="QLabel" name="outputFileLabel">
-        <property name="text">
-         <string>最终矢量</string>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="1">
-       <widget class="QgsFileWidget" name="outputFileWidget"/>
-      </item>
-      <item row="1" column="0">
-       <widget class="QLabel" name="rasterFileLabel">
-        <property name="text">
-         <string>最终栅格</string>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="1">
-       <widget class="QgsFileWidget" name="rasterFileWidget"/>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <widget class="QGroupBox" name="progressGroup">
-     <property name="title">
-      <string>进度</string>
-     </property>
-     <layout class="QVBoxLayout" name="progressLayout">
-      <item>
-       <widget class="QProgressBar" name="progressBar">
-        <property name="value">
-         <number>0</number>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QLabel" name="statusLabel">
-        <property name="text">
-         <string>空闲</string>
-        </property>
-       </widget>
-      </item>
-     </layout>
-    </widget>
-   </item>
-   <item>
-    <layout class="QHBoxLayout" name="buttonsLayout">
-     <item>
-      <spacer name="buttonsSpacer">
-       <property name="orientation">
-        <enum>Qt::Horizontal</enum>
-       </property>
-       <property name="sizeHint" stdset="0">
-        <size>
-         <width>40</width>
-         <height>20</height>
-        </size>
-       </property>
-      </spacer>
-     </item>
-     <item>
-      <widget class="QPushButton" name="confirmSelectedBtn">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>确认选中对象</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="confirmAllBtn">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>全部确认</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="exportRasterBtn">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>导出栅格</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="runBtn">
-       <property name="text">
-        <string>运行</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="cancelBtn">
-       <property name="enabled">
-        <bool>false</bool>
-       </property>
-       <property name="text">
-        <string>取消</string>
-       </property>
-      </widget>
-     </item>
-     <item>
-      <widget class="QPushButton" name="closeBtn">
-       <property name="text">
-        <string>关闭</string>
-       </property>
-      </widget>
-     </item>
-    </layout>
    </item>
   </layout>
  </widget>
