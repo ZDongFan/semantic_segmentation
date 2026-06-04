@@ -7,8 +7,9 @@
 ## 主要功能
 
 - 自动判断输入是否带地理坐标。
-- GeoTIFF 走 PaddleRS `slider_predict`，保留原始 CRS 和 GeoTransform。
-- 普通 JPG/PNG/TIF 先 resize 到 `512 x 512`，推理后再按原始尺寸回采样。
+- 带地理参考的 GeoTIFF 使用 PaddleRS `slider_predict` 推理，并保留原始 CRS 和 GeoTransform。
+- `slider_predict` 的 `block_size` 会根据当前 GPU 空闲显存自适应选择，不是固定值。
+- 普通 JPG/PNG/TIF 会先 resize 到 `512 x 512`，推理后再按原始尺寸使用最近邻回采样。
 - 支持可选预处理链：CLAHE、锐化、中值滤波、高斯滤波。
 - 后台子进程执行推理，避免卡住 QGIS 主界面。
 - 自动扫描 `land_cover_classification/models/semantic_segmentation/` 下的分割模型并填充下拉框。
@@ -36,7 +37,7 @@
 2. 将 `land_cover_classification/` 目录部署到 QGIS 插件目录。
 3. 在 QGIS 对应的 Python 环境中安装运行依赖。
 4. 将导出的 PaddleRS 模型子目录放入 `land_cover_classification/models/semantic_segmentation/`。
-5. 重启 QGIS，在插件管理器中启用 `LandCoverClassification`。
+5. 重启 QGIS，并在插件管理器中启用 `LandCoverClassification`。
 
 更详细的依赖安装说明见 [`docs/install.md`](docs/install.md)。
 
@@ -57,30 +58,30 @@
 
 ```text
 new_semantic_segmentation/
-├── README.md                          # 项目说明文档
-├── LICENSE                            # 开源许可证
-├── AGENTS.md                          # Codex 协作与项目约定
-├── docs/                              # 额外文档
-│   ├── install.md                     # 依赖安装说明
-│   └── model_layout.md                # 模型目录结构说明
-└── land_cover_classification/         # QGIS 插件主体目录
-    ├── __init__.py                    # 插件入口
-    ├── land_cover_classification.py   # 主插件类，负责菜单与对话框入口
-    ├── land_cover_classification_dialog.py
-    │                                  # 主对话框逻辑、草稿层确认与结果导出
-    ├── land_cover_classification_dialog_base.ui
-    │                                  # Qt Designer 维护的界面文件
-    ├── inference.py                   # 核心推理逻辑，输出单波段类别栅格
-    ├── inference_runner.py            # 独立推理子进程入口
-    ├── preprocess.py                  # 推理前预处理链
-    ├── model_scan.py                  # 扫描可用模型并解析 model.yml
-    ├── deps_check.py                  # 运行依赖检查与提示
-    ├── metadata.txt                   # QGIS 插件元数据
-    ├── pb_tool.cfg                    # pb_tool 打包配置
-    ├── vendor/                        # 随插件打包的第三方代码
-    │   └── PaddleRS/                  # 内置 PaddleRS 代码与依赖
-    └── models/                        # 模型根目录
-        └── semantic_segmentation/     # 语义分割模型默认存放位置
+|-- README.md                          # 项目说明文档
+|-- LICENSE                            # 开源许可证
+|-- AGENTS.md                          # Codex 协作与项目约定
+|-- docs/                              # 额外文档
+|   |-- install.md                     # 依赖安装说明
+|   `-- model_layout.md                # 模型目录结构说明
+`-- land_cover_classification/         # QGIS 插件主体目录
+    |-- __init__.py                    # 插件入口
+    |-- land_cover_classification.py   # 主插件类，负责菜单与对话框入口
+    |-- land_cover_classification_dialog.py
+    |                                   # 主对话框逻辑、草稿层确认与结果导出
+    |-- land_cover_classification_dialog_base.ui
+    |                                   # Qt Designer 维护的界面文件
+    |-- inference.py                   # 核心推理逻辑，输出单波段类别栅格
+    |-- inference_runner.py            # 独立推理子进程入口
+    |-- preprocess.py                  # 推理前预处理链
+    |-- model_scan.py                  # 扫描可用模型并解析 model.yml
+    |-- deps_check.py                  # 运行依赖检查与提示
+    |-- metadata.txt                   # QGIS 插件元数据
+    |-- pb_tool.cfg                    # pb_tool 打包配置
+    |-- vendor/                        # 随插件打包的第三方代码
+    |   `-- PaddleRS/                  # 内置 PaddleRS 代码与依赖
+    `-- models/                        # 模型根目录
+        `-- semantic_segmentation/     # 语义分割模型默认存放位置
 ```
 
 ## 许可
