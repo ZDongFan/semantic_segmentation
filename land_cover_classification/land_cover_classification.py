@@ -18,9 +18,9 @@
  *                                                                         *
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction
+from qgis.PyQt.QtWidgets import QAction, QDockWidget
 
 # 从 resources.py 加载 Qt 资源
 from .resources import *
@@ -61,6 +61,8 @@ class LandCoverClassification:
         # 标记插件是否是当前 QGIS 会话中第一次启动
         # 必须在 initGui() 中赋值,以便插件重载后仍生效
         self.first_start = None
+        self.dlg = None
+        self.dock = None
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -168,6 +170,38 @@ class LandCoverClassification:
                 action)
             self.iface.removeToolBarIcon(action)
 
+        if self.dock is not None:
+            if self.dlg is not None:
+                self.dlg.close()
+            self.iface.mainWindow().removeDockWidget(self.dock)
+            self.dock.deleteLater()
+            self.dock = None
+            self.dlg = None
+
+
+    def _create_dock(self):
+        """创建默认停靠在 QGIS 右侧的插件面板。"""
+        dock = QDockWidget(self.tr(u'地物分类'), self.iface.mainWindow())
+        dock.setObjectName("LandCoverClassificationDock")
+        dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        dock.setFeatures(
+            QDockWidget.DockWidgetClosable |
+            QDockWidget.DockWidgetMovable |
+            QDockWidget.DockWidgetFloatable
+        )
+
+        self.dlg = LandCoverClassificationDialog(self.iface, parent=dock)
+        self.dlg.setWindowFlags(Qt.Widget)
+        try:
+            self.dlg.closeBtn.clicked.disconnect()
+        except TypeError:
+            pass
+        self.dlg.closeBtn.clicked.connect(dock.hide)
+
+        dock.setWidget(self.dlg)
+        self.iface.mainWindow().addDockWidget(Qt.RightDockWidgetArea, dock)
+        self.dock = dock
+
 
     def run(self):
         """打开插件主对话框。"""
@@ -186,12 +220,12 @@ class LandCoverClassification:
             return
 
         # 延迟构造对话框,只在首次使用时创建一次。
-        if self.first_start:
+        if self.first_start or self.dock is None:
             self.first_start = False
-            self.dlg = LandCoverClassificationDialog(
-                self.iface, parent=self.iface.mainWindow())
+            self._create_dock()
 
         # 非模态:推理过程中用户仍可平移/缩放画布。
         self.dlg.show()
-        self.dlg.raise_()
-        self.dlg.activateWindow()
+        self.dock.show()
+        self.dock.raise_()
+        self.dock.activateWindow()
