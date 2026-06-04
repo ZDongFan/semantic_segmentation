@@ -48,6 +48,7 @@ FIELD_CLASS_NAME = "class_name"
 FIELD_REVIEW_STATUS = "review_status"
 FIELD_SOURCE_ID = "source_id"
 BACKGROUND_CLASS_NAMES = {"sliding"}
+DRAFT_SIMPLIFY_PIXEL_TOLERANCE = 5
 STATUS_PENDING = "待确认"
 STATUS_CONFIRMED = "已确认"
 
@@ -713,27 +714,66 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         updates = []
         background_fids = []
+        geometry_updates = []
+        tolerance = self._draft_simplify_tolerance()
         for feature in layer.getFeatures():
             class_id = self._safe_int(feature[FIELD_CLASS_ID], 0)
             if self._is_background_class_id(class_id):
                 background_fids.append(feature.id())
                 continue
+            geometry = self._simplified_draft_geometry(feature.geometry(),
+                                                       tolerance)
+            if geometry is not None:
+                geometry_updates.append((feature.id(), geometry))
             updates.append({
                 "fid": feature.id(),
                 FIELD_CLASS_NAME: self._class_name(class_id),
                 FIELD_REVIEW_STATUS: STATUS_PENDING,
                 FIELD_SOURCE_ID: int(feature.id()),
             })
-        if updates or background_fids:
+        if updates or background_fids or geometry_updates:
             layer.startEditing()
             if background_fids:
                 layer.deleteFeatures(background_fids)
+            for fid, geometry in geometry_updates:
+                layer.changeGeometry(fid, geometry)
             for item in updates:
                 fid = item.pop("fid")
                 for name, value in item.items():
                     layer.changeAttributeValue(
                         fid, layer.fields().indexFromName(name), value)
             layer.commitChanges()
+
+    def _draft_simplify_tolerance(self):
+        from osgeo import gdal
+
+        if not self._label_path:
+            return float(DRAFT_SIMPLIFY_PIXEL_TOLERANCE)
+        ds = gdal.Open(self._label_path)
+        if ds is None:
+            return float(DRAFT_SIMPLIFY_PIXEL_TOLERANCE)
+        gt = ds.GetGeoTransform()
+        ds = None
+        if gt is None:
+            return float(DRAFT_SIMPLIFY_PIXEL_TOLERANCE)
+        pixel_width = (gt[1] ** 2 + gt[2] ** 2) ** 0.5
+        pixel_height = (gt[4] ** 2 + gt[5] ** 2) ** 0.5
+        pixel_size = max(pixel_width, pixel_height)
+        if pixel_size <= 0:
+            return float(DRAFT_SIMPLIFY_PIXEL_TOLERANCE)
+        return DRAFT_SIMPLIFY_PIXEL_TOLERANCE * pixel_size
+
+    def _simplified_draft_geometry(self, geometry, tolerance):
+        if geometry is None or geometry.isEmpty() or tolerance <= 0:
+            return None
+        simplified = geometry.simplify(tolerance)
+        if simplified is None or simplified.isEmpty():
+            return None
+        if not simplified.isGeosValid():
+            simplified = simplified.makeValid()
+        if simplified is None or simplified.isEmpty():
+            return None
+        return simplified
 
     def _place_layer_above_input(self, layer):
         root = QgsProject.instance().layerTreeRoot()
