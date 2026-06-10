@@ -1,0 +1,9 @@
+# 把已导出的 PaddleRS 分割模型放到本目录下。
+#
+# 每个子目录须包含一个完整的导出模型,至少包括:
+#   model.yml
+#   model.pdmodel
+#   model.pdiparams
+#   pipeline.yml
+#
+# 详细要求见 ../../docs/model_layout.md。

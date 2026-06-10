@@ -20,10 +20,14 @@ from qgis.PyQt.QtGui import QColor, QDesktopServices
 from qgis.core import (
     QgsApplication,
     QgsCategorizedSymbolRenderer,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
     QgsFeature,
     QgsField,
     QgsFillSymbol,
+    QgsGeometry,
     QgsMapLayerProxyModel,
+    QgsPointXY,
     QgsProject,
     QgsRendererCategory,
     QgsVectorFileWriter,
@@ -33,6 +37,8 @@ from qgis.core import (
 )
 from qgis.gui import QgsFileWidget
 
+from . import sam_deps_check
+from .ai_segment_tool import AiSegmentMapTool
 from .inference import is_georeferenced
 from .model_scan import get_model_info
 from .model_scan import scan as scan_models
@@ -49,10 +55,15 @@ FIELD_REVIEW_STATUS = "review_status"
 FIELD_SOURCE_ID = "source_id"
 BACKGROUND_CLASS_NAMES = {"background"}
 DRAFT_SIMPLIFY_PIXEL_TOLERANCE = 5
+AI_PREVIEW_SIMPLIFY_PIXEL_TOLERANCE = 8
+AI_PREVIEW_MAX_VERTICES = 6000
 OUTPUT_FORMAT_RASTER = "raster"
 OUTPUT_FORMAT_VECTOR = "vector"
 STATUS_PENDING = "待确认"
 STATUS_CONFIRMED = "已确认"
+
+SAM_DEFAULT_MODEL_TYPE = "vit_b"
+LANDSLIDE_CLASS_NAME = "landslide"
 
 
 def _default_model_root():
@@ -300,6 +311,24 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._input_path = None
         self._class_labels = []
 
+        self._ai_tool = None
+        self._ai_previous_tool = None
+        self._ai_worker = None
+        self._ai_worker_ready = False
+        self._ai_request_seq = 0
+        self._ai_pending_id = None
+        self._ai_responses = {}
+        self._ai_image_path = None
+        self._ai_image_loaded = False
+        self._ai_image_size = None
+        self._ai_image_geotransform = None
+        self._ai_image_crs = None
+        self._ai_preview_geometry = None
+        self._draft_layer_original_name = None
+        self._ai_buffer = ""
+        self._ai_predicting = False
+        self._ai_queued_points = None
+
         self._init_defaults()
         self._wire_signals()
         self._refresh_models()
@@ -346,6 +375,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.exportRasterBtn.clicked.connect(self._on_export_raster)
         self.closeBtn.clicked.connect(self.close)
         self.exportCloseBtn.clicked.connect(self.close)
+
+        self.aiStartBtn.clicked.connect(self._on_ai_start)
+        self.aiStopBtn.clicked.connect(self._on_ai_stop)
+        self.aiUndoPointBtn.clicked.connect(self._on_ai_undo_point)
+        self.aiClearPointsBtn.clicked.connect(self._on_ai_clear_points)
+        self.aiAppendDraftBtn.clicked.connect(self._on_ai_append_draft)
+
         QgsProject.instance().layersWillBeRemoved.connect(
             self._on_layers_will_be_removed)
 
@@ -399,9 +435,19 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             layer = self.layerCombo.currentLayer()
             if layer is None:
                 return None
-            return layer.source()
+            return self._normalize_input_path(layer.source())
         path = self.inputFileWidget.filePath().strip()
-        return path or None
+        return self._normalize_input_path(path) or None
+
+    def _normalize_input_path(self, path):
+        if not path:
+            return None
+        if os.path.exists(path):
+            return path
+        candidate = path.split("|", 1)[0]
+        if candidate and os.path.exists(candidate):
+            return candidate
+        return path
 
     def _resolve_input_layer(self):
         if self.layerRadio.isChecked():
@@ -669,11 +715,20 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self.confirmSelectedBtn.setEnabled(True)
             self.confirmAllBtn.setEnabled(True)
             self.exportRasterBtn.setEnabled(True)
-            self.statusLabel.setText("草稿层已生成，请编辑后确认对象。")
+            self._switch_to_export_tab()
+            self.statusLabel.setText("草稿层已生成,请编辑后确认对象。")
             self.iface.messageBar().pushSuccess(
-                "地物分类", "可编辑草稿层已加载。")
+                "地物分类", "可编辑草稿层已加载,可在编辑与导出页启动 AI 编辑。")
         except Exception as exc:  # noqa: BLE001
             self._warn("生成草稿层失败:{}".format(exc))
+
+    def _switch_to_export_tab(self):
+        try:
+            export_index = self.mainTabWidget.indexOf(self.exportTab)
+            if export_index >= 0:
+                self.mainTabWidget.setCurrentIndex(export_index)
+        except AttributeError:
+            pass
 
     def _load_reference_input_layer(self):
         if self._input_layer is not None and self._input_layer.isValid():
@@ -809,6 +864,16 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return None
         return simplified
 
+    def _ai_preview_simplify_tolerance(self):
+        gt = self._ai_image_geotransform
+        if gt:
+            pixel_width = (gt[1] ** 2 + gt[2] ** 2) ** 0.5
+            pixel_height = (gt[4] ** 2 + gt[5] ** 2) ** 0.5
+            pixel_size = max(pixel_width, pixel_height)
+            if pixel_size > 0:
+                return AI_PREVIEW_SIMPLIFY_PIXEL_TOLERANCE * pixel_size
+        return float(AI_PREVIEW_SIMPLIFY_PIXEL_TOLERANCE)
+
     def _place_layer_above_input(self, layer):
         root = QgsProject.instance().layerTreeRoot()
         input_node = (root.findLayer(self._input_layer.id())
@@ -932,6 +997,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if self._draft_layer_id in layer_ids:
             self._draft_layer = None
             self._draft_layer_id = None
+            self._draft_layer_original_name = None
         if self._final_layer_id in layer_ids:
             self._final_layer = None
             self._final_layer_id = None
@@ -1390,4 +1456,686 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def closeEvent(self, event):
         if self._process is not None:
             self._process.kill()
+        self._stop_ai_editing(silent=True)
         super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # AI 辅助编辑相关
+    # ------------------------------------------------------------------
+
+    def _on_ai_start(self):
+        if not self._ensure_draft_layer():
+            self._warn("请先运行推理生成草稿图层,再启动 AI 编辑。")
+            return
+        image_path = self._input_path or self._resolve_input_path()
+        if not image_path or not os.path.isfile(image_path):
+            self._warn("找不到推理使用的输入影像,无法启动 AI 编辑。")
+            return
+
+        ok, message = sam_deps_check.ensure_ready()
+        if not ok:
+            QtWidgets.QMessageBox.warning(
+                self, "SAM 环境未就绪", message)
+            return
+
+        if not self._start_ai_worker():
+            return
+
+        self._ai_image_path = image_path
+        self._ai_image_loaded = False
+        try:
+            self._load_ai_image_metadata(image_path)
+        except Exception as exc:  # noqa: BLE001
+            self._warn("无法读取影像元数据:{}".format(exc))
+            self._stop_ai_editing(silent=True)
+            return
+
+        if not self._send_ai_command({"op": "set_image",
+                                      "image_path": image_path}):
+            self._stop_ai_editing(silent=True)
+            return
+        self._ai_image_loaded = True
+
+        canvas = self.iface.mapCanvas()
+        self._ai_previous_tool = canvas.mapTool()
+        self._ai_tool = AiSegmentMapTool(canvas, self._on_ai_points_changed)
+        canvas.setMapTool(self._ai_tool)
+        self._mark_draft_layer_ai_preview()
+        self._remove_legacy_ai_preview_layers()
+
+        self.aiStartBtn.setEnabled(False)
+        self.aiStopBtn.setEnabled(True)
+        self.aiUndoPointBtn.setEnabled(True)
+        self.aiClearPointsBtn.setEnabled(True)
+        self.aiAppendDraftBtn.setEnabled(False)
+        self.aiStatusLabel.setText(
+            "AI 编辑已启动。左键添加正点,右键添加负点。")
+        self.iface.messageBar().pushInfo(
+            "地物分类", "AI 编辑已启动,请在画布上标注正负样本点。")
+
+    def _on_ai_stop(self):
+        self._stop_ai_editing(silent=False)
+
+    def _stop_ai_editing(self, silent=False):
+        canvas = self.iface.mapCanvas() if self.iface else None
+        self._clear_ai_preview()
+        self._restore_draft_layer_name()
+        if self._ai_tool is not None:
+            try:
+                self._ai_tool.clear_points()
+                self._ai_tool.clear_preview()
+            except Exception:
+                pass
+            if canvas is not None and self._ai_previous_tool is not None:
+                try:
+                    canvas.setMapTool(self._ai_previous_tool)
+                except Exception:
+                    pass
+            try:
+                self._ai_tool.dispose()
+            except Exception:
+                pass
+        self._ai_tool = None
+        self._ai_previous_tool = None
+        self._ai_preview_geometry = None
+        self._ai_pending_id = None
+
+        if self._ai_worker is not None:
+            try:
+                self._send_ai_command({"op": "quit"}, expect_response=False)
+            except Exception:
+                pass
+            try:
+                if self._ai_worker.state() != QProcess.NotRunning:
+                    self._ai_worker.waitForFinished(2000)
+            except Exception:
+                pass
+            try:
+                self._ai_worker.kill()
+            except Exception:
+                pass
+            try:
+                self._ai_worker.deleteLater()
+            except Exception:
+                pass
+        self._ai_worker = None
+        self._ai_worker_ready = False
+        self._ai_responses = {}
+        self._ai_image_loaded = False
+        self._ai_preview_geometry = None
+        self._ai_buffer = ""
+        self._ai_predicting = False
+        self._ai_queued_points = None
+
+        self.aiStartBtn.setEnabled(True)
+        self.aiStopBtn.setEnabled(False)
+        self.aiUndoPointBtn.setEnabled(False)
+        self.aiClearPointsBtn.setEnabled(False)
+        self.aiAppendDraftBtn.setEnabled(False)
+        if not silent:
+            self.aiStatusLabel.setText("AI 编辑已停止。")
+
+    def _on_ai_undo_point(self):
+        if self._ai_tool is None:
+            return
+        self._ai_tool.undo_last_point()
+
+    def _on_ai_clear_points(self):
+        if self._ai_tool is None:
+            return
+        self._ai_tool.clear_points()
+        self._clear_ai_preview()
+        self.aiAppendDraftBtn.setEnabled(False)
+        self.aiStatusLabel.setText("已清空提示点。")
+
+    def _on_ai_append_draft(self):
+        if not self._ensure_draft_layer() or self._ai_preview_geometry is None:
+            return
+        class_id = self._ai_landslide_class_id()
+        self._write_ai_geometry_to_draft(self._ai_preview_geometry, class_id)
+
+    def _ai_landslide_class_id(self):
+        for class_id, label in enumerate(self._class_labels or []):
+            if str(label).strip().lower() == LANDSLIDE_CLASS_NAME:
+                return class_id
+        for class_id, _label in enumerate(self._class_labels or []):
+            if not self._is_background_class_id(class_id):
+                return class_id
+        return 1
+
+    def _write_ai_geometry_to_draft(self, geometry, class_id):
+        layer = self._draft_layer
+        geometry = self._coerce_ai_geometry_for_layer(geometry, layer)
+        if geometry is None or geometry.isEmpty():
+            self._warn("当前没有可写入的 AI 预览几何。")
+            return
+        if not layer.isEditable():
+            if not layer.startEditing():
+                self._warn("草稿层无法进入编辑状态。")
+                return
+
+        class_name = self._class_name(class_id)
+        new_feature = QgsFeature(layer.fields())
+        new_feature.setGeometry(geometry)
+        new_feature.setAttribute(FIELD_CLASS_ID, class_id)
+        new_feature.setAttribute(FIELD_CLASS_NAME, class_name)
+        new_feature.setAttribute(FIELD_REVIEW_STATUS, STATUS_PENDING)
+        new_source_id = self._next_draft_source_id(layer)
+        new_feature.setAttribute(FIELD_SOURCE_ID, new_source_id)
+        layer.addFeature(new_feature)
+
+        if not layer.commitChanges():
+            self._warn("写入草稿层失败:{}".format(layer.commitErrors()))
+            layer.rollBack()
+            return
+        layer.triggerRepaint()
+        self._apply_vector_style(layer, draft=True)
+
+        if self._ai_tool is not None:
+            self._ai_tool.clear_points()
+        self._clear_ai_preview()
+        self._restore_draft_layer_name()
+        self.aiAppendDraftBtn.setEnabled(False)
+        self.aiStatusLabel.setText(
+            "追加 1 个 landslide 草稿对象,类别 {}({})。".format(
+                class_id, class_name))
+        self.iface.messageBar().pushSuccess(
+            "地物分类", "AI 编辑结果已写入草稿层。")
+
+    def _next_draft_source_id(self, layer):
+        max_source = 0
+        for feature in layer.getFeatures():
+            source_id = self._safe_int(feature[FIELD_SOURCE_ID], 0)
+            if source_id > max_source:
+                max_source = source_id
+        return max_source + 1
+
+    # ------------------------------------------------------------------
+    # AI Worker 子进程
+    # ------------------------------------------------------------------
+
+    def _start_ai_worker(self):
+        worker_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "sam_worker.py")
+        python_exe = sam_deps_check.default_python_executable()
+        if not os.path.isfile(python_exe):
+            self._warn("找不到 SAM 子进程解释器:{}".format(python_exe))
+            return False
+
+        self._ai_worker = QProcess(self)
+        self._ai_responses = {}
+        self._ai_pending_id = None
+        self._ai_image_loaded = False
+        self._ai_worker.setProcessChannelMode(QProcess.SeparateChannels)
+        env = QProcessEnvironment()
+        for key, value in sam_deps_check.runtime_environment(
+                python_exe).items():
+            env.insert(key, value)
+        self._ai_worker.setProcessEnvironment(env)
+        self._ai_worker.readyReadStandardOutput.connect(
+            self._on_ai_worker_output)
+        self._ai_worker.readyReadStandardError.connect(
+            self._on_ai_worker_stderr)
+        self._ai_worker.finished.connect(self._on_ai_worker_finished)
+        self._ai_worker.errorOccurred.connect(self._on_ai_worker_error)
+        self._ai_worker.start(python_exe, [worker_script])
+        if not self._ai_worker.waitForStarted(5000):
+            self._warn("SAM 子进程启动失败。")
+            self._ai_worker = None
+            return False
+
+        self.aiStatusLabel.setText("正在加载 SAM 模型...")
+        QgsApplication.processEvents()
+        if not self._send_ai_command({
+                "op": "init",
+                "model_path": sam_deps_check.default_model_path(),
+                "model_type": SAM_DEFAULT_MODEL_TYPE,
+        }):
+            return False
+        self._ai_worker_ready = True
+        return True
+
+    def _send_ai_command(self, payload, expect_response=True, timeout_ms=60000):
+        if self._ai_worker is None:
+            return False
+        if self._ai_worker.state() != QProcess.Running:
+            return False
+        self._ai_request_seq += 1
+        req_id = self._ai_request_seq
+        self._ai_responses.pop(req_id, None)
+        payload = dict(payload)
+        payload["id"] = req_id
+        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        bytes_written = self._ai_worker.write(data)
+        if bytes_written < 0:
+            return False
+        self._ai_worker.waitForBytesWritten(2000)
+        if not expect_response:
+            return True
+
+        self._ai_pending_id = req_id
+        elapsed = 0
+        while req_id not in self._ai_responses and elapsed < timeout_ms:
+            if self._ai_worker.state() != QProcess.Running:
+                self._ai_pending_id = None
+                self._warn("SAM 子进程已退出。")
+                return False
+            if self._ai_worker.waitForReadyRead(500):
+                self._on_ai_worker_output()
+            elapsed += 500
+            QgsApplication.processEvents()
+        if req_id not in self._ai_responses:
+            self._ai_pending_id = None
+            self._warn("SAM 子进程响应超时。")
+            return False
+        response = self._ai_responses.pop(req_id)
+        if self._ai_pending_id == req_id:
+            self._ai_pending_id = None
+        if not response.get("ok", True):
+            error = response.get("error", "SAM 子进程返回错误。")
+            self._warn("SAM 子进程错误:{}".format(error))
+            return False
+        return True
+
+    def _on_ai_worker_output(self):
+        if self._ai_worker is None:
+            return
+        data = bytes(self._ai_worker.readAllStandardOutput()).decode(
+            "utf-8", errors="replace")
+        self._ai_buffer += data
+        while "\n" in self._ai_buffer:
+            line, self._ai_buffer = self._ai_buffer.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            self._handle_ai_message(message)
+
+    def _on_ai_worker_stderr(self):
+        if self._ai_worker is None:
+            return
+        data = bytes(self._ai_worker.readAllStandardError()).decode(
+            "utf-8", errors="replace").strip()
+        if data:
+            QgsApplication.messageLog().logMessage(
+                data, "LandCoverClassification", Qgis.Warning)
+
+    def _handle_ai_message(self, message):
+        if message.get("event") == "ready":
+            return
+        req_id = message.get("id")
+        if req_id is not None:
+            self._ai_responses[req_id] = message
+            if req_id == self._ai_pending_id:
+                self._ai_pending_id = None
+        if not message.get("ok", True):
+            if req_id is None:
+                error = message.get("error", "SAM 子进程返回错误。")
+                self._warn("SAM 子进程错误:{}".format(error))
+            return
+
+        if "polygons" in message:
+            geometry = self._build_geometry_from_message(message)
+            self._ai_preview_geometry = (
+                QgsGeometry(geometry) if geometry is not None
+                and not geometry.isEmpty() else None)
+            enabled = self._ai_preview_geometry is not None
+            if enabled:
+                self._show_ai_preview_on_draft(self._ai_preview_geometry)
+            else:
+                self._clear_ai_preview()
+            self.aiAppendDraftBtn.setEnabled(enabled)
+            score = message.get("score")
+            if enabled and score is not None:
+                self.aiStatusLabel.setText(
+                    "已生成 mask 预览,score={:.3f}".format(float(score)))
+            elif enabled:
+                self.aiStatusLabel.setText("已生成 mask 预览。")
+            else:
+                self.aiStatusLabel.setText("当前点提示未生成有效 mask。")
+
+    def _on_ai_worker_finished(self, exit_code, exit_status):
+        self._ai_worker_ready = False
+        self._ai_image_loaded = False
+        if exit_status != QProcess.NormalExit or exit_code != 0:
+            QgsApplication.messageLog().logMessage(
+                "SAM worker exited with code {}".format(exit_code),
+                "LandCoverClassification", Qgis.Warning)
+
+    def _on_ai_worker_error(self, error):
+        if self._ai_worker is None:
+            return
+        QgsApplication.messageLog().logMessage(
+            "SAM worker error: {}".format(error),
+            "LandCoverClassification", Qgis.Warning)
+
+    # ------------------------------------------------------------------
+    # 影像 / 几何坐标转换
+    # ------------------------------------------------------------------
+
+    def _load_ai_image_metadata(self, image_path):
+        from osgeo import gdal, osr
+
+        ds = gdal.Open(image_path)
+        if ds is None:
+            raise IOError("无法打开影像:{}".format(image_path))
+        try:
+            width = ds.RasterXSize
+            height = ds.RasterYSize
+            gt = ds.GetGeoTransform()
+            proj = ds.GetProjection()
+        finally:
+            ds = None
+
+        self._ai_image_size = (width, height)
+        self._ai_image_geotransform = gt if gt and gt != (0, 1, 0, 0, 0, 1) \
+            else None
+        if proj:
+            srs = osr.SpatialReference()
+            srs.ImportFromWkt(proj)
+            authid = None
+            try:
+                code = srs.GetAuthorityCode(None)
+                if code:
+                    authid = "{}:{}".format(
+                        srs.GetAuthorityName(None) or "EPSG", code)
+            except Exception:
+                authid = None
+            self._ai_image_crs = QgsCoordinateReferenceSystem(authid) \
+                if authid else QgsCoordinateReferenceSystem.fromWkt(proj)
+        else:
+            self._ai_image_crs = QgsCoordinateReferenceSystem()
+
+    def _map_point_to_image(self, map_point):
+        """把地图坐标转换为影像像素坐标。"""
+        canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+        image_crs = self._ai_image_crs
+
+        if (image_crs is not None and image_crs.isValid()
+                and canvas_crs.isValid() and image_crs != canvas_crs):
+            transform = QgsCoordinateTransform(
+                canvas_crs, image_crs, QgsProject.instance())
+            image_point = transform.transform(QgsPointXY(map_point))
+        else:
+            image_point = QgsPointXY(map_point)
+
+        gt = self._ai_image_geotransform
+        if gt is None:
+            # 没有地理坐标的影像,直接把地图坐标视作像素坐标
+            return (float(image_point.x()), float(image_point.y()))
+
+        det = gt[1] * gt[5] - gt[2] * gt[4]
+        if abs(det) < 1e-12:
+            return None
+        x = image_point.x() - gt[0]
+        y = image_point.y() - gt[3]
+        px = (gt[5] * x - gt[2] * y) / det
+        py = (-gt[4] * x + gt[1] * y) / det
+        return (float(px), float(py))
+
+    def _image_point_to_layer(self, px, py):
+        gt = self._ai_image_geotransform
+        if gt is None:
+            return QgsPointXY(px, py)
+        x = gt[0] + gt[1] * px + gt[2] * py
+        y = gt[3] + gt[4] * px + gt[5] * py
+        point = QgsPointXY(x, y)
+        layer_crs = (self._draft_layer.crs()
+                     if self._draft_layer is not None else None)
+        image_crs = self._ai_image_crs
+        if (image_crs is not None and image_crs.isValid()
+                and layer_crs is not None and layer_crs.isValid()
+                and image_crs != layer_crs):
+            transform = QgsCoordinateTransform(
+                image_crs, layer_crs, QgsProject.instance())
+            point = transform.transform(point)
+        return point
+
+    def _closed_ring(self, points):
+        if points and points[0] != points[-1]:
+            points = list(points) + [QgsPointXY(points[0])]
+        return points
+
+    def _build_geometry_from_message(self, message):
+        polygons = message.get("polygons") or []
+        if not polygons:
+            return QgsGeometry()
+        polygons = sorted(
+            polygons,
+            key=lambda polygon: self._pixel_ring_area(
+                polygon.get("shell") or []),
+            reverse=True)[:1]
+        multi_polygon = []
+        for polygon in polygons:
+            shell = polygon.get("shell") or []
+            holes = polygon.get("holes") or []
+            shell_pts = [self._image_point_to_layer(p[0], p[1])
+                         for p in shell]
+            if len(shell_pts) < 3:
+                continue
+            rings = [self._closed_ring(shell_pts)]
+            for hole in holes:
+                hole_pts = [self._image_point_to_layer(p[0], p[1])
+                            for p in hole]
+                if len(hole_pts) >= 3:
+                    rings.append(self._closed_ring(hole_pts))
+            multi_polygon.append(rings)
+        if not multi_polygon:
+            return QgsGeometry()
+        if len(multi_polygon) == 1:
+            geometry = QgsGeometry.fromPolygonXY(multi_polygon[0])
+        else:
+            geometry = QgsGeometry.fromMultiPolygonXY(multi_polygon)
+        return self._polygon_only_geometry(geometry, make_valid=False)
+
+    def _pixel_ring_area(self, ring):
+        if not ring:
+            return 0.0
+        area = 0.0
+        for idx, point in enumerate(ring):
+            previous = ring[idx - 1]
+            area += float(previous[0]) * float(point[1])
+            area -= float(point[0]) * float(previous[1])
+        return abs(area) * 0.5
+
+    def _clear_ai_preview(self):
+        if self._ai_tool is not None:
+            self._ai_tool.clear_preview()
+        self._ai_preview_geometry = None
+
+    def _show_ai_preview_on_draft(self, geometry):
+        layer = self._draft_layer if self._layer_is_usable(
+            self._draft_layer) else None
+        if self._ai_tool is None:
+            return
+        preview_geometry = self._preview_geometry_for_canvas(geometry)
+        if preview_geometry is None or preview_geometry.isEmpty():
+            self._ai_tool.clear_preview()
+            return
+        self._ai_tool.show_preview(preview_geometry, layer)
+
+    def _mark_draft_layer_ai_preview(self):
+        if not self._layer_is_usable(self._draft_layer):
+            return
+        if self._draft_layer_original_name is None:
+            self._draft_layer_original_name = self._draft_layer.name()
+        self._draft_layer.setName("地物分类草稿 / AI mask 预览")
+
+    def _restore_draft_layer_name(self):
+        if (self._draft_layer_original_name is None
+                or not self._layer_is_usable(self._draft_layer)):
+            self._draft_layer_original_name = None
+            return
+        self._draft_layer.setName(self._draft_layer_original_name)
+        self._draft_layer_original_name = None
+
+    def _remove_legacy_ai_preview_layers(self):
+        project = QgsProject.instance()
+        layer_ids = [
+            layer.id()
+            for layer in project.mapLayersByName("AI mask 预览")
+        ]
+        if layer_ids:
+            project.removeMapLayers(layer_ids)
+
+    def _preview_geometry_for_canvas(self, geometry):
+        if geometry is None or geometry.isEmpty():
+            return QgsGeometry()
+        parts = self._polygon_parts_xy(geometry)
+        if not parts:
+            return QgsGeometry()
+        largest = max(parts, key=self._polygon_part_area)
+        preview = QgsGeometry.fromPolygonXY(largest)
+        if preview is None or preview.isEmpty():
+            return QgsGeometry()
+        vertex_count = sum(len(ring) for ring in largest)
+        if vertex_count <= AI_PREVIEW_MAX_VERTICES:
+            return preview
+
+        tolerance = self._ai_preview_simplify_tolerance()
+        for multiplier in (1, 2, 4, 8):
+            simplified = preview.simplify(tolerance * multiplier)
+            parts = self._polygon_parts_xy(simplified)
+            if not parts:
+                continue
+            largest = max(parts, key=self._polygon_part_area)
+            preview = QgsGeometry.fromPolygonXY(largest)
+            vertex_count = sum(len(ring) for ring in largest)
+            if vertex_count <= AI_PREVIEW_MAX_VERTICES:
+                return preview
+
+        # 极复杂或很不明确的 mask 只用于画布提示时退化为外接范围,
+        # 完整几何仍保存在 _ai_preview_geometry,供追加按钮使用。
+        rect = preview.boundingBox()
+        if rect is not None and not rect.isEmpty():
+            return QgsGeometry.fromRect(rect)
+        return preview
+
+    def _polygon_part_area(self, part):
+        if not part or not part[0]:
+            return 0.0
+        ring = part[0]
+        area = 0.0
+        for idx, point in enumerate(ring):
+            previous = ring[idx - 1]
+            area += previous.x() * point.y() - point.x() * previous.y()
+        return abs(area) * 0.5
+
+    def _polygon_only_geometry(self, geometry, make_valid=True):
+        if geometry is None or geometry.isEmpty():
+            return QgsGeometry()
+        candidate = QgsGeometry(geometry)
+        if make_valid:
+            try:
+                if not candidate.isGeosValid():
+                    candidate = candidate.makeValid()
+            except Exception:
+                return QgsGeometry()
+        polygon_parts = self._polygon_parts_xy(candidate)
+        if not polygon_parts:
+            return QgsGeometry()
+        if len(polygon_parts) == 1:
+            return QgsGeometry.fromPolygonXY(polygon_parts[0])
+        return QgsGeometry.fromMultiPolygonXY(polygon_parts)
+
+    def _polygon_parts_xy(self, geometry):
+        if geometry is None or geometry.isEmpty():
+            return []
+        if QgsWkbTypes.geometryType(geometry.wkbType()) == \
+                QgsWkbTypes.PolygonGeometry:
+            if QgsWkbTypes.isMultiType(geometry.wkbType()):
+                return geometry.asMultiPolygon()
+            polygon = geometry.asPolygon()
+            return [polygon] if polygon else []
+
+        parts = []
+        try:
+            children = geometry.asGeometryCollection()
+        except Exception:
+            children = []
+        for child in children:
+            parts.extend(self._polygon_parts_xy(child))
+        return parts
+
+    def _coerce_ai_geometry_for_layer(self, geometry, layer, make_valid=True):
+        geometry = self._polygon_only_geometry(geometry, make_valid=make_valid)
+        if geometry is None or geometry.isEmpty():
+            return QgsGeometry()
+        if layer is not None and QgsWkbTypes.isMultiType(layer.wkbType()) \
+                and QgsWkbTypes.isSingleType(geometry.wkbType()):
+            geometry.convertToMultiType()
+        elif layer is not None and QgsWkbTypes.isSingleType(layer.wkbType()) \
+                and QgsWkbTypes.isMultiType(geometry.wkbType()):
+            parts = geometry.asMultiPolygon()
+            if len(parts) == 1:
+                geometry = QgsGeometry.fromPolygonXY(parts[0])
+            elif parts:
+                # 旧草稿层可能是单 Polygon,取最大面保证预览仍能落到同一层。
+                parts = sorted(
+                    parts,
+                    key=lambda part: abs(
+                        QgsGeometry.fromPolygonXY(part).area()),
+                    reverse=True)
+                geometry = QgsGeometry.fromPolygonXY(parts[0])
+        return geometry
+
+    def _on_ai_points_changed(self, positive_points, negative_points):
+        if not positive_points and not negative_points:
+            self._clear_ai_preview()
+            self.aiAppendDraftBtn.setEnabled(False)
+            return
+        if not self._ai_worker_ready:
+            self._warn("SAM 子进程尚未就绪。")
+            return
+        if not self._ai_image_loaded:
+            self._warn("SAM 子进程尚未设置推理影像,请重新启动 AI 编辑。")
+            return
+
+        if self._ai_predicting:
+            self._ai_queued_points = (
+                list(positive_points), list(negative_points))
+            self.aiStatusLabel.setText("正在推理,已记录最新提示点...")
+            return
+
+        self._predict_ai_points(positive_points, negative_points)
+
+    def _predict_ai_points(self, positive_points, negative_points):
+        self._ai_predicting = True
+        try:
+            self._send_ai_predict_command(positive_points, negative_points)
+        finally:
+            self._ai_predicting = False
+        queued = self._ai_queued_points
+        self._ai_queued_points = None
+        if queued is not None and (self._ai_worker_ready
+                                   and self._ai_image_loaded):
+            self._predict_ai_points(queued[0], queued[1])
+
+    def _send_ai_predict_command(self, positive_points, negative_points):
+        if not positive_points and not negative_points:
+            return
+
+        positive_image = []
+        for point in positive_points:
+            mapped = self._map_point_to_image(point)
+            if mapped is not None:
+                positive_image.append(mapped)
+        negative_image = []
+        for point in negative_points:
+            mapped = self._map_point_to_image(point)
+            if mapped is not None:
+                negative_image.append(mapped)
+
+        self.aiStatusLabel.setText(
+            "正在推理...(正点 {},负点 {})".format(
+                len(positive_image), len(negative_image)))
+
+        self._send_ai_command({
+            "op": "predict",
+            "positive_points": positive_image,
+            "negative_points": negative_image,
+            "multimask_output": False,
+        })

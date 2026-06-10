@@ -1,0 +1,12 @@
+# SAM AI 编辑功能离线依赖锁定文件。
+# 实际 wheel 文件请放置到 vendor/sam_runtime/wheels 目录,
+# 由 create_sam_venv.bat / create_sam_venv.sh 调用 pip 离线安装。
+# 默认面向 Python 3.8 / 3.9 + CPU,如果需要 GPU 请改用 PyTorch 官方
+# 的对应 CUDA 版本 wheel,并同步替换 wheels/ 中的文件。
+
+numpy==1.23.5
+opencv-contrib-python==4.8.1.78
+Pillow==10.4.0
+torch==1.13.1
+torchvision==0.14.1
+segment-anything==1.0
