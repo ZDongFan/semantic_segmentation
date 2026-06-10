@@ -62,7 +62,7 @@ OUTPUT_FORMAT_VECTOR = "vector"
 STATUS_PENDING = "待确认"
 STATUS_CONFIRMED = "已确认"
 
-SAM_DEFAULT_MODEL_TYPE = "vit_b"
+SAM_DEFAULT_BACKEND = sam_deps_check.DEFAULT_BACKEND
 LANDSLIDE_CLASS_NAME = "landslide"
 
 
@@ -1472,7 +1472,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._warn("找不到推理使用的输入影像,无法启动 AI 编辑。")
             return
 
-        ok, message = sam_deps_check.ensure_ready()
+        ok, message = sam_deps_check.ensure_ready(
+            backend=SAM_DEFAULT_BACKEND)
         if not ok:
             QtWidgets.QMessageBox.warning(
                 self, "SAM 环境未就绪", message)
@@ -1688,8 +1689,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         QgsApplication.processEvents()
         if not self._send_ai_command({
                 "op": "init",
-                "model_path": sam_deps_check.default_model_path(),
-                "model_type": SAM_DEFAULT_MODEL_TYPE,
+                "backend": SAM_DEFAULT_BACKEND,
+                "model_path": sam_deps_check.default_model_path(
+                    SAM_DEFAULT_BACKEND),
+                "config_path": sam_deps_check.default_config_path(
+                    SAM_DEFAULT_BACKEND),
+                "model_type": sam_deps_check.default_model_type(
+                    SAM_DEFAULT_BACKEND),
         }):
             return False
         self._ai_worker_ready = True

@@ -1,62 +1,68 @@
-# SAM 运行时离线环境
+# SAM 运行环境
 
-本目录用于承载 AI 编辑功能(SAM1 ViT-B)所需的独立 Python 虚拟环境
-与离线 wheel 文件。插件主体只负责调度 SAM 子进程,不在 QGIS 主进程
-内 import torch、segment_anything 等重型依赖,以保持稳定性。
+本目录用于创建 AI 编辑功能所需的独立 Python 虚拟环境。虚拟环境固定放在:
 
-## 目录约定
-
-- `requirements-sam.txt`  SAM 子进程依赖列表(锁定版本)
-- `wheels/`               由用户按目标机环境准备的离线 wheel 文件目录
-- `create_sam_venv.bat`   Windows 下离线创建 SAM venv 的入口脚本
-- `create_sam_venv.sh`    Linux/macOS 下离线创建 SAM venv 的入口脚本
-- `LICENSE_THIRD_PARTY/`  PyTorch、segment-anything 等第三方许可证
-
-创建后的 venv 默认位于 `vendor/sam_runtime/venv/`,插件通过
-`sam_deps_check.py` 中的 `default_python_executable()` 查找该解释器。
-`venv/` 是本机生成目录,不应提交到 git,也不建议直接拷贝到其他机器复用。
-
-## 最低依赖
-
-- Python 3.8 或与所选 wheels 匹配的 Python 版本
-- PyTorch 1.x 或 2.x 的 CPU/GPU 版本
-- segment-anything
-- numpy
-- opencv-contrib-python
-
-## 离线 wheels
-
-仓库仅保留 `wheels/` 目录占位,不直接分发实际 wheel 文件。请根据目标机环境
-自行准备并放入该目录,然后再创建 `venv/`。
-
-如需准备或更新离线 wheels,可参考:
-
-```bash
-pip download -r requirements-sam.txt -d wheels --no-deps --platform <platform>
+```text
+land_cover_classification/vendor/sam_runtime/venv
 ```
 
-对于 Windows CPU 用户,通常应准备 `win_amd64` 的 wheel。若改用 GPU 版
-PyTorch,请同步替换 `torch`、`torchvision` 及相关依赖文件。
+插件主进程不使用 QGIS 自带 Python 加载 `torch`、`sam2` 或 `segment_anything`，只通过
+`sam_worker.py` 子进程调用 AI 编辑能力。这样可以避免 QGIS / OSGeo4W 的 Python 环境变量
+污染 SAM runtime。
 
-## 创建 venv
+## 默认后端
 
-- Windows:
+- 默认后端: `sam2`
+- 默认模型: SAM2.1 Base+
+- 默认权重: `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`
+- 默认配置: `configs/sam2.1/sam2.1_hiera_b+.yaml`
+- 回退后端: `sam1`
+- SAM1 默认权重: `land_cover_classification/models/sam/sam_vit_b_01ec64.pth`
+
+## 创建环境
+
+Windows:
 
 ```bat
 create_sam_venv.bat
 ```
 
-- Linux/macOS:
+Linux/macOS:
 
 ```bash
 ./create_sam_venv.sh
 ```
 
-如需指定 Python 解释器,可通过 `SAM_PYTHON` 环境变量覆盖默认值。
-创建完成后,插件会自动使用 `vendor/sam_runtime/venv/` 中的解释器启动
-`sam_worker.py`。
+脚本默认在线安装依赖。Windows 下会优先使用 `C:\Python312\python.exe`，然后尝试
+`py -3.12`，最后才使用 `python`。如需指定解释器，可设置 `SAM_PYTHON`:
 
-## 许可证
+```bat
+set SAM_PYTHON=C:\Python312\python.exe
+create_sam_venv.bat
+```
 
-本目录不复制 segment-anything、PyTorch 源代码,仅在创建 venv 时通过
-pip 安装。第三方许可证副本放置于 `LICENSE_THIRD_PARTY/`,请保留与发布。
+已有 `venv/` 时脚本会停止，避免覆盖本机环境。如需重建，可先手动删除 `venv/`，或设置:
+
+```bat
+set SAM_RECREATE=1
+create_sam_venv.bat
+```
+
+## CUDA 策略
+
+脚本分两层判断 CUDA:
+
+- 检测到 NVIDIA 环境时，优先安装 CUDA 版 PyTorch。
+- 只有同时检测到 `nvcc` 和 C/C++ 编译工具链时，才设置 `SAM2_BUILD_CUDA=1` 构建 SAM2 CUDA 扩展。
+- 缺少 CUDA 编译工具链时会设置 `SAM2_BUILD_CUDA=0`，仍允许使用 GPU PyTorch 或 CPU 推理。
+
+## 环境检查
+
+可在插件目录外直接运行:
+
+```bash
+python land_cover_classification/sam_deps_check.py --backend sam2
+python land_cover_classification/sam_deps_check.py --backend sam1
+```
+
+检查逻辑会通过 `venv` 内的 Python 子进程导入依赖，不会在当前 Python 进程中导入 SAM/PyTorch。
