@@ -32,13 +32,15 @@ MAX_MASK_TOTAL_POINTS = 6000
 MIN_MASK_CONTOUR_AREA = 64.0
 MASK_SIMPLIFY_RATIO = 0.004
 PROMPT_POINT_RADIUS = 2
+NEGATIVE_ERASE_RADIUS = 4
 SAM_CROP_SIZE = 1024
 CROP_POINT_MARGIN_RATIO = 1.4
+MIN_CROP_SCALE_FACTOR = 0.25
+MAX_CROP_SCALE_FACTOR = 8.0
 WHOLE_CROP_AREA_RATIO = 0.8
-LOW_RES_MASK_SIZE = 256
 FALLBACK_LARGE_AREA_RATIO = 0.45
 MAX_REFINED_AREA_GROWTH = 2.2
-MIN_REFINED_AREA_KEEP_RATIO = 0.03
+MIN_REFINED_AREA_KEEP_RATIO = 0.08
 
 
 def _emit(message):
@@ -308,6 +310,128 @@ def _mask_boundary_ratio(mask):
     return float(boundary_count) / float(edge_len)
 
 
+def _split_prompt_points(point_coords, point_labels):
+    """按标签拆分正负点坐标。"""
+    positive_points = []
+    negative_points = []
+    for point, label in zip(point_coords, point_labels):
+        if int(label) == 1:
+            positive_points.append(point)
+        else:
+            negative_points.append(point)
+    return positive_points, negative_points
+
+
+def _component_ids_for_points(labels, points):
+    """返回提示点小窗口命中的连通域编号。"""
+    import numpy as np
+
+    height, width = labels.shape[:2]
+    comp_ids = set()
+    for point in points:
+        x = int(round(float(point[0])))
+        y = int(round(float(point[1])))
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+        x0 = max(0, x - PROMPT_POINT_RADIUS)
+        x1 = min(width, x + PROMPT_POINT_RADIUS + 1)
+        y0 = max(0, y - PROMPT_POINT_RADIUS)
+        y1 = min(height, y + PROMPT_POINT_RADIUS + 1)
+        for comp_id in np.unique(labels[y0:y1, x0:x1]):
+            if int(comp_id) > 0:
+                comp_ids.add(int(comp_id))
+    return comp_ids
+
+
+def _keep_positive_components(mask, positive_points):
+    """只保留正点命中的连通域。"""
+    import cv2
+    import numpy as np
+
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if not positive_points or not np.any(binary):
+        return binary
+    _count, labels = cv2.connectedComponents(binary, connectivity=8)
+    keep_ids = _component_ids_for_points(labels, positive_points)
+    if not keep_ids:
+        return np.zeros(binary.shape, dtype=np.uint8)
+    return np.isin(labels, list(keep_ids)).astype(np.uint8)
+
+
+def _apply_negative_hard_constraints(mask, positive_points, negative_points):
+    """把负点作为硬约束处理，只清理负点附近的小范围残留。"""
+    import cv2
+    import numpy as np
+
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if not negative_points or not np.any(binary):
+        return binary
+
+    height, width = binary.shape[:2]
+
+    for negative in negative_points:
+        if not _point_hits_mask(binary, negative):
+            continue
+        x = int(round(float(negative[0])))
+        y = int(round(float(negative[1])))
+        if x < 0 or y < 0 or x >= width or y >= height:
+            continue
+
+        cv2.circle(binary, (x, y), NEGATIVE_ERASE_RADIUS, 0, thickness=-1)
+
+    if positive_points:
+        binary = _keep_positive_components(binary, positive_points)
+    return binary.astype(np.uint8)
+
+
+def _mask_result_rank(mask, score, point_coords, point_labels,
+                      previous_area_ratio=None):
+    """为候选结果排序，优先满足点约束，再考虑面积稳定性。"""
+    area_ratio = _mask_area_ratio(mask)
+    boundary_ratio = _mask_boundary_ratio(mask)
+    positive_miss, negative_hit = _mask_prompt_counts(
+        mask, point_coords, point_labels)
+    has_negative = any(int(label) == 0 for label in point_labels)
+    whole_crop = 1 if area_ratio >= WHOLE_CROP_AREA_RATIO else 0
+    large_edge = 1 if (area_ratio >= FALLBACK_LARGE_AREA_RATIO
+                       and boundary_ratio > 0.08) else 0
+    shrink = 0
+    growth = 0
+    retention = 0.0
+    if previous_area_ratio is not None and previous_area_ratio > 0:
+        if has_negative:
+            retention = min(area_ratio / previous_area_ratio, 1.0)
+        if area_ratio > previous_area_ratio * MAX_REFINED_AREA_GROWTH:
+            growth = 1
+        if has_negative and area_ratio < (
+                previous_area_ratio * MIN_REFINED_AREA_KEEP_RATIO):
+            shrink = 1
+    return (
+        -negative_hit,
+        -positive_miss,
+        -shrink,
+        -growth,
+        -whole_crop,
+        -large_edge,
+        retention,
+        float(score),
+        -boundary_ratio,
+        -area_ratio,
+    )
+
+
+def _candidate_rank(raw_mask, cleaned_mask, score, point_coords, point_labels,
+                    previous_area_ratio=None):
+    """候选排序同时参考 SAM 原始结果和最终清理结果。"""
+    raw_positive_miss, raw_negative_hit = _mask_prompt_counts(
+        raw_mask, point_coords, point_labels)
+    return (
+        -raw_negative_hit,
+        -raw_positive_miss,
+    ) + _mask_result_rank(
+        cleaned_mask, score, point_coords, point_labels, previous_area_ratio)
+
+
 def _select_initial_mask(masks, scores):
     """选择第一点的候选 mask，避免整幅 crop 被误选。"""
     import numpy as np
@@ -334,7 +458,8 @@ def _select_initial_mask(masks, scores):
     return (np.asarray(candidates[best_idx]) > 0).astype(np.uint8), score, best_idx
 
 
-def _select_prompt_mask(masks, scores, point_coords, point_labels):
+def _select_prompt_mask(masks, scores, point_coords, point_labels,
+                        previous_area_ratio=None):
     """按点提示一致性选择候选 mask，负点命中优先级高于 score。"""
     import numpy as np
 
@@ -343,23 +468,12 @@ def _select_prompt_mask(masks, scores, point_coords, point_labels):
     best = None
 
     for idx, mask in enumerate(candidates):
-        binary = np.asarray(mask) > 0
+        raw_binary = (np.asarray(mask) > 0).astype(np.uint8)
+        binary = _keep_prompt_components(mask, point_coords, point_labels)
         score = float(scores[idx]) if idx < len(scores) else 0.0
-        positive_miss, negative_hit = _mask_prompt_counts(
-            binary, point_coords, point_labels)
-        area_ratio = _mask_area_ratio(binary)
-        boundary_ratio = _mask_boundary_ratio(binary)
-        too_large = 1 if area_ratio >= FALLBACK_LARGE_AREA_RATIO else 0
-        whole_crop = 1 if area_ratio >= WHOLE_CROP_AREA_RATIO else 0
-        rank = (
-            -negative_hit,
-            -positive_miss,
-            -whole_crop,
-            -too_large,
-            score,
-            -boundary_ratio,
-            -area_ratio,
-        )
+        rank = _candidate_rank(
+            raw_binary, binary, score, point_coords, point_labels,
+            previous_area_ratio)
         if best is None or rank > best[0]:
             best = (rank, binary, score, idx)
 
@@ -399,67 +513,41 @@ def _resize_nearest(image, width, height):
                       interpolation=cv2.INTER_NEAREST)
 
 
+def _clamp_crop_scale(scale_factor):
+    """限制 crop 尺度，避免过度放大或缩小导致 SAM 上下文失真。"""
+    try:
+        scale = float(scale_factor)
+    except (TypeError, ValueError):
+        scale = 1.0
+    if scale <= 0:
+        scale = 1.0
+    return max(MIN_CROP_SCALE_FACTOR, min(MAX_CROP_SCALE_FACTOR, scale))
+
+
 def _keep_prompt_components(mask, point_coords, point_labels):
-    """保留正点所在连通域，并只删除不含正点的负点杂散区域。"""
+    """保留正点区域，并把负点作为最终 mask 的硬约束。"""
     import cv2
     import numpy as np
 
     binary = (np.asarray(mask) > 0).astype(np.uint8)
-    positive_points = [
-        point for point, label in zip(point_coords, point_labels)
-        if int(label) == 1
-    ]
-    negative_points = [
-        point for point, label in zip(point_coords, point_labels)
-        if int(label) == 0
-    ]
+    positive_points, negative_points = _split_prompt_points(
+        point_coords, point_labels)
     if not np.any(binary):
         return binary
 
-    count, labels = cv2.connectedComponents(binary, connectivity=8)
-    del count
-    keep_ids = set()
-    remove_ids = set()
-    height, width = binary.shape[:2]
-
-    for point in positive_points:
-        x = int(round(float(point[0])))
-        y = int(round(float(point[1])))
-        if x < 0 or y < 0 or x >= width or y >= height:
-            continue
-        x0 = max(0, x - PROMPT_POINT_RADIUS)
-        x1 = min(width, x + PROMPT_POINT_RADIUS + 1)
-        y0 = max(0, y - PROMPT_POINT_RADIUS)
-        y1 = min(height, y + PROMPT_POINT_RADIUS + 1)
-        hit_ids = labels[y0:y1, x0:x1]
-        for comp_id in np.unique(hit_ids):
-            if int(comp_id) > 0:
-                keep_ids.add(int(comp_id))
-
-    for point in negative_points:
-        x = int(round(float(point[0])))
-        y = int(round(float(point[1])))
-        if x < 0 or y < 0 or x >= width or y >= height:
-            continue
-        x0 = max(0, x - PROMPT_POINT_RADIUS)
-        x1 = min(width, x + PROMPT_POINT_RADIUS + 1)
-        y0 = max(0, y - PROMPT_POINT_RADIUS)
-        y1 = min(height, y + PROMPT_POINT_RADIUS + 1)
-        hit_ids = labels[y0:y1, x0:x1]
-        for comp_id in np.unique(hit_ids):
-            if int(comp_id) > 0:
-                remove_ids.add(int(comp_id))
-
     if positive_points:
-        if not keep_ids:
-            return np.zeros(binary.shape, dtype=np.uint8)
-        refined = np.isin(labels, list(keep_ids)).astype(np.uint8)
-        for comp_id in remove_ids - keep_ids:
-            refined[labels == comp_id] = 0
-        return refined.astype(np.uint8)
+        binary = _keep_positive_components(binary, positive_points)
+        if not np.any(binary):
+            return binary
 
-    for comp_id in remove_ids:
-        binary[labels == comp_id] = 0
+    if negative_points:
+        _count, labels = cv2.connectedComponents(binary, connectivity=8)
+        remove_ids = _component_ids_for_points(labels, negative_points)
+        keep_ids = _component_ids_for_points(labels, positive_points)
+        for comp_id in remove_ids - keep_ids:
+            binary[labels == comp_id] = 0
+        binary = _apply_negative_hard_constraints(
+            binary, positive_points, negative_points)
     return binary.astype(np.uint8)
 
 
@@ -523,7 +611,7 @@ class BaseSamBackend(object):
         }
 
     def predict(self, positive_points, negative_points,
-                multimask_output=False):
+                multimask_output=False, scale_factor=1.0):
         if self._predictor is None:
             raise RuntimeError("SAM 模型尚未初始化。")
         if self._image_shape is None or self._image_rgb is None:
@@ -531,7 +619,7 @@ class BaseSamBackend(object):
 
         image_coords, point_labels = _points_to_arrays(
             positive_points, negative_points)
-        self._ensure_crop(image_coords, point_labels)
+        self._ensure_crop(image_coords, point_labels, scale_factor)
         crop_coords, point_labels = self._filter_crop_points(
             image_coords, point_labels)
         signature = _prompt_signature(positive_points, negative_points)
@@ -550,18 +638,39 @@ class BaseSamBackend(object):
         masks, scores, low_res_masks = self._predict_masks(
             crop_coords, point_labels, mask_input, use_multimask)
         mask, score, best_idx = self._select_mask_result(
-            masks, scores, crop_coords, point_labels, use_multimask)
+            masks, scores, crop_coords, point_labels, use_multimask,
+            previous_area_ratio)
+        selected_low_res_source = low_res_masks
 
         if self._needs_prompt_fallback(
                 mask, crop_coords, point_labels, previous_area_ratio,
                 mask_input):
-            masks, scores, low_res_masks = self._predict_masks(
+            current_cleaned = _keep_prompt_components(
+                mask, crop_coords, point_labels)
+            current_rank = _candidate_rank(
+                mask, current_cleaned, score, crop_coords, point_labels,
+                previous_area_ratio)
+            fallback_masks, fallback_scores, fallback_low_res_masks = \
+                self._predict_masks(
                 crop_coords, point_labels, None, True)
-            mask, score, best_idx = self._select_mask_result(
-                masks, scores, crop_coords, point_labels, True)
-
+            fallback_mask, fallback_score, fallback_idx = \
+                self._select_mask_result(
+                    fallback_masks, fallback_scores, crop_coords, point_labels,
+                    True,
+                    previous_area_ratio)
+            fallback_mask = _keep_prompt_components(
+                fallback_mask, crop_coords, point_labels)
+            fallback_rank = _candidate_rank(
+                fallback_mask, fallback_mask, fallback_score, crop_coords,
+                point_labels, previous_area_ratio)
+            if fallback_rank > current_rank:
+                mask = fallback_mask
+                score = fallback_score
+                best_idx = fallback_idx
+                selected_low_res_source = fallback_low_res_masks
         mask = _keep_prompt_components(mask, crop_coords, point_labels)
-        selected_low_res_mask = _select_low_res_mask(low_res_masks, best_idx)
+        selected_low_res_mask = _select_low_res_mask(
+            selected_low_res_source, best_idx)
         if _mask_area_ratio(mask) > 0:
             self._last_low_res_mask = selected_low_res_mask
             self._last_mask_area_ratio = _mask_area_ratio(mask)
@@ -591,19 +700,21 @@ class BaseSamBackend(object):
         return bool(multimask_output) or mask_input is None
 
     def _select_mask_result(self, masks, scores, point_coords, point_labels,
-                            use_multimask):
+                            use_multimask, previous_area_ratio=None):
         import numpy as np
 
         if use_multimask:
             if any(int(label) == 0 for label in point_labels):
                 return _select_prompt_mask(
-                    masks, scores, point_coords, point_labels)
+                    masks, scores, point_coords, point_labels,
+                    previous_area_ratio)
             return _select_initial_mask(masks, scores)
         if len(_normalise_masks(masks)) == 1:
             score = float(scores[0]) if len(scores) else 0.0
             return (np.asarray(_normalise_masks(masks)[0]) > 0).astype(
                 np.uint8), score, 0
-        return _select_prompt_mask(masks, scores, point_coords, point_labels)
+        return _select_prompt_mask(
+            masks, scores, point_coords, point_labels, previous_area_ratio)
 
     def _needs_prompt_fallback(self, mask, point_coords, point_labels,
                                previous_area_ratio, mask_input):
@@ -637,10 +748,10 @@ class BaseSamBackend(object):
             self._crop_shape = None
             self._crop_key = None
 
-    def _ensure_crop(self, image_coords, point_labels):
+    def _ensure_crop(self, image_coords, point_labels, scale_factor):
         if self._crop_can_accept_points(image_coords, point_labels):
             return self._image_points_to_crop(image_coords)
-        crop = self._extract_crop(image_coords)
+        crop = self._extract_crop(image_coords, scale_factor)
         self._predictor.set_image(crop)
         self._reset_prompt_context(reset_crop=False)
         return self._image_points_to_crop(image_coords)
@@ -692,7 +803,7 @@ class BaseSamBackend(object):
             np.asarray(kept_labels, dtype=np.int32),
         )
 
-    def _extract_crop(self, image_coords):
+    def _extract_crop(self, image_coords, scale_factor=1.0):
         import math
         import numpy as np
 
@@ -702,7 +813,8 @@ class BaseSamBackend(object):
         center_x = (min(xs) + max(xs)) / 2.0
         center_y = (min(ys) + max(ys)) / 2.0
         span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
-        crop_size = max(float(SAM_CROP_SIZE), span * CROP_POINT_MARGIN_RATIO)
+        base_size = float(SAM_CROP_SIZE) * _clamp_crop_scale(scale_factor)
+        crop_size = max(base_size, span * CROP_POINT_MARGIN_RATIO)
         crop_size = min(crop_size, float(max(width, height)))
 
         left = center_x - crop_size / 2.0
@@ -790,6 +902,11 @@ class BaseSamBackend(object):
             except Exception:
                 # 不同 SAM predictor 的 reset 行为不完全一致，这里只隔离异常。
                 pass
+        return {}
+
+    def clear_context(self):
+        """清空点提示上下文，但保留已加载影像，便于下一次按画布尺度重裁剪。"""
+        self._reset_prompt_context(reset_crop=True)
         return {}
 
 
@@ -922,12 +1039,15 @@ class SamSession(object):
         return self._require_backend().set_image(image_path)
 
     def predict(self, positive_points, negative_points,
-                multimask_output=False):
+                multimask_output=False, scale_factor=1.0):
         return self._require_backend().predict(
-            positive_points, negative_points, multimask_output)
+            positive_points, negative_points, multimask_output, scale_factor)
 
     def reset(self):
         return self._require_backend().reset()
+
+    def clear_context(self):
+        return self._require_backend().clear_context()
 
 
 def _dispatch(session, message):
@@ -948,9 +1068,12 @@ def _dispatch(session, message):
             positive_points=message.get("positive_points") or [],
             negative_points=message.get("negative_points") or [],
             multimask_output=bool(message.get("multimask_output", False)),
+            scale_factor=message.get("scale_factor", 1.0),
         )
     elif op == "reset":
         result = session.reset()
+    elif op == "clear_context":
+        result = session.clear_context()
     elif op == "quit":
         _ok(req_id, bye=True)
         return False

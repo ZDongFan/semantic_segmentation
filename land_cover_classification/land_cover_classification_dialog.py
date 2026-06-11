@@ -1882,6 +1882,32 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         py = (-gt[4] * x + gt[1] * y) / det
         return (float(px), float(py))
 
+    def _ai_canvas_scale_factor(self):
+        """按当前 QGIS 画布分辨率估算 SAM crop 的源影像读取尺度。"""
+        canvas = self.iface.mapCanvas()
+        extent = canvas.extent()
+        corners = [
+            QgsPointXY(extent.xMinimum(), extent.yMinimum()),
+            QgsPointXY(extent.xMinimum(), extent.yMaximum()),
+            QgsPointXY(extent.xMaximum(), extent.yMinimum()),
+            QgsPointXY(extent.xMaximum(), extent.yMaximum()),
+        ]
+        mapped = [
+            self._map_point_to_image(point)
+            for point in corners
+        ]
+        mapped = [point for point in mapped if point is not None]
+        if len(mapped) < 2:
+            return 1.0
+        xs = [point[0] for point in mapped]
+        ys = [point[1] for point in mapped]
+        canvas_width = max(1, int(canvas.width()))
+        canvas_height = max(1, int(canvas.height()))
+        scale_x = (max(xs) - min(xs)) / float(canvas_width)
+        scale_y = (max(ys) - min(ys)) / float(canvas_height)
+        scale = max(scale_x, scale_y, 0.25)
+        return max(0.25, min(8.0, float(scale)))
+
     def _image_point_to_layer(self, px, py):
         gt = self._ai_image_geotransform
         if gt is None:
@@ -2090,6 +2116,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _on_ai_points_changed(self, positive_points, negative_points):
         if not positive_points and not negative_points:
+            if self._ai_predicting:
+                self._ai_queued_points = ([], [])
+                self.aiStatusLabel.setText("正在推理,已记录清空提示点...")
+                self._clear_ai_preview()
+                self.aiAppendDraftBtn.setEnabled(False)
+                return
+            self._clear_ai_worker_context()
             self._clear_ai_preview()
             self.aiAppendDraftBtn.setEnabled(False)
             return
@@ -2109,6 +2142,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._predict_ai_points(positive_points, negative_points)
 
     def _predict_ai_points(self, positive_points, negative_points):
+        if not positive_points and not negative_points:
+            self._clear_ai_worker_context()
+            return
         self._ai_predicting = True
         try:
             self._send_ai_predict_command(positive_points, negative_points)
@@ -2144,4 +2180,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "positive_points": positive_image,
             "negative_points": negative_image,
             "multimask_output": False,
+            "scale_factor": self._ai_canvas_scale_factor(),
         })
+
+    def _clear_ai_worker_context(self):
+        """清空 SAM worker 的 crop 与 logits 上下文，保留当前影像。"""
+        if not self._ai_worker_ready or not self._ai_image_loaded:
+            return
+        self._send_ai_command({"op": "clear_context"}, timeout_ms=10000)

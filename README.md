@@ -17,11 +17,13 @@
 - 自动将类别栅格矢量化为草稿图层，并支持确认后写出最终 Shapefile。
 - 支持按用户选择导出最终成果：`Raster (GeoTIFF)` 或 `Vector (Shapefile)`。
 - 推理完成后自动切换到 `编辑与导出` 页签，并可启动 `AI 辅助编辑`。
-- AI 辅助编辑使用独立 SAM worker 子进程，支持左键正样本点、右键负样本点、mask/polygon 预览、撤销点、清除点。
-- SAM worker 会参考 TerraLab 的交互策略，在子进程内按提示点裁剪 1024 x 1024 crop 进行 SAM 编码；没有 `mask_input` 的首轮或兜底重跑会内部启用多候选筛选，一正一负同样适用，后续正负点优先复用上一轮 `low_res_masks` 作为 `mask_input` 迭代细化；已有活动 crop 时优先保持原 crop，不因边界附近新增负点频繁重切 crop，crop 外负点也不会参与当前轮细化。
-- AI mask 预览与推理草稿统一服务于同一草稿流程，不创建独立 `AI mask 预览` 图层；启动 AI 编辑后，预览通过画布 RubberBand 显示在当前草稿层上下文中。
-- SAM worker 会在子进程内只保留最大外轮廓并输出单个滑坡草稿对象，同时严格简化轮廓和限制点数，避免大范围或不明确提示点生成的超复杂 mask 导致 QGIS 主进程异常退出；负点是硬约束，最终预览 polygon 不应覆盖负点；当负点落在包含正点的主连通域边界附近时，优先通过候选重选和迭代细化收缩边界，而不是直接把整块主区域删除。
-- 正负点快速连续变化时，插件会避免重入预测；如果上一轮 SAM 预测尚未结束，只保留最新点集排队，完成后再预测最新结果。
+- AI 辅助编辑使用独立 SAM worker 子进程，支持左键正样本点、右键负样本点、mask/polygon 预览、撤销点、清空点。
+- SAM worker 会参考 TerraLab 的交互思路，在子进程内按提示点裁剪 `1024 x 1024` crop 进行 SAM 编码；首轮 crop 会结合当前 QGIS 画布可见范围换算 `scale_factor`，让读取尺度匹配当前缩放；没有 `mask_input` 的首轮或兜底重跑会内部启用多候选筛选，一正一负同样适用；后续正负点优先复用上一轮 `low_res_masks` 作为 `mask_input` 迭代细化；已有活动 crop 时优先复用原 crop，不因边界附近新增负点频繁重切 crop，crop 外负点也不会参与当前轮细化。
+- AI mask 预览与推理草稿统一服务于同一草稿工作流，不创建独立 `AI mask 预览` 图层；启动 AI 编辑后，预览通过画布 RubberBand 显示在当前草稿层上下文中。
+- 清空提示点时会同步清空 worker 的 crop 与 logits 上下文，但保留已加载影像，避免下一轮继续沿用旧裁剪上下文。
+- SAM worker 会在子进程内只保留最大外轮廓并输出单个滑坡草稿对象，同时严格简化轮廓和限制点数，避免大范围或不明确提示点生成的超复杂 mask 导致 QGIS 主进程异常退出。
+- 负点是硬约束，最终预览 polygon 不应覆盖负点；当负点落在主区域边界附近时，优先通过候选重排与迭代细化逐步收缩边界，而不是做几何直线切割。
+- 正负点快速连续变化时，插件会避免重入预测；如果上一轮 SAM 预测尚未结束，只保留最新点集排队，完成后再刷新到最新结果。
 - AI 结果直接写回当前草稿层，支持“追加为新草稿对象”和“替换选中草稿对象”。
 - 仓库约定了默认 SAM2.1 Base+ 权重位置与 SAM runtime 目录，用户可按文档准备 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt` 后，在目标机创建插件专用 SAM 虚拟环境。
 
@@ -58,7 +60,7 @@ AI 辅助编辑控件位于 `编辑与导出` 页签中。默认后端为 `sam2`
 2. 选择分割模型与可选预处理项。
 3. 在 `编辑与导出` 页签中选择导出格式和导出目录。
 4. 回到 `推理` 页签点击运行，插件会先生成单波段类别栅格，再自动加载草稿矢量图层。
-5. 推理完成后插件自动切到 `编辑与导出` 页签。可直接手动编辑草稿层，也可以点击“启动 AI 编辑”后在地图画布上左键添加正样本点、右键添加负样本点，预览满意后追加或替换草稿对象。连续添加点时界面只以最新点集刷新预览，避免多轮 SAM 预测同时回写画布；负点用于从当前活动 crop 内的迭代 mask 中排除区域，预览不应覆盖负点，边界附近连续补负点时应表现为沿上一轮边界逐步收缩。
+5. 推理完成后插件自动切到 `编辑与导出` 页签。可直接手动编辑草稿层，也可以点击“启动 AI 编辑”后在地图画布上左键添加正样本点、右键添加负样本点，预览满意后追加或替换草稿对象。建议先把 QGIS 画布缩放到目标区域附近，再开始第一轮正负点交互，这样首轮 crop 会按当前可见范围读取更合适的源影像尺度。连续添加点时界面只以最新点集刷新预览，避免多轮 SAM 预测同时回写画布；清空提示点会同步清空 worker 上下文；负点用于从当前活动 crop 内的迭代 mask 中排除区域，预览不应覆盖负点，边界附近连续补负点时应表现为沿上一轮边界逐步收缩。
 6. 通过 `编辑与导出` 页签中的“确认选中对象”或“全部确认”写入最终结果图层。
 7. 点击“导出结果”，插件按所选格式导出最终 Shapefile 或 GeoTIFF。
 
@@ -73,6 +75,7 @@ new_semantic_segmentation/
 |-- README.md                          # 项目说明文档
 |-- LICENSE                            # 开源许可证
 |-- AGENTS.md                          # Codex 协作与项目约定
+|-- CLAUDE.md                          # Claude 协作与项目约定
 |-- docs/                              # 额外文档
 |   |-- install.md                     # 依赖安装说明
 |   `-- model_layout.md                # 模型目录结构说明
@@ -104,4 +107,4 @@ new_semantic_segmentation/
 
 ## 许可
 
-本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。内置的 PaddleRS 代码同样遵循 Apache-2.0，相关许可位于 `land_cover_classification/vendor/PaddleRS/LICENSE`。SAM2、PyTorch、segment-anything 及其他 SAM runtime 依赖的第三方说明位于 `land_cover_classification/vendor/sam_runtime/NOTICE.txt`。
+本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。内置的 PaddleRS 代码同样遵循 Apache-2.0，相关许可证位于 `land_cover_classification/vendor/PaddleRS/LICENSE`。SAM2、PyTorch、segment-anything 及其余 SAM runtime 依赖的第三方说明位于 `land_cover_classification/vendor/sam_runtime/NOTICE.txt`。
