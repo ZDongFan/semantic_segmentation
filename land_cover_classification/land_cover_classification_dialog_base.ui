@@ -294,7 +294,7 @@
           <item row="2" column="0" colspan="2">
            <widget class="QLabel" name="workflowHintLabel">
             <property name="text">
-             <string>推理后会生成草稿矢量，请确认对象后再导出所选格式。</string>
+             <string>推理后会生成草稿矢量，请直接编辑草稿层，编辑完成后导出所选格式。</string>
             </property>
             <property name="wordWrap">
              <bool>true</bool>
@@ -431,26 +431,6 @@
             </size>
            </property>
           </spacer>
-         </item>
-         <item>
-          <widget class="QPushButton" name="confirmSelectedBtn">
-           <property name="enabled">
-            <bool>false</bool>
-           </property>
-           <property name="text">
-            <string>确认选中对象</string>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QPushButton" name="confirmAllBtn">
-           <property name="enabled">
-            <bool>false</bool>
-           </property>
-           <property name="text">
-            <string>全部确认</string>
-           </property>
-          </widget>
          </item>
          <item>
           <widget class="QPushButton" name="exportRasterBtn">
