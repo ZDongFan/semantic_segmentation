@@ -703,6 +703,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._load_reference_input_layer()
             self._draft_layer = self._create_draft_layer(self._label_path)
             self._place_layer_above_input(self._draft_layer)
+            self._activate_layer(self._draft_layer)
             self.exportRasterBtn.setEnabled(True)
             self._switch_to_export_tab()
             self.statusLabel.setText("草稿层已生成,请编辑后导出结果。")
@@ -879,6 +880,18 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         parent = input_node.parent()
         index = parent.children().index(input_node)
         parent.insertLayer(index, layer)
+
+    def _activate_layer(self, layer):
+        if not self._layer_is_usable(layer) or self.iface is None:
+            return
+        try:
+            self.iface.setActiveLayer(layer)
+        except AttributeError:
+            pass
+        try:
+            self.iface.layerTreeView().setCurrentLayer(layer)
+        except AttributeError:
+            pass
 
     def _ensure_draft_layer(self):
         if not self._layer_is_usable(self._draft_layer):
