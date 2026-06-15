@@ -55,6 +55,10 @@ FIELD_REVIEW_STATUS = "review_status"
 FIELD_SOURCE_ID = "source_id"
 BACKGROUND_CLASS_NAMES = {"background"}
 DRAFT_SIMPLIFY_PIXEL_TOLERANCE = 5
+AI_GEOMETRY_SIMPLIFY_PIXEL_TOLERANCE = 2
+AI_GEOMETRY_SMOOTH_ITERATIONS = 1
+AI_GEOMETRY_SMOOTH_OFFSET = 0.25
+AI_GEOMETRY_MAX_VERTICES = 2000
 AI_PREVIEW_SIMPLIFY_PIXEL_TOLERANCE = 8
 AI_PREVIEW_MAX_VERTICES = 6000
 OUTPUT_FORMAT_RASTER = "raster"
@@ -328,6 +332,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._ai_buffer = ""
         self._ai_predicting = False
         self._ai_queued_points = None
+        self._ai_prompt_layer_points = {"positive": [], "negative": []}
 
         self._init_defaults()
         self._wire_signals()
@@ -873,6 +878,16 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             if pixel_size > 0:
                 return AI_PREVIEW_SIMPLIFY_PIXEL_TOLERANCE * pixel_size
         return float(AI_PREVIEW_SIMPLIFY_PIXEL_TOLERANCE)
+
+    def _ai_geometry_simplify_tolerance(self):
+        gt = self._ai_image_geotransform
+        if gt:
+            pixel_width = (gt[1] ** 2 + gt[2] ** 2) ** 0.5
+            pixel_height = (gt[4] ** 2 + gt[5] ** 2) ** 0.5
+            pixel_size = max(pixel_width, pixel_height)
+            if pixel_size > 0:
+                return AI_GEOMETRY_SIMPLIFY_PIXEL_TOLERANCE * pixel_size
+        return float(AI_GEOMETRY_SIMPLIFY_PIXEL_TOLERANCE)
 
     def _place_layer_above_input(self, layer):
         root = QgsProject.instance().layerTreeRoot()
@@ -1785,6 +1800,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         if "polygons" in message:
             geometry = self._build_geometry_from_message(message)
+            geometry = self._refined_ai_geometry(geometry)
             self._ai_preview_geometry = (
                 QgsGeometry(geometry) if geometry is not None
                 and not geometry.isEmpty() else None)
@@ -1882,6 +1898,20 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         py = (-gt[4] * x + gt[1] * y) / det
         return (float(px), float(py))
 
+    def _map_point_to_draft_layer(self, map_point):
+        """把画布地图坐标转换为草稿层坐标。"""
+        point = QgsPointXY(map_point)
+        if not self._layer_is_usable(self._draft_layer):
+            return point
+        canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+        layer_crs = self._draft_layer.crs()
+        if (canvas_crs.isValid() and layer_crs.isValid()
+                and canvas_crs != layer_crs):
+            transform = QgsCoordinateTransform(
+                canvas_crs, layer_crs, QgsProject.instance())
+            point = transform.transform(point)
+        return point
+
     def _ai_canvas_scale_factor(self):
         """按当前 QGIS 画布分辨率估算 SAM crop 的源影像读取尺度。"""
         canvas = self.iface.mapCanvas()
@@ -1972,6 +2002,118 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             area += float(previous[0]) * float(point[1])
             area -= float(point[0]) * float(previous[1])
         return abs(area) * 0.5
+
+    def _refined_ai_geometry(self, geometry):
+        original = self._largest_single_polygon_geometry(
+            self._polygon_only_geometry(geometry, make_valid=False))
+        if original is None or original.isEmpty():
+            return QgsGeometry()
+
+        tolerance = self._ai_geometry_simplify_tolerance()
+        simplified = self._accepted_ai_geometry(
+            self._simplify_ai_geometry(original, tolerance), original)
+        smoothed = None
+        if simplified is not None:
+            smoothed = self._accepted_ai_geometry(
+                self._smooth_ai_geometry(simplified), original)
+
+        for candidate in (smoothed, simplified):
+            if candidate is not None:
+                return candidate
+        return original
+
+    def _simplify_ai_geometry(self, geometry, tolerance):
+        if geometry is None or geometry.isEmpty() or tolerance <= 0:
+            return QgsGeometry()
+        try:
+            simplified = geometry.simplify(tolerance)
+        except Exception:
+            return QgsGeometry()
+        return self._valid_largest_ai_geometry(simplified)
+
+    def _smooth_ai_geometry(self, geometry):
+        if geometry is None or geometry.isEmpty():
+            return QgsGeometry()
+        try:
+            smoothed = geometry.smooth(
+                AI_GEOMETRY_SMOOTH_ITERATIONS,
+                AI_GEOMETRY_SMOOTH_OFFSET)
+        except Exception:
+            return QgsGeometry()
+        return self._valid_largest_ai_geometry(smoothed)
+
+    def _valid_largest_ai_geometry(self, geometry):
+        geometry = self._polygon_only_geometry(geometry, make_valid=True)
+        if geometry is None or geometry.isEmpty():
+            return QgsGeometry()
+        return self._largest_single_polygon_geometry(geometry)
+
+    def _accepted_ai_geometry(self, geometry, original):
+        if not self._ai_geometry_is_safe(geometry, original):
+            return None
+        return geometry
+
+    def _ai_geometry_is_safe(self, geometry, original):
+        if geometry is None or geometry.isEmpty():
+            return False
+        try:
+            if not geometry.isGeosValid():
+                return False
+        except Exception:
+            return False
+        if self._geometry_vertex_count(geometry) > AI_GEOMETRY_MAX_VERTICES:
+            return False
+
+        original_area = abs(original.area()) if original is not None else 0.0
+        area = abs(geometry.area())
+        if original_area > 0:
+            ratio = area / original_area
+            if ratio < 0.75 or ratio > 1.25:
+                return False
+        if self._geometry_covers_negative_prompt(geometry):
+            return False
+        return True
+
+    def _largest_single_polygon_geometry(self, geometry):
+        parts = self._polygon_parts_xy(geometry)
+        if not parts:
+            return QgsGeometry()
+        largest = max(parts, key=self._polygon_part_area)
+        return QgsGeometry.fromPolygonXY(largest)
+
+    def _geometry_vertex_count(self, geometry):
+        return sum(
+            len(ring)
+            for part in self._polygon_parts_xy(geometry)
+            for ring in part)
+
+    def _geometry_covers_negative_prompt(self, geometry):
+        if geometry is None or geometry.isEmpty():
+            return False
+        negative_points = self._ai_prompt_layer_points.get("negative", [])
+        if not negative_points:
+            return False
+        buffer_tolerance = self._ai_prompt_point_tolerance()
+        for point in negative_points:
+            point_geometry = QgsGeometry.fromPointXY(point)
+            try:
+                if geometry.contains(point_geometry):
+                    return True
+                if buffer_tolerance > 0:
+                    point_buffer = point_geometry.buffer(buffer_tolerance, 8)
+                    if (point_buffer is not None
+                            and not point_buffer.isEmpty()
+                            and geometry.intersects(point_buffer)):
+                        return True
+            except Exception:
+                continue
+        return False
+
+    def _ai_prompt_point_tolerance(self):
+        base = self._ai_geometry_simplify_tolerance()
+        if AI_GEOMETRY_SIMPLIFY_PIXEL_TOLERANCE <= 0:
+            return 0.0
+        return max(0.0, base / AI_GEOMETRY_SIMPLIFY_PIXEL_TOLERANCE * 0.5)
 
     def _clear_ai_preview(self):
         if self._ai_tool is not None:
@@ -2121,10 +2263,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 self.aiStatusLabel.setText("正在推理,已记录清空提示点...")
                 self._clear_ai_preview()
                 self.aiAppendDraftBtn.setEnabled(False)
+                self._ai_prompt_layer_points = {"positive": [],
+                                                "negative": []}
                 return
             self._clear_ai_worker_context()
             self._clear_ai_preview()
             self.aiAppendDraftBtn.setEnabled(False)
+            self._ai_prompt_layer_points = {"positive": [], "negative": []}
             return
         if not self._ai_worker_ready:
             self._warn("SAM 子进程尚未就绪。")
@@ -2159,6 +2304,16 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def _send_ai_predict_command(self, positive_points, negative_points):
         if not positive_points and not negative_points:
             return
+        self._ai_prompt_layer_points = {
+            "positive": [
+                self._map_point_to_draft_layer(point)
+                for point in positive_points
+            ],
+            "negative": [
+                self._map_point_to_draft_layer(point)
+                for point in negative_points
+            ],
+        }
 
         positive_image = []
         for point in positive_points:
