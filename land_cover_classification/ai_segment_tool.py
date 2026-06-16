@@ -47,8 +47,6 @@ class AiSegmentMapTool(QgsMapTool):
         if self._disposed:
             super().deactivate()
             return
-        self.clear_points()
-        self.clear_preview()
         super().deactivate()
 
     def canvasPressEvent(self, event):

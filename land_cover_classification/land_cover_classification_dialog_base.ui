@@ -371,13 +371,23 @@
             </property>
            </widget>
           </item>
-          <item row="2" column="0" colspan="4">
+          <item row="2" column="0" colspan="2">
            <widget class="QPushButton" name="aiAppendDraftBtn">
             <property name="enabled">
              <bool>false</bool>
             </property>
             <property name="text">
              <string>追加 landslide 草稿对象</string>
+            </property>
+           </widget>
+          </item>
+          <item row="2" column="2" colspan="2">
+           <widget class="QPushButton" name="aiReactivateBtn">
+            <property name="enabled">
+             <bool>false</bool>
+            </property>
+            <property name="text">
+             <string>回到 AI 点选模式</string>
             </property>
            </widget>
           </item>

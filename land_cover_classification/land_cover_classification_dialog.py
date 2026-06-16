@@ -374,6 +374,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.aiStartBtn.clicked.connect(self._on_ai_start)
         self.aiStopBtn.clicked.connect(self._on_ai_stop)
+        self.aiReactivateBtn.clicked.connect(self._on_ai_reactivate)
         self.aiUndoPointBtn.clicked.connect(self._on_ai_undo_point)
         self.aiClearPointsBtn.clicked.connect(self._on_ai_clear_points)
         self.aiAppendDraftBtn.clicked.connect(self._on_ai_append_draft)
@@ -1298,6 +1299,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.aiStartBtn.setEnabled(False)
         self.aiStopBtn.setEnabled(True)
+        self.aiReactivateBtn.setEnabled(True)
         self.aiUndoPointBtn.setEnabled(True)
         self.aiClearPointsBtn.setEnabled(True)
         self.aiAppendDraftBtn.setEnabled(False)
@@ -1308,6 +1310,19 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _on_ai_stop(self):
         self._stop_ai_editing(silent=False)
+
+    def _on_ai_reactivate(self):
+        if self._ai_tool is None:
+            return
+        canvas = self.iface.mapCanvas() if self.iface else None
+        if canvas is None:
+            return
+        current_tool = canvas.mapTool()
+        if current_tool is not self._ai_tool:
+            self._ai_previous_tool = current_tool
+            canvas.setMapTool(self._ai_tool)
+        self.aiStatusLabel.setText(
+            "已回到 AI 点选模式。左键添加正点,右键添加负点。")
 
     def _stop_ai_editing(self, silent=False):
         canvas = self.iface.mapCanvas() if self.iface else None
@@ -1362,6 +1377,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.aiStartBtn.setEnabled(True)
         self.aiStopBtn.setEnabled(False)
+        self.aiReactivateBtn.setEnabled(False)
         self.aiUndoPointBtn.setEnabled(False)
         self.aiClearPointsBtn.setEnabled(False)
         self.aiAppendDraftBtn.setEnabled(False)
