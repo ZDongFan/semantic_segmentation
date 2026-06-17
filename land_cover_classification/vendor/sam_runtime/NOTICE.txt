@@ -4,7 +4,6 @@ SAM AI 编辑功能的第三方组件许可证
 请在打包发布前确保以下文件存在:
 
 - PyTorch (BSD-3-Clause)               见 LICENSE_THIRD_PARTY/LICENSE-PyTorch
-- segment-anything (Apache-2.0)        见 LICENSE_THIRD_PARTY/LICENSE-segment-anything
 - numpy (BSD-3-Clause)                 见 LICENSE_THIRD_PARTY/LICENSE-numpy
 - opencv-contrib-python (Apache-2.0)   见 LICENSE_THIRD_PARTY/LICENSE-opencv
 

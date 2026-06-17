@@ -1,6 +1,6 @@
 # LandCoverClassification 地物分类 QGIS 插件
 
-这是一个面向 QGIS 3.28 LTR 的地物分类插件，可对当前活动栅格图层或本地影像执行基于 PaddleRS 的遥感语义分割，并将结果组织为“类别栅格 -> 草稿矢量 -> 最终成果”的人工编辑流程。推理生成草稿层后，插件还支持基于 SAM2.1 Base+ 的 AI 辅助编辑，用正负点提示生成 mask 预览，并将结果追加到现有草稿图层；如需兼容旧流程，也可显式回退到 SAM1 ViT-B 后端。
+这是一个面向 QGIS 3.28 LTR 的地物分类插件，可对当前活动栅格图层或本地影像执行基于 PaddleRS 的遥感语义分割，并将结果组织为“类别栅格 -> 草稿矢量 -> 最终成果”的人工编辑流程。推理生成草稿层后，插件还支持基于 SAM2.1 Base+ 的 AI 辅助编辑，用正负点提示生成 mask 预览，并将结果追加到现有草稿图层。
 
 插件主体位于 `land_cover_classification/` 目录下，默认自带 PaddleRS 运行时代码、模型目录和相关测试资源。可用模型默认放在 `land_cover_classification/models/semantic_segmentation/`。
 
@@ -44,7 +44,7 @@
 推理完成后仍会先生成草稿矢量图层，用户可在 QGIS 中直接编辑草稿对象，再导出所选格式的最终成果。
 DXF 导出面向 CAD 边界交换：插件会从草稿 polygon 提取外轮廓并写出闭合线，DXF 属性层只保留 OGR DXF 驱动支持的 `Layer` 字段；`class_id`、`class_name`、`source_id` 等业务字段仍保留在 Shapefile 工作流中。
 
-AI 辅助编辑控件位于 `编辑与导出` 页签中。默认后端为 `sam2`，启动后插件会加载 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`，并使用 `land_cover_classification/vendor/sam_runtime/venv/` 中的独立 Python 环境运行 `sam_worker.py`。QGIS 主进程只负责界面、坐标转换、预览显示和草稿层写回，不在主进程中导入 `torch`、`sam2` 或 `segment_anything`。预览不会写入真实草稿层，也不会创建单独的 AI 图层；只有用户点击追加时，AI 结果才提交到草稿层。AI 编辑运行期间如果临时切换到 QGIS 顶点编辑、选择等其他 map tool，可通过“回到 AI 点选模式”恢复现有 AI 点选工具，已有正负点和预览会保留。为适配当前滑坡识别任务，一次 AI 编辑只生成一个滑坡草稿对象：SAM 子进程按提示点裁剪 crop、使用多候选筛选和 `low_res_masks` 迭代细化、尽量复用当前活动 crop、忽略 crop 外负点、提取最大外轮廓；QGIS 侧会对 worker 返回的 polygon 做轻量简化与平滑，并在顶点数、面积变化、负点覆盖或有效性检查失败时自动回退到未平滑或原始几何，最终用稳定的单面 RubberBand 显示预览。预览与追加草稿共用同一份 refine 后几何，保证“看到的”和“写入的”一致。
+AI 辅助编辑控件位于 `编辑与导出` 页签中。插件启动 AI 编辑时会加载 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`，并使用 `land_cover_classification/vendor/sam_runtime/venv/` 中的独立 Python 环境运行 `sam_worker.py`。QGIS 主进程只负责界面、坐标转换、预览显示和草稿层写回，不在主进程中导入 `torch` 或 `sam2`。预览不会写入真实草稿层，也不会创建单独的 AI 图层；只有用户点击追加时，AI 结果才提交到草稿层。AI 编辑运行期间如果临时切换到 QGIS 顶点编辑、选择等其他 map tool，可通过“回到 AI 点选模式”恢复现有 AI 点选工具，已有正负点和预览会保留。为适配当前滑坡识别任务，一次 AI 编辑只生成一个滑坡草稿对象：SAM 子进程按提示点裁剪 crop、使用多候选筛选和 `low_res_masks` 迭代细化、尽量复用当前活动 crop、忽略 crop 外负点、提取最大外轮廓；QGIS 侧会对 worker 返回的 polygon 做轻量简化与平滑，并在顶点数、面积变化、负点覆盖或有效性检查失败时自动回退到未平滑或原始几何，最终用稳定的单面 RubberBand 显示预览。预览与追加草稿共用同一份 refine 后几何，保证“看到的”和“写入的”一致。
 
 ## 安装
 
@@ -101,10 +101,9 @@ semantic_segmentation/
     |   `-- sam_runtime/               # SAM 专用 venv 创建脚本与运行环境说明
     `-- models/                        # 模型根目录
         |-- semantic_segmentation/     # 语义分割模型默认存放位置
-        |-- sam/                       # SAM1 ViT-B 回退权重默认存放位置
         `-- sam2/                      # SAM2.1 权重默认存放位置
 ```
 
 ## 许可
 
-本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。内置的 PaddleRS 代码同样遵循 Apache-2.0，相关许可证位于 `land_cover_classification/vendor/PaddleRS/LICENSE`。SAM2、PyTorch、segment-anything 及其余 SAM runtime 依赖的第三方说明位于 `land_cover_classification/vendor/sam_runtime/NOTICE.txt`。
+本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。内置的 PaddleRS 代码同样遵循 Apache-2.0，相关许可证位于 `land_cover_classification/vendor/PaddleRS/LICENSE`。SAM2、PyTorch 及其余 SAM runtime 依赖的第三方说明位于 `land_cover_classification/vendor/sam_runtime/NOTICE.txt`。

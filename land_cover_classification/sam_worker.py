@@ -3,10 +3,10 @@
 
 该脚本运行在插件专用的独立 Python venv 中，负责加载 SAM 后端、读取当前影像、
 接收正负点提示并返回经轮廓化后的 mask 几何。QGIS 主进程只通过 stdin/stdout 上的
-JSON line 协议和本脚本通信，不在主进程内导入 torch、sam2 或 segment_anything。
+JSON line 协议和本脚本通信，不在主进程内导入 torch 或 sam2。
 
 支持的 op:
-- init      : 加载模型，参数 backend、model_path、config_path、model_type、device
+- init      : 加载模型，参数 model_path、config_path、model_type、device
 - set_image : 设置当前推理影像，参数 image_path
 - predict   : 输入正负点，返回 score 与 polygons
 - reset     : 清空当前影像缓存
@@ -23,8 +23,6 @@ import traceback
 
 
 DEFAULT_BACKEND = "sam2"
-SAM1_BACKEND = "sam1"
-SAM2_BACKEND = "sam2"
 
 MAX_MASK_POLYGONS = 1
 MAX_MASK_RING_POINTS = 320
@@ -910,51 +908,10 @@ class BaseSamBackend(object):
         return {}
 
 
-class Sam1Backend(BaseSamBackend):
-    """SAM1 ViT 后端，用于回退兼容。"""
-
-    backend_name = SAM1_BACKEND
-
-    def init(self, model_path, model_type="vit_b", config_path=None,
-             device=None):
-        import torch
-        from segment_anything import SamPredictor, sam_model_registry
-
-        if model_type not in sam_model_registry:
-            raise ValueError("不支持的 SAM1 模型类型: {}".format(model_type))
-        if not model_path or not os.path.isfile(model_path):
-            raise IOError("SAM1 模型权重不存在: {}".format(model_path))
-
-        sam = sam_model_registry[model_type](checkpoint=model_path)
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        sam.to(device=device)
-        self._predictor = SamPredictor(sam)
-        self._device = device
-        self._model_type = model_type
-        self._image_path = None
-        self._image_shape = None
-        return {
-            "backend": self.backend_name,
-            "device": device,
-            "model_type": model_type,
-        }
-
-    def _predict_masks(self, point_coords, point_labels, mask_input,
-                       multimask_output):
-        masks, scores, low_res_masks = self._predictor.predict(
-            point_coords=point_coords,
-            point_labels=point_labels,
-            mask_input=mask_input,
-            multimask_output=bool(multimask_output),
-        )
-        return masks, scores, low_res_masks
-
-
 class Sam2Backend(BaseSamBackend):
     """SAM2/SAM2.1 后端，默认用于 AI 编辑。"""
 
-    backend_name = SAM2_BACKEND
+    backend_name = DEFAULT_BACKEND
 
     def init(self, model_path, model_type="sam2.1_hiera_base_plus",
              config_path=None, device=None):
@@ -1004,26 +961,17 @@ class Sam2Backend(BaseSamBackend):
 
 
 class SamSession(object):
-    """根据协议选择 SAM 后端，并转发后续请求。"""
+    """维护单一 SAM2 会话，并转发后续请求。"""
 
     def __init__(self):
         self._backend = None
 
-    def init(self, backend=DEFAULT_BACKEND, model_path=None, model_type=None,
-             config_path=None, device=None):
-        backend = (backend or DEFAULT_BACKEND).lower()
-        if backend == SAM1_BACKEND:
-            selected = Sam1Backend()
-            model_type = model_type or "vit_b"
-        elif backend == SAM2_BACKEND:
-            selected = Sam2Backend()
-            model_type = model_type or "sam2.1_hiera_base_plus"
-        else:
-            raise ValueError("不支持的 SAM 后端: {}".format(backend))
-
+    def init(self, model_path=None, model_type=None, config_path=None,
+             device=None):
+        selected = Sam2Backend()
         result = selected.init(
             model_path=model_path,
-            model_type=model_type,
+            model_type=model_type or "sam2.1_hiera_base_plus",
             config_path=config_path,
             device=device,
         )
@@ -1055,7 +1003,6 @@ def _dispatch(session, message):
     req_id = message.get("id")
     if op == "init":
         result = session.init(
-            backend=message.get("backend", DEFAULT_BACKEND),
             model_path=message.get("model_path"),
             model_type=message.get("model_type"),
             config_path=message.get("config_path"),

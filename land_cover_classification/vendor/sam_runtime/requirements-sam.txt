@@ -7,6 +7,3 @@ Pillow
 torch
 torchvision
 sam2
-
-# SAM1 回退后端需要该依赖；只有使用 sam1 后端时才需要安装。
-segment-anything

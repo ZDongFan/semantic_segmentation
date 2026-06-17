@@ -6,7 +6,7 @@
 land_cover_classification/vendor/sam_runtime/venv
 ```
 
-插件主进程不使用 QGIS 自带 Python 加载 `torch`、`sam2` 或 `segment_anything`，只通过
+插件主进程不使用 QGIS 自带 Python 加载 `torch` 或 `sam2`，只通过
 `sam_worker.py` 子进程调用 AI 编辑能力。这样可以避免 QGIS / OSGeo4W 的 Python 环境变量
 污染 SAM runtime。
 
@@ -16,9 +16,6 @@ land_cover_classification/vendor/sam_runtime/venv
 - 默认模型: SAM2.1 Base+
 - 默认权重: `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`
 - 默认配置: `configs/sam2.1/sam2.1_hiera_b+.yaml`
-- 回退后端: `sam1`
-- SAM1 默认权重: `land_cover_classification/models/sam/sam_vit_b_01ec64.pth`
-
 ## 创建环境
 
 Windows:
@@ -62,7 +59,6 @@ create_sam_venv.bat
 
 ```bash
 python land_cover_classification/sam_deps_check.py --backend sam2
-python land_cover_classification/sam_deps_check.py --backend sam1
 ```
 
 检查逻辑会通过 `venv` 内的 Python 子进程导入依赖，不会在当前 Python 进程中导入 SAM/PyTorch。
