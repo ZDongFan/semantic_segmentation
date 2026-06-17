@@ -62,6 +62,9 @@ AI_PREVIEW_SIMPLIFY_PIXEL_TOLERANCE = 8
 AI_PREVIEW_MAX_VERTICES = 6000
 OUTPUT_FORMAT_RASTER = "raster"
 OUTPUT_FORMAT_VECTOR = "vector"
+OUTPUT_FORMAT_DXF = "dxf"
+DXF_LAYER_FIELD = "Layer"
+DXF_DEFAULT_LAYER_NAME = "landslide"
 
 SAM_DEFAULT_BACKEND = sam_deps_check.DEFAULT_BACKEND
 LANDSLIDE_CLASS_NAME = "landslide"
@@ -349,6 +352,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.outputFileWidget.setFilter("Shapefile 文件 (*.shp)")
         self.outputFormatCombo.setItemData(0, OUTPUT_FORMAT_RASTER)
         self.outputFormatCombo.setItemData(1, OUTPUT_FORMAT_VECTOR)
+        self.outputFormatCombo.setItemData(2, OUTPUT_FORMAT_DXF)
         self.rasterFileWidget.setFilter("GeoTIFF 影像 (*.tif *.tiff)")
 
         self.layerRadio.setChecked(True)
@@ -950,6 +954,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         return os.path.join(out_dir, "{}_final.tif".format(
             self._output_base_name()))
 
+    def _dxf_output_path(self):
+        out_dir = self._output_directory_path()
+        if not out_dir:
+            return ""
+        return os.path.join(out_dir, "{}_final.dxf".format(
+            self._output_base_name()))
+
     def _suggest_output_paths(self, *args, **kwargs):
         src = self._resolve_input_path()
         if not src or not os.path.exists(src):
@@ -1037,6 +1048,20 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 "地物分类", "草稿矢量已导出:{}".format(path))
             return
 
+        if self._selected_output_format() == OUTPUT_FORMAT_DXF:
+            path = self._dxf_output_path()
+            if not path:
+                self._warn("请选择导出目录。")
+                return
+            try:
+                self._export_draft_dxf(path)
+            except Exception as exc:  # noqa: BLE001
+                self._warn("导出 DXF 失败:{}".format(exc))
+                return
+            self.iface.messageBar().pushSuccess(
+                "地物分类", "DXF 边界已导出:{}".format(path))
+            return
+
         path = self._raster_output_path()
         if not path:
             self._warn("请选择导出目录。")
@@ -1085,19 +1110,104 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             provider.addFeature(new_feature)
         self._write_vector_layer(output, path)
 
-    def _write_vector_layer(self, layer, path):
+    def _export_draft_dxf(self, path):
+        layer = self._draft_layer
+        if not self._layer_is_usable(layer):
+            raise IOError("当前没有可导出的草稿图层。")
+        crs = layer.crs()
+        uri = "LineString"
+        if crs.isValid() and crs.authid():
+            uri = "{}?crs={}".format(uri, crs.authid())
+        output = QgsVectorLayer(uri, "dxf_template", "memory")
+        if crs.isValid():
+            output.setCrs(crs)
+        provider = output.dataProvider()
+        provider.addAttributes([
+            QgsField(DXF_LAYER_FIELD, QVariant.String, "", 80),
+        ])
+        output.updateFields()
+
+        exported_count = 0
+        for feature in layer.getFeatures():
+            class_id = self._safe_int(feature[FIELD_CLASS_ID], 0)
+            if self._is_background_class_id(class_id):
+                continue
+            class_name = self._feature_class_name(feature, class_id)
+            layer_name = self._dxf_layer_name(class_name, class_id)
+            for ring in self._feature_outer_rings(feature):
+                line = self._closed_line_geometry(ring)
+                if line is None or line.isEmpty():
+                    continue
+                new_feature = QgsFeature(output.fields())
+                new_feature.setGeometry(line)
+                new_feature.setAttribute(DXF_LAYER_FIELD, layer_name)
+                if provider.addFeature(new_feature):
+                    exported_count += 1
+
+        output.updateExtents()
+        if exported_count == 0:
+            raise IOError("草稿图层中没有可导出的非背景边界。")
+        self._write_vector_layer(output, path, "DXF", "DXF")
+
+    def _dxf_layer_name(self, class_name, class_id):
+        name = (class_name or "").strip()
+        if not name:
+            name = ("class_{}".format(class_id)
+                    if class_id else DXF_DEFAULT_LAYER_NAME)
+        invalid_chars = '<>\\/":;?*|=`,'
+        cleaned = "".join(
+            "_" if char in invalid_chars else char
+            for char in name)
+        cleaned = cleaned.strip() or DXF_DEFAULT_LAYER_NAME
+        return cleaned[:80]
+
+    def _feature_class_name(self, feature, class_id):
+        try:
+            value = feature[FIELD_CLASS_NAME]
+        except (KeyError, IndexError):
+            value = None
+        class_name = str(value).strip() if value is not None else ""
+        return class_name or self._class_name(class_id)
+
+    def _feature_outer_rings(self, feature):
+        for polygon in self._polygon_parts_xy(feature.geometry()):
+            if polygon and polygon[0]:
+                yield polygon[0]
+
+    def _closed_line_geometry(self, ring):
+        if len(ring) < 3:
+            return QgsGeometry()
+        points = [QgsPointXY(point) for point in ring]
+        first = points[0]
+        last = points[-1]
+        if first.x() != last.x() or first.y() != last.y():
+            points.append(QgsPointXY(first))
+        if len(points) < 4:
+            return QgsGeometry()
+        return QgsGeometry.fromPolylineXY(points)
+
+    def _write_vector_layer(self, layer, path, driver_name="ESRI Shapefile",
+                            label="Shapefile"):
+        out_dir = os.path.dirname(path) or "."
+        if not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
         options = QgsVectorFileWriter.SaveVectorOptions()
-        options.driverName = "ESRI Shapefile"
+        options.driverName = driver_name
         options.fileEncoding = "UTF-8"
         options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
         result = QgsVectorFileWriter.writeAsVectorFormatV3(
             layer, path, QgsProject.instance().transformContext(), options)
         if isinstance(result, tuple):
             error = result[0]
+            message = result[1] if len(result) > 1 else ""
         else:
             error = result
+            message = ""
         if error != QgsVectorFileWriter.NoError:
-            raise IOError("写出 Shapefile 失败:{}".format(path))
+            detail = str(message).strip()
+            if detail:
+                raise IOError("写出 {} 失败:{} ({})".format(label, detail, path))
+            raise IOError("写出 {} 失败:{}".format(label, path))
 
     def _rasterize_draft_layer(self, path):
         from osgeo import gdal
