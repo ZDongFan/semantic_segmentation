@@ -1208,6 +1208,103 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 raise IOError("写出 {} 失败:{} ({})".format(label, detail, path))
             raise IOError("写出 {} 失败:{}".format(label, path))
 
+        if driver_name.upper() == "DXF":
+            self._fit_dxf_initial_view(path, layer.extent())
+
+    def _fit_dxf_initial_view(self, path, extent):
+        if extent is None or extent.isEmpty():
+            return
+
+        xmin = extent.xMinimum()
+        ymin = extent.yMinimum()
+        xmax = extent.xMaximum()
+        ymax = extent.yMaximum()
+        width = max(xmax - xmin, 1.0)
+        height = max(ymax - ymin, 1.0)
+        padding = max(width, height) * 0.02
+        view_width = width + padding * 2
+        view_height = height + padding * 2
+        center_x = (xmin + xmax) / 2.0
+        center_y = (ymin + ymax) / 2.0
+
+        with open(path, "r", encoding="utf-8", errors="replace") as dxf_file:
+            lines = dxf_file.read().splitlines()
+
+        self._replace_dxf_header_xy(lines, "$EXTMIN", xmin, ymin)
+        self._replace_dxf_header_xy(lines, "$EXTMAX", xmax, ymax)
+        self._replace_dxf_header_xy(
+            lines, "$LIMMIN", xmin - padding, ymin - padding)
+        self._replace_dxf_header_xy(
+            lines, "$LIMMAX", xmax + padding, ymax + padding)
+        self._replace_active_vport_value(lines, "12", center_x)
+        self._replace_active_vport_value(lines, "22", center_y)
+        self._replace_active_vport_value(lines, "40", view_height)
+        self._replace_active_vport_value(
+            lines, "41", max(view_width / view_height, 0.001))
+
+        with open(path, "w", encoding="utf-8", newline="\n") as dxf_file:
+            dxf_file.write("\n".join(lines))
+            dxf_file.write("\n")
+
+    def _replace_dxf_header_xy(self, lines, variable_name, x_value, y_value):
+        for index, line in enumerate(lines):
+            if line.strip() != variable_name:
+                continue
+            end = self._next_dxf_header_variable_index(lines, index + 1)
+            self._replace_dxf_value_in_range(lines, index + 1, end,
+                                             "10", x_value)
+            self._replace_dxf_value_in_range(lines, index + 1, end,
+                                             "20", y_value)
+            return
+
+    def _next_dxf_header_variable_index(self, lines, start):
+        for index in range(start, len(lines) - 1, 2):
+            if lines[index].strip() == "9":
+                return index
+        return len(lines)
+
+    def _replace_active_vport_value(self, lines, code, value):
+        start, end = self._active_dxf_vport_range(lines)
+        if start is None:
+            return
+        self._replace_dxf_value_in_range(lines, start, end, code, value)
+
+    def _active_dxf_vport_range(self, lines):
+        index = 0
+        while index < len(lines) - 1:
+            if (lines[index].strip() != "0" or
+                    lines[index + 1].strip() != "VPORT"):
+                index += 1
+                continue
+            start = index + 2
+            end = self._next_dxf_entity_index(lines, start)
+            if self._dxf_range_has_value(lines, start, end, "2", "*Active"):
+                return start, end
+            index = end
+        return None, None
+
+    def _next_dxf_entity_index(self, lines, start):
+        for index in range(start, len(lines) - 1, 2):
+            if lines[index].strip() == "0":
+                return index
+        return len(lines)
+
+    def _dxf_range_has_value(self, lines, start, end, code, value):
+        for index in range(start, min(end, len(lines) - 1), 2):
+            if (lines[index].strip() == code and
+                    lines[index + 1].strip() == value):
+                return True
+        return False
+
+    def _replace_dxf_value_in_range(self, lines, start, end, code, value):
+        for index in range(start, min(end, len(lines) - 1), 2):
+            if lines[index].strip() == code:
+                lines[index + 1] = self._format_dxf_float(value)
+                return
+
+    def _format_dxf_float(self, value):
+        return "{:.12g}".format(float(value))
+
     def _rasterize_draft_layer(self, path):
         from osgeo import gdal
 
