@@ -3,19 +3,12 @@
 /***************************************************************************
  LandCoverClassification
                                  一个 QGIS 插件
- 基于 PaddleRS 的遥感影像地物分类(语义分割)
+ 基于 PyTorch bundle 的遥感影像语义分割与 SAM 辅助编辑
                               -------------------
         begin                : 2026-05-14
         git sha              : $Format:%H$
         copyright            : (C) 2026 by zdf
         email                : 819754924@qq.com
- ***************************************************************************/
-
-/***************************************************************************
- *                                                                         *
- *   本程序是自由软件;可在 GNU 通用公共许可证(版本 2 或更高版本,由自由软件 *
- *   基金会发布)条款下重新分发和/或修改。                                  *
- *                                                                         *
  ***************************************************************************/
 """
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
@@ -27,6 +20,9 @@ from .resources import *
 # 引入对话框
 from .land_cover_classification_dialog import LandCoverClassificationDialog
 import os.path
+
+
+DOCK_PANEL_WIDTH = 400
 
 
 class LandCoverClassification:
@@ -78,7 +74,6 @@ class LandCoverClassification:
         """
         # noinspection PyTypeChecker,PyArgumentList,PyCallByClass
         return QCoreApplication.translate('LandCoverClassification', message)
-
 
     def add_action(
         self,
@@ -161,7 +156,6 @@ class LandCoverClassification:
         # 将在 run() 中置为 False
         self.first_start = True
 
-
     def unload(self):
         """从 QGIS GUI 中移除本插件的菜单项与工具栏图标。"""
         for action in self.actions:
@@ -178,12 +172,13 @@ class LandCoverClassification:
             self.dock = None
             self.dlg = None
 
-
     def _create_dock(self):
         """创建默认停靠在 QGIS 右侧的插件面板。"""
         dock = QDockWidget(self.tr(u'地物分类'), self.iface.mainWindow())
         dock.setObjectName("LandCoverClassificationDock")
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        dock.setMinimumWidth(DOCK_PANEL_WIDTH)
+        dock.setMaximumWidth(DOCK_PANEL_WIDTH)
         dock.setFeatures(
             QDockWidget.DockWidgetClosable |
             QDockWidget.DockWidgetMovable |
@@ -192,6 +187,8 @@ class LandCoverClassification:
 
         self.dlg = LandCoverClassificationDialog(self.iface, parent=dock)
         self.dlg.setWindowFlags(Qt.Widget)
+        self.dlg.setMinimumWidth(DOCK_PANEL_WIDTH)
+        self.dlg.setMaximumWidth(DOCK_PANEL_WIDTH)
         try:
             self.dlg.closeBtn.clicked.disconnect()
         except TypeError:
@@ -202,22 +199,19 @@ class LandCoverClassification:
         self.iface.mainWindow().addDockWidget(Qt.RightDockWidgetArea, dock)
         self.dock = dock
 
-
     def run(self):
         """打开插件主对话框。"""
 
-        # 在打开对话框前先做依赖检查。用一个友好的提示弹窗代替
-        # paddlepaddle / GDAL / cv2 缺失时的 ImportError 堆栈。
-        from .deps_check import check, installation_hint
-        missing = check()
-        if missing:
+        settings = QSettings()
+        notice_key = "LandCoverClassification/paddlers_deprecated_notice_shown"
+        if not settings.value(notice_key, False, type=bool):
             from qgis.PyQt.QtWidgets import QMessageBox
-            QMessageBox.warning(
+            QMessageBox.information(
                 self.iface.mainWindow(),
-                self.tr("缺少依赖"),
-                installation_hint(missing),
+                self.tr("PaddleRS 已下线"),
+                self.tr("PaddleRS 推理入口已下线，请使用 PyTorch bundle。详见 docs/model_layout.md。"),
             )
-            return
+            settings.setValue(notice_key, True)
 
         # 延迟构造对话框,只在首次使用时创建一次。
         if self.first_start or self.dock is None:

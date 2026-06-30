@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""SAM AI 编辑运行环境检查。
+"""SAM AI 编辑在插件统一运行环境中的依赖检查。
 
-QGIS 主进程只负责调度 SAM worker 子进程，因此本模块不直接导入
-`torch` 或 `sam2`。所有重型依赖都通过插件内 venv 的 Python 子进程探测。
+QGIS 主进程只负责调度 SAM worker 子进程，因此本模块不直接导入 `torch` 或
+`sam2`。所有重型依赖都通过插件统一 venv 的 Python 子进程探测。
 """
 
 import argparse
@@ -49,7 +49,7 @@ def default_venv_dir():
 
 
 def default_python_executable():
-    """返回 SAM 专用 venv 中的 Python 解释器路径。"""
+    """返回插件统一 venv 中的 Python 解释器路径。"""
     venv_dir = default_venv_dir()
     if os.name == "nt":
         return os.path.join(venv_dir, "Scripts", "python.exe")
@@ -61,8 +61,8 @@ def runtime_environment(python_executable=None):
     python_executable = python_executable or default_python_executable()
     env = os.environ.copy()
 
-    # 清理 QGIS/OSGeo4W 注入的 Python 环境变量，避免污染 SAM venv。
-    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE"):
+    # 清理 QGIS/OSGeo4W 注入的 Python 环境变量，避免污染插件统一 venv。
+    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "QGIS_PREFIX_PATH"):
         env.pop(key, None)
 
     env["PYTHONNOUSERSITE"] = "1"
@@ -100,7 +100,7 @@ def check_runtime(python_executable=None, _backend=None):
     python_executable = python_executable or default_python_executable()
     if not python_executable or not os.path.isfile(python_executable):
         return [name for name, _ in requirements], (
-            "未找到 SAM 专用 Python 解释器: {}".format(python_executable))
+            "未找到插件统一 Python 解释器: {}".format(python_executable))
 
     probe = (
         "import json, sys\n"
@@ -123,11 +123,11 @@ def check_runtime(python_executable=None, _backend=None):
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return [name for name, _ in requirements], (
-            "调用 SAM 解释器失败: {}".format(exc))
+            "调用插件统一解释器失败: {}".format(exc))
 
     if result.returncode != 0:
         return [name for name, _ in requirements], (
-            result.stderr.strip() or "SAM 解释器探测失败。")
+            result.stderr.strip() or "SAM2 依赖探测失败。")
 
     try:
         missing = json.loads(result.stdout.strip() or "[]")
@@ -138,14 +138,15 @@ def check_runtime(python_executable=None, _backend=None):
 
 def installation_hint(missing, error="", _backend=None):
     lines = [
-        "AI 编辑功能需要插件内独立的 SAM2 运行环境。",
+        "AI 编辑功能需要插件统一运行环境。",
+        "该环境同时服务 PyTorch 主推理和 SAM2 AI 编辑。",
         "当前后端: {}".format(DEFAULT_BACKEND),
     ]
 
     if not venv_ready():
         lines.extend([
             "",
-            "未发现 SAM 专用虚拟环境:",
+            "未发现插件统一虚拟环境:",
             "  {}".format(default_venv_dir()),
             "请运行 vendor/sam_runtime/ 下的环境创建脚本:",
         ])

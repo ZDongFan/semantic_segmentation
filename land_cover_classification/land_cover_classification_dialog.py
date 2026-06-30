@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import textwrap
 
 from qgis.PyQt import sip, uic
 from qgis.PyQt import QtWidgets
@@ -12,10 +13,10 @@ from qgis.PyQt.QtCore import (
     QProcess,
     QProcessEnvironment,
     QSettings,
-    QUrl,
+    Qt,
     QVariant,
 )
-from qgis.PyQt.QtGui import QColor, QDesktopServices
+from qgis.PyQt.QtGui import QColor
 
 from qgis.core import (
     QgsApplication,
@@ -37,9 +38,10 @@ from qgis.core import (
 )
 from qgis.gui import QgsFileWidget
 
+from . import pytorch_deps_check
 from . import sam_deps_check
 from .ai_segment_tool import AiSegmentMapTool
-from .inference import is_georeferenced
+from .pytorch_inference_core import is_georeferenced
 from .model_scan import get_model_info
 from .model_scan import scan as scan_models
 
@@ -67,6 +69,8 @@ DXF_LAYER_FIELD = "Layer"
 DXF_DEFAULT_LAYER_NAME = "landslide"
 
 LANDSLIDE_CLASS_NAME = "landslide"
+DIALOG_PANEL_WIDTH = 400
+STATUS_WRAP_WIDTH = 50
 
 
 def _default_model_root():
@@ -266,15 +270,33 @@ def _remove_existing_shapefile(path):
 
 class _MirroredLabel:
 
-    def __init__(self, *widgets):
+    def __init__(self, *widgets, wrap_width=STATUS_WRAP_WIDTH):
         self._widgets = widgets
+        self._wrap_width = wrap_width
+        self._text = ""
 
     def setText(self, text):
+        self._text = "" if text is None else str(text)
+        display_text = self._wrapped_text(self._text)
         for widget in self._widgets:
-            widget.setText(text)
+            widget.setText(display_text)
+            widget.setToolTip(self._text)
 
     def text(self):
-        return self._widgets[0].text()
+        return self._text
+
+    def _wrapped_text(self, text):
+        lines = text.splitlines() or [""]
+        return "\n".join(
+            textwrap.fill(
+                line,
+                width=self._wrap_width,
+                break_long_words=True,
+                break_on_hyphens=False,
+                replace_whitespace=False,
+            )
+            for line in lines
+        )
 
 
 class _MirroredProgressBar:
@@ -292,9 +314,37 @@ class _MirroredProgressBar:
 
 class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
+    def _configure_layout_constraints(self):
+        self.setMinimumWidth(DIALOG_PANEL_WIDTH)
+        self.setMaximumWidth(DIALOG_PANEL_WIDTH)
+        self.resize(DIALOG_PANEL_WIDTH, self.height())
+
+        ignored = QtWidgets.QSizePolicy.Ignored
+        preferred = QtWidgets.QSizePolicy.Preferred
+        fixed = QtWidgets.QSizePolicy.Fixed
+        compact_widgets = (
+            self.modelRootEdit, self.modelCombo, self.layerCombo,
+            self.inputFileWidget, self.mDemFile, self.outputDirWidget,
+            self.outputFileWidget, self.rasterFileWidget,
+        )
+        for widget in compact_widgets:
+            widget.setMinimumWidth(0)
+            widget.setSizePolicy(ignored, fixed)
+
+        status_labels = (
+            self.statusLabel, self.exportStatusLabel, self.aiStatusLabel,
+            self.workflowHintLabel, self.aiHintLabel,
+        )
+        for label in status_labels:
+            label.setWordWrap(True)
+            label.setMinimumWidth(0)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            label.setSizePolicy(ignored, preferred)
+
     def __init__(self, iface, parent=None):
         super().__init__(parent)
         self.setupUi(self)
+        self._configure_layout_constraints()
         self.statusLabel = _MirroredLabel(
             self.statusLabel, self.exportStatusLabel)
         self.progressBar = _MirroredProgressBar(
@@ -344,10 +394,33 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.layerCombo.setFilters(QgsMapLayerProxyModel.RasterLayer)
 
+        self.refreshModelsBtn.setText("")
+        self.refreshModelsBtn.setIcon(
+            self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload))
+        self.refreshModelsBtn.setToolTip("刷新模型列表")
+        for button in (self.browseModelRootBtn, self.refreshModelsBtn):
+            button.setFixedSize(32, 22)
+        self.modelLayout.setColumnStretch(1, 1)
+        self.modelLayout.setColumnStretch(2, 0)
+        self.modelLayout.setColumnStretch(3, 0)
+        try:
+            self.refreshModelsBtn.setAutoRaise(True)
+        except AttributeError:
+            pass
+
         self.inputFileWidget.setStorageMode(QgsFileWidget.GetFile)
-        self.inputFileWidget.setFilter(
-            "影像文件 (*.tif *.tiff *.png *.jpg *.jpeg)")
+        self.inputFileWidget.setFilter("影像文件 (*.tif *.tiff *.png *.jpg *.jpeg)")
         self.outputDirWidget.setStorageMode(QgsFileWidget.GetDirectory)
+        self.mDemFile.setStorageMode(QgsFileWidget.GetFile)
+        self.mDemFile.setFilter("DEM 文件 (*.tif *.tiff *.vrt)")
+        self.mDemFile.setDialogTitle("选择 DEM 文件")
+        self.mDemFile.setToolTip("请选择与输入影像覆盖范围相交的 DEM 文件。")
+        last_dem_dir = settings.value("{}/last_dem_dir".format(SETTINGS_GROUP), "")
+        if last_dem_dir:
+            try:
+                self.mDemFile.setDefaultRoot(last_dem_dir)
+            except AttributeError:
+                pass
         self.outputFileWidget.setFilter("Shapefile 文件 (*.shp)")
         self.outputFormatCombo.setItemData(0, OUTPUT_FORMAT_RASTER)
         self.outputFormatCombo.setItemData(1, OUTPUT_FORMAT_VECTOR)
@@ -360,7 +433,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _wire_signals(self):
         self.browseModelRootBtn.clicked.connect(self._on_browse_model_root)
-        self.openModelDirBtn.clicked.connect(self._on_open_model_dir)
         self.refreshModelsBtn.clicked.connect(self._refresh_models)
         self.modelRootEdit.editingFinished.connect(self._on_model_root_edited)
 
@@ -368,6 +440,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.fileRadio.toggled.connect(self._on_input_source_changed)
         self.layerCombo.layerChanged.connect(self._suggest_output_paths)
         self.inputFileWidget.fileChanged.connect(self._suggest_output_paths)
+        self.mDemFile.fileChanged.connect(self._on_dem_file_changed)
 
         self.runBtn.clicked.connect(self._on_run)
         self.cancelBtn.clicked.connect(self._on_cancel)
@@ -389,6 +462,34 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         QSettings().setValue(
             "{}/model_root".format(SETTINGS_GROUP), self.modelRootEdit.text())
 
+    def _on_dem_file_changed(self, path):
+        path = self._normalize_input_path(path)
+        if path and os.path.exists(path):
+            QSettings().setValue(
+                "{}/last_dem_dir".format(SETTINGS_GROUP),
+                os.path.dirname(path),
+            )
+
+    def _resolve_dem_path(self):
+        path = self._normalize_input_path(self.mDemFile.filePath().strip())
+        if not path or not os.path.exists(path):
+            QtWidgets.QMessageBox.warning(
+                self, "缺少 DEM", "请选择对应的 DEM 文件。")
+            return None
+        QSettings().setValue(
+            "{}/last_dem_dir".format(SETTINGS_GROUP), os.path.dirname(path))
+        return path
+
+    def _model_path_from_entry(self, entry):
+        if isinstance(entry, dict):
+            return entry.get("path")
+        return entry
+
+    def _pytorch_process_environment(self):
+        env = QProcessEnvironment()
+        for key, value in pytorch_deps_check.runtime_environment().items():
+            env.insert(key, value)
+        return env
     def _refresh_models(self):
         self.modelCombo.clear()
         root = self.modelRootEdit.text().strip()
@@ -400,7 +501,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self.statusLabel.setText("目录 {} 下未发现可用的分割模型".format(root))
             return
         for entry in models:
-            self.modelCombo.addItem(entry["name"], entry["path"])
+            self.modelCombo.addItem(entry["name"], entry)
         self.statusLabel.setText("已发现 {} 个模型".format(len(models)))
 
     def _on_browse_model_root(self):
@@ -412,13 +513,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._persist_model_root()
             self._refresh_models()
 
-    def _on_open_model_dir(self):
-        path = self.modelRootEdit.text().strip()
-        if not path:
-            return
-        if not os.path.isdir(path):
-            os.makedirs(path, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     def _on_model_root_edited(self):
         self._persist_model_root()
@@ -454,81 +548,15 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return self.layerCombo.currentLayer()
         return None
 
-    def _suggest_output_paths(self, *args, **kwargs):
-        src = self._resolve_input_path()
-        if not src or not os.path.exists(src):
-            return
-        base, _ext = os.path.splitext(src)
-        if not self.outputFileWidget.filePath().strip():
-            self.outputFileWidget.setFilePath("{}_final.shp".format(base))
-        if not self.rasterFileWidget.filePath().strip():
-            self.rasterFileWidget.setFilePath("{}_final.tif".format(base))
-
-    def _on_run(self):
-        if self.modelCombo.count() == 0:
-            self._warn("尚未选择模型。")
-            return
-        model_path = self.modelCombo.currentData()
-        if not model_path or not os.path.isdir(model_path):
-            self._warn("所选模型路径无效。")
-            return
-
-        input_path = self._resolve_input_path()
-        if not input_path:
-            self._warn("请选择输入图层或输入文件。")
-            return
-        if not os.path.exists(input_path):
-            self._warn("输入文件不存在:{}".format(input_path))
-            return
-
-        vector_path = self.outputFileWidget.filePath().strip()
-        if not vector_path:
-            self._warn("请选择最终 Shapefile 输出路径。")
-            return
-        if os.path.splitext(vector_path)[1].lower() != ".shp":
-            vector_path = os.path.splitext(vector_path)[0] + ".shp"
-            self.outputFileWidget.setFilePath(vector_path)
-        out_dir = os.path.dirname(vector_path) or "."
-        if not os.path.isdir(out_dir):
-            try:
-                os.makedirs(out_dir, exist_ok=True)
-            except OSError as exc:
-                self._warn("无法创建输出目录:{}".format(exc))
-                return
-
-        if os.path.exists(vector_path):
-            answer = QtWidgets.QMessageBox.question(
-                self, "覆盖确认",
-                "最终 Shapefile 已存在，确认后会覆盖同名结果。是否继续？")
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
-            try:
-                _remove_existing_shapefile(vector_path)
-            except OSError as exc:
-                self._warn("无法覆盖已有 Shapefile:{}".format(exc))
-                return
-
-        self._class_labels = self._read_class_labels(model_path)
-        self._input_layer = self._resolve_input_layer()
-        self._input_path = input_path
-        flags = {
-            "clahe": self.claheCheck.isChecked(),
-            "sharpen": self.sharpenCheck.isChecked(),
-            "median": self.medianCheck.isChecked(),
-            "gaussian": self.gaussianCheck.isChecked(),
-        }
-        georef = is_georeferenced(input_path)
-        self._start_inference_process(model_path, input_path, flags, georef)
-
     def _read_class_labels(self, model_path):
         try:
             info = get_model_info(model_path)
-            labels = info.get("_Attributes", {}).get("labels") or []
+            labels = (info.get("class_names") or info.get("classes") or info.get("labels") or info.get("_Attributes", {}).get("labels") or [])
             return [str(label) for label in labels]
         except Exception:
             return []
 
-    def _start_inference_process(self, model_path, input_path, flags, georef):
+    def _start_inference_process(self, model_path, input_path, dem_path, flags, georef):
         self._process_error_message = ""
         fd, self._label_path = tempfile.mkstemp(
             prefix="lcc_label_", suffix=".tif")
@@ -537,8 +565,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "model_path": model_path,
             "input_path": input_path,
             "output_path": self._label_path,
+            "dem_path": dem_path,
             "preprocess_flags": flags,
-            "is_georef": georef,
+            "postprocess_overrides": {},
         }
         fd, self._params_file = tempfile.mkstemp(
             prefix="lcc_params_", suffix=".json")
@@ -547,7 +576,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self._process = QProcess(self)
         self._process.setProcessChannelMode(QProcess.MergedChannels)
-        self._process.setProcessEnvironment(self._clean_process_environment())
+        self._process.setProcessEnvironment(self._pytorch_process_environment())
         self._process.setWorkingDirectory(tempfile.gettempdir())
         self._process.readyReadStandardOutput.connect(
             self._on_process_output)
@@ -558,17 +587,15 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.cancelBtn.setEnabled(True)
         self.exportRasterBtn.setEnabled(False)
         self.progressBar.setValue(0)
-        self.statusLabel.setText("运行中({}模式)...".format(
+        self.statusLabel.setText("PyTorch 推理运行中({}模式)...".format(
             "带地理坐标" if georef else "普通图像"))
 
         runner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              "inference_runner.py")
-        launcher = self._create_windows_launcher(runner, self._params_file)
-        if launcher:
-            self._process.start(_cmd_executable(), ["/c", launcher])
-        else:
-            self._process.start(_python_executable(), [runner, "--params",
-                                                 self._params_file])
+                              "pytorch_inference_runner.py")
+        self._process.start(
+            pytorch_deps_check.default_python_executable(),
+            [runner, "--params", self._params_file],
+        )
 
     def _clean_process_environment(self):
         env = QProcessEnvironment()
@@ -752,7 +779,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._prepare_draft_fields(layer)
         self._apply_vector_style(layer, draft=True)
         return layer
-
     def _polygonize_to_gpkg(self, label_path, gpkg_path):
         from osgeo import gdal, ogr, osr
 
@@ -970,11 +996,24 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.outputFileWidget.setFilePath(self._vector_output_path())
         self.rasterFileWidget.setFilePath(self._raster_output_path())
 
+    def _ensure_pytorch_runtime_ready(self):
+        self.statusLabel.setText("正在检查 PyTorch 运行环境...")
+        QtWidgets.QApplication.processEvents()
+        ok, message = pytorch_deps_check.ensure_ready()
+        if ok:
+            return True
+        message = message or "PyTorch 运行环境未就绪。"
+        self.statusLabel.setText("PyTorch 运行环境未就绪:\n{}".format(message))
+        QtWidgets.QMessageBox.warning(
+            self, "缺少插件统一运行环境", message)
+        return False
+
     def _on_run(self):
         if self.modelCombo.count() == 0:
             self._warn("尚未选择模型。")
             return
-        model_path = self.modelCombo.currentData()
+        model_entry = self.modelCombo.currentData()
+        model_path = self._model_path_from_entry(model_entry)
         if not model_path or not os.path.isdir(model_path):
             self._warn("所选模型路径无效。")
             return
@@ -995,6 +1034,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             os.makedirs(out_dir, exist_ok=True)
         except OSError as exc:
             self._warn("无法创建导出目录:{}".format(exc))
+            return
+
+        dem_path = self._resolve_dem_path()
+        if not dem_path:
+            return
+
+        if not self._ensure_pytorch_runtime_ready():
             return
 
         vector_path = self._vector_output_path()
@@ -1023,8 +1069,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "gaussian": self.gaussianCheck.isChecked(),
         }
         georef = is_georeferenced(input_path)
-        self._start_inference_process(model_path, input_path, flags, georef)
-
+        self._start_inference_process(model_path, input_path, dem_path, flags, georef)
     def _on_export_raster(self):
         if not self._layer_is_usable(self._draft_layer):
             self._warn("请先完成草稿层编辑。")
@@ -1076,7 +1121,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self.iface.messageBar().pushSuccess(
                 "地物分类", "草稿栅格已导出:{}".format(path))
         except Exception as exc:  # noqa: BLE001
-            self._warn("导出栅格图像失败:{}".format(exc))
+            self._warn("导出栅格失败:{}".format(exc))
 
     def _export_draft_vector(self, path):
         layer = self._draft_layer
@@ -1145,9 +1190,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         output.updateExtents()
         if exported_count == 0:
-            raise IOError("草稿图层中没有可导出的非背景边界。")
+            raise IOError("草稿图层没有可导出的边界线。")
         self._write_vector_layer(output, path, "DXF", "DXF")
-
     def _dxf_layer_name(self, class_name, class_id):
         name = (class_name or "").strip()
         if not name:
@@ -1310,7 +1354,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         template = gdal.Open(self._input_path)
         if template is None:
-            raise IOError("无法打开原始影像作为栅格模板:{}".format(
+            raise IOError("无法打开输入影像作为栅格模板:{}".format(
                 self._input_path))
         driver = gdal.GetDriverByName("GTiff")
         dst = driver.Create(
@@ -1347,7 +1391,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         template = None
         if result != 0:
             raise IOError("草稿矢量图层栅格化失败。")
-
     def _apply_vector_style(self, layer, draft):
         categories = []
         values = self._known_class_ids(layer)
@@ -1528,7 +1571,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             canvas.setMapTool(self._ai_tool)
         self.aiStatusLabel.setText(
             "已回到 AI 点选模式。左键添加正点,右键添加负点。")
-
     def _stop_ai_editing(self, silent=False):
         canvas = self.iface.mapCanvas() if self.iface else None
         self._clear_ai_preview()
@@ -1654,7 +1696,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 class_id, class_name))
         self.iface.messageBar().pushSuccess(
             "地物分类", "AI 编辑结果已写入草稿层。")
-
     def _next_draft_source_id(self, layer):
         max_source = 0
         for feature in layer.getFeatures():
@@ -1750,7 +1791,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._warn("SAM 子进程错误:{}".format(error))
             return False
         return True
-
     def _on_ai_worker_output(self):
         if self._ai_worker is None:
             return
@@ -1811,7 +1851,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 self.aiStatusLabel.setText("已生成 mask 预览。")
             else:
                 self.aiStatusLabel.setText("当前点提示未生成有效 mask。")
-
     def _on_ai_worker_finished(self, exit_code, exit_status):
         self._ai_worker_ready = False
         self._ai_image_loaded = False

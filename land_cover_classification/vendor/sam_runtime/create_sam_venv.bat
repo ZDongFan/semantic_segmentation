@@ -25,16 +25,16 @@ if errorlevel 1 (
 
 if exist "%VENV_DIR%" (
     if "%SAM_RECREATE%"=="1" (
-        echo Recreating existing venv: %VENV_DIR%
+        echo Recreating existing unified plugin venv: %VENV_DIR%
         rmdir /s /q "%VENV_DIR%"
     ) else (
-        echo Existing venv found: %VENV_DIR%
+        echo Existing unified plugin venv found: %VENV_DIR%
         echo Delete it manually, or set SAM_RECREATE=1 and run again.
         exit /b 1
     )
 )
 
-echo Creating venv: %VENV_DIR%
+echo Creating unified plugin venv: %VENV_DIR%
 "%SAM_PYTHON%" -m venv "%VENV_DIR%"
 if errorlevel 1 (
     echo Failed to create the venv.
@@ -80,19 +80,19 @@ if "%SAM2_BUILD_CUDA%"=="1" (
     echo nvcc or cl not detected. Skipping SAM2 CUDA extension build.
 )
 
-echo Installing SAM2 and image dependencies...
-"%VENV_PY%" -m pip install sam2 opencv-contrib-python numpy Pillow
+echo Installing unified plugin runtime dependencies...
+"%VENV_PY%" -m pip install sam2 opencv-contrib-python numpy Pillow segmentation-models-pytorch==0.4.* timm rasterio scipy PyYAML
 if errorlevel 1 (
-    echo Failed to install SAM2 dependencies.
+    echo Failed to install plugin runtime dependencies.
     exit /b 1
 )
 
-echo Verifying the SAM2 runtime...
-"%VENV_PY%" -c "import torch, torchvision, sam2, cv2, numpy; print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); print('sam2 ok')"
+echo Verifying the unified plugin runtime...
+"%VENV_PY%" -c "import torch, torchvision, sam2, cv2, numpy, rasterio, scipy, yaml, timm, segmentation_models_pytorch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available()); print('plugin runtime ok')"
 if errorlevel 1 (
-    echo SAM2 runtime verification failed.
+    echo Unified plugin runtime verification failed.
     exit /b 1
 )
 
-echo SAM venv created successfully: %VENV_DIR%
+echo Unified plugin venv created successfully: %VENV_DIR%
 endlocal

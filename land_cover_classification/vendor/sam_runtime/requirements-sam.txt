@@ -1,9 +1,14 @@
-# SAM AI 编辑运行环境依赖参考。
+# 插件统一运行环境依赖参考。
 # create_sam_venv.bat / create_sam_venv.sh 会根据 CUDA 情况先安装 torch/torchvision，
-# 再在线安装下面的通用依赖。这里保留为人工排查或自定义安装时的参考清单。
+# 再安装主推理和 SAM AI 编辑共用的依赖。这里保留为人工排查或自定义安装时的参考清单。
 numpy
 opencv-contrib-python
 Pillow
 torch
 torchvision
 sam2
+segmentation-models-pytorch==0.4.*
+timm
+rasterio
+scipy
+PyYAML

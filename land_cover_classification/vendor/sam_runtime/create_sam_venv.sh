@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 在线创建 SAM AI 编辑功能所需的独立 Python 3.12 虚拟环境。
-# 默认位置固定为 land_cover_classification/vendor/sam_runtime/venv。
+# 创建插件统一 Python 3.12 虚拟环境。
+# 默认位置固定为 land_cover_classification/vendor/sam_runtime/venv，供主推理和 SAM AI 编辑共用。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,16 +21,16 @@ echo "使用解释器: ${SAM_PYTHON}"
 
 if [[ -d "${VENV_DIR}" ]]; then
     if [[ "${SAM_RECREATE:-0}" == "1" ]]; then
-        echo "SAM_RECREATE=1，正在重建虚拟环境: ${VENV_DIR}"
+        echo "SAM_RECREATE=1，正在重建插件统一虚拟环境: ${VENV_DIR}"
         rm -rf "${VENV_DIR}"
     else
-        echo "发现已有虚拟环境: ${VENV_DIR}"
+        echo "发现已有插件统一虚拟环境: ${VENV_DIR}"
         echo "如需重新创建，请先手动删除该目录，或设置 SAM_RECREATE=1 后重试。"
         exit 1
     fi
 fi
 
-echo "创建虚拟环境: ${VENV_DIR}"
+echo "创建插件统一虚拟环境: ${VENV_DIR}"
 "${SAM_PYTHON}" -m venv "${VENV_DIR}"
 
 VENV_PY="${VENV_DIR}/bin/python"
@@ -54,7 +54,7 @@ if [[ "${USE_CUDA_TORCH}" == "1" ]]; then
     "${VENV_PY}" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 else
     echo "未检测到 NVIDIA 环境，安装 CPU 版 PyTorch。"
-    "${VENV_PY}" -m pip install torch torchvision
+    "${VENV_PY}" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 fi
 
 SAM2_BUILD_CUDA=0
@@ -66,24 +66,38 @@ fi
 export SAM2_BUILD_CUDA
 
 if [[ "${SAM2_BUILD_CUDA}" == "1" ]]; then
-    echo "检测到 nvcc 和 C/C++ 编译工具链，将尝试构建 SAM2 CUDA 扩展。"
+    echo "检测到 nvcc 和 C/C++ 编译工具链，SAM2 可在需要时构建 CUDA 扩展。"
 else
     echo "未检测到完整 CUDA 编译工具链，禁用 SAM2 CUDA 扩展构建。"
 fi
 
-echo "安装 SAM2 和图像处理依赖..."
-"${VENV_PY}" -m pip install sam2 opencv-contrib-python numpy Pillow
+echo "安装插件统一运行环境依赖..."
+"${VENV_PY}" -m pip install \
+    sam2 \
+    opencv-contrib-python \
+    numpy \
+    Pillow \
+    segmentation-models-pytorch==0.4.* \
+    timm \
+    rasterio \
+    scipy \
+    PyYAML
 
-echo "验证 SAM2 运行环境..."
+echo "验证插件统一运行环境..."
 "${VENV_PY}" - <<'PY'
 import torch
 import torchvision
 import sam2
 import cv2
 import numpy
+import rasterio
+import scipy
+import yaml
+import timm
+import segmentation_models_pytorch
 
 print("torch", torch.__version__, "cuda", torch.cuda.is_available())
-print("sam2 ok")
+print("plugin runtime ok")
 PY
 
-echo "SAM 虚拟环境创建完成: ${VENV_DIR}"
+echo "插件统一虚拟环境创建完成: ${VENV_DIR}"

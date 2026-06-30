@@ -37,20 +37,13 @@
             </property>
            </widget>
           </item>
-          <item row="0" column="1">
+          <item row="0" column="1" colspan="2">
            <widget class="QLineEdit" name="modelRootEdit"/>
           </item>
-          <item row="0" column="2">
+          <item row="0" column="3">
            <widget class="QToolButton" name="browseModelRootBtn">
             <property name="text">
              <string>...</string>
-            </property>
-           </widget>
-          </item>
-          <item row="0" column="3">
-           <widget class="QPushButton" name="openModelDirBtn">
-            <property name="text">
-             <string>打开目录</string>
             </property>
            </widget>
           </item>
@@ -65,9 +58,9 @@
            <widget class="QComboBox" name="modelCombo"/>
           </item>
           <item row="1" column="3">
-           <widget class="QPushButton" name="refreshModelsBtn">
+           <widget class="QToolButton" name="refreshModelsBtn">
             <property name="text">
-             <string>刷新</string>
+             <string/>
             </property>
            </widget>
           </item>
@@ -116,6 +109,16 @@
           </item>
           <item row="3" column="1">
            <widget class="QgsFileWidget" name="inputFileWidget"/>
+          </item>
+          <item row="4" column="0">
+           <widget class="QLabel" name="demFileLabel">
+            <property name="text">
+             <string>DEM 文件（必选）</string>
+            </property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <widget class="QgsFileWidget" name="mDemFile"/>
           </item>
          </layout>
         </widget>

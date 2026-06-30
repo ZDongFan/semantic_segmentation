@@ -1,109 +1,71 @@
 # LandCoverClassification 地物分类 QGIS 插件
 
-这是一个面向 QGIS 3.28 LTR 的地物分类插件，可对当前活动栅格图层或本地影像执行基于 PaddleRS 的遥感语义分割，并将结果组织为“类别栅格 -> 草稿矢量 -> 最终成果”的人工编辑流程。推理生成草稿层后，插件还支持基于 SAM2.1 Base+ 的 AI 辅助编辑，用正负点提示生成 mask 预览，并将结果追加到现有草稿图层。
+这是一个面向 QGIS 3.28+ 的语义分割插件，可对当前栅格图层或本地影像执行基于 PyTorch bundle 的遥感滑坡 / 地物语义分割，并将结果组织为“类别栅格 -> 草稿矢量 -> 最终成果”的人工编辑流程。推理生成草稿层后，插件支持基于 SAM2.1 Base+ 的 AI 辅助编辑，用正负点提示生成 mask 预览，并将结果追加到现有草稿图层。
 
-插件主体位于 `land_cover_classification/` 目录下，默认自带 PaddleRS 运行时代码、模型目录和相关测试资源。可用模型默认放在 `land_cover_classification/models/semantic_segmentation/`。
+插件主体位于 `land_cover_classification/` 目录下。可用 PyTorch bundle 默认放在 `land_cover_classification/models/semantic_segmentation/`；SAM2 权重默认放在 `land_cover_classification/models/sam2/`。
 
 ## 主要功能
 
-- 自动判断输入是否带地理坐标。
-- 带地理参考的 GeoTIFF 使用 PaddleRS `slider_predict` 推理，并保留原始 CRS 和 GeoTransform。
-- `slider_predict` 的 `block_size` 会根据当前 GPU 空闲显存自适应选择，不是固定值。
-- 普通 JPG/PNG/TIF 会先 resize 到 `512 x 512`，推理后再按原始尺寸使用最近邻回采样。
-- 支持可选预处理链：CLAHE、锐化、中值滤波、高斯滤波。
-- 后台子进程执行推理，避免卡住 QGIS 主界面。
-- 自动扫描 `land_cover_classification/models/semantic_segmentation/` 下的分割模型并填充下拉框。
-- 推理阶段输出单波段类别 GeoTIFF，供后续矢量化与人工编辑使用。
-- 自动将类别栅格矢量化为草稿图层，并支持编辑后导出最终 Shapefile 或 DXF 边界线。
-- 支持按用户选择导出最终成果：`Raster (GeoTIFF)`、`Vector (Shapefile)` 或 `Vector (DXF / CAD)`。
-- 推理完成后自动切换到 `编辑与导出` 页签，并可启动 `AI 辅助编辑`。
-- AI 辅助编辑使用独立 SAM worker 子进程，支持左键正样本点、右键负样本点、mask/polygon 预览、撤销点、清空点；切换到 QGIS 顶点编辑等其他工具后，可点击“回到 AI 点选模式”继续正负点采集。
-- SAM worker 会参考 TerraLab 的交互思路，在子进程内按提示点裁剪 `1024 x 1024` crop 进行 SAM 编码；首轮 crop 会结合当前 QGIS 画布可见范围换算 `scale_factor`，让读取尺度匹配当前缩放；没有 `mask_input` 的首轮或兜底重跑会内部启用多候选筛选，一正一负同样适用；后续正负点优先复用上一轮 `low_res_masks` 作为 `mask_input` 迭代细化；已有活动 crop 时优先复用原 crop，不因边界附近新增负点频繁重切 crop，crop 外负点也不会参与当前轮细化。
-- AI mask 预览与推理草稿统一服务于同一草稿工作流，不创建独立 `AI mask 预览` 图层；启动 AI 编辑后，预览通过画布 RubberBand 显示在当前草稿层上下文中。
-- 清空提示点时会同步清空 worker 的 crop 与 logits 上下文，但保留已加载影像，避免下一轮继续沿用旧裁剪上下文。
-- SAM worker 会在子进程内只保留最大外轮廓并输出单个滑坡草稿对象，同时严格简化轮廓和限制点数，避免大范围或不明确提示点生成的超复杂 mask 导致 QGIS 主进程异常退出。
-- QGIS 主进程会在 worker 返回 polygon 后继续执行轻量 refine：按影像像素尺度做约 2 像素简化、1 次平滑、有效性修复、最大单面提取、顶点数与面积变化检查，并在覆盖负点或几何异常时回退到更保守结果，让预览和写入草稿的边界更顺滑且仍然稳定。
-- 负点是硬约束，最终预览 polygon 不应覆盖负点；当负点落在主区域边界附近时，优先通过候选重排与迭代细化逐步收缩边界，而不是做几何直线切割。
-- 正负点快速连续变化时，插件会避免重入预测；如果上一轮 SAM 预测尚未结束，只保留最新点集排队，完成后再刷新到最新结果。
-- AI 结果直接写回当前草稿层，支持“追加为新草稿对象”。
-- 仓库约定了默认 SAM2.1 Base+ 权重位置与 SAM runtime 目录，用户可按文档准备 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt` 后，在目标机创建插件专用 SAM 虚拟环境。
-
-## 界面结构
-
-插件主对话框采用页签式布局，参考 SamGeo 插件的 Model / Output 分栏方式：
-
-- `推理` 页签：模型目录、模型选择、输入图层或本地影像、预处理选项、推理进度，以及运行、取消、关闭按钮。
-- `编辑与导出` 页签：导出格式、导出目录、AI 辅助编辑控件、编辑与导出状态，以及导出结果、关闭按钮。
-
-导出设置只需要选择最终成果格式和导出目录。插件会根据输入影像名称自动生成结果文件名：
-
-- 选择 `Vector (Shapefile)` 时，导出为 `<输入文件名>_final.shp`。
-- 选择 `Vector (DXF / CAD)` 时，导出为 `<输入文件名>_final.dxf`。
-- 选择 `Raster (GeoTIFF)` 时，导出为 `<输入文件名>_final.tif`。
-
-推理完成后仍会先生成草稿矢量图层，用户可在 QGIS 中直接编辑草稿对象，再导出所选格式的最终成果。
-DXF 导出面向 CAD 边界交换：插件会从草稿 polygon 提取外轮廓并写出闭合线，DXF 属性层只保留 OGR DXF 驱动支持的 `Layer` 字段；`class_id`、`class_name`、`source_id` 等业务字段仍保留在 Shapefile 工作流中。
-
-AI 辅助编辑控件位于 `编辑与导出` 页签中。插件启动 AI 编辑时会加载 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`，并使用 `land_cover_classification/vendor/sam_runtime/venv/` 中的独立 Python 环境运行 `sam_worker.py`。QGIS 主进程只负责界面、坐标转换、预览显示和草稿层写回，不在主进程中导入 `torch` 或 `sam2`。预览不会写入真实草稿层，也不会创建单独的 AI 图层；只有用户点击追加时，AI 结果才提交到草稿层。AI 编辑运行期间如果临时切换到 QGIS 顶点编辑、选择等其他 map tool，可通过“回到 AI 点选模式”恢复现有 AI 点选工具，已有正负点和预览会保留。为适配当前滑坡识别任务，一次 AI 编辑只生成一个滑坡草稿对象：SAM 子进程按提示点裁剪 crop、使用多候选筛选和 `low_res_masks` 迭代细化、尽量复用当前活动 crop、忽略 crop 外负点、提取最大外轮廓；QGIS 侧会对 worker 返回的 polygon 做轻量简化与平滑，并在顶点数、面积变化、负点覆盖或有效性检查失败时自动回退到未平滑或原始几何，最终用稳定的单面 RubberBand 显示预览。预览与追加草稿共用同一份 refine 后几何，保证“看到的”和“写入的”一致。
+- 扫描 `manifest.json` 格式的 PyTorch 语义分割 bundle，并在模型下拉框中列出。
+- 使用插件统一运行环境 `vendor/sam_runtime/venv/` 子进程执行 PyTorch 主推理和 SAM AI 编辑，QGIS 主进程不导入 `torch`；打开插件面板时不检查 / 加载 venv，点击“运行”后才检查 PyTorch 主推理环境。
+- 推理时必选 DEM 文件，插件会把 DEM 对齐到输入影像格网，并调用 bundle 内 `dem_factors.py` 计算派生因子。
+- 支持 GPU 推理，并在 CUDA 不可用时自动降级到 CPU；CPU 路径使用更小 tile 保护内存。
+- 对 landslide 概率图执行 threshold、连通域、最小面积过滤，以及 slope、relief、TPI 三条 DEM 规则后处理。
+- 每次推理写出单波段类别 GeoTIFF 和 `<output>.postprocess.json` 审计文件。
+- 自动将类别栅格矢量化为草稿图层，支持编辑后导出 `Raster (GeoTIFF)`、`Vector (Shapefile)` 或 `Vector (DXF / CAD)`。
+- AI 辅助编辑使用独立 SAM worker 子进程，支持左键正样本点、右键负样本点、撤销、清空、停止和“回到 AI 点选模式”。
 
 ## 安装
 
-1. 安装 QGIS 3.28 LTR。
+1. 安装 QGIS 3.28+。
 2. 将 `land_cover_classification/` 目录部署到 QGIS 插件目录。
-3. 在 QGIS 对应的 Python 环境中安装运行依赖。
-4. 将导出的 PaddleRS 模型子目录放入 `land_cover_classification/models/semantic_segmentation/`。
-5. 如需使用 AI 辅助编辑，请先准备 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`，再在目标机运行 `land_cover_classification/vendor/sam_runtime/create_sam_venv.bat` 或 `create_sam_venv.sh` 创建 SAM 专用虚拟环境；创建完成后可用 `python land_cover_classification/sam_deps_check.py --backend sam2` 验证环境。
+3. 运行 `land_cover_classification/vendor/sam_runtime/create_sam_venv.bat` 或 `create_sam_venv.sh` 创建插件统一运行环境。
+4. 将训练仓导出的 PyTorch bundle 子目录放入 `land_cover_classification/models/semantic_segmentation/`。
+5. 如需使用 AI 辅助编辑，准备 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`。
 6. 重启 QGIS，并在插件管理器中启用 `LandCoverClassification`。
 
-更详细的依赖安装说明见 [`docs/install.md`](docs/install.md)。
+更详细的模型目录说明见 [`docs/model_layout.md`](docs/model_layout.md)。
 
 ## 使用流程
 
-1. 在 `推理` 页签中选择输入图层或本地影像。
-2. 选择分割模型与可选预处理项。
-3. 在 `编辑与导出` 页签中选择导出格式和导出目录。
-4. 回到 `推理` 页签点击运行，插件会先生成单波段类别栅格，再自动加载草稿矢量图层。
-5. 推理完成后插件自动切到 `编辑与导出` 页签。可直接手动编辑草稿层，也可以点击“启动 AI 编辑”后在地图画布上左键添加正样本点、右键添加负样本点，预览满意后追加草稿对象；如果中途切到 QGIS 顶点编辑等其他工具，可点击“回到 AI 点选模式”继续打点。建议先把 QGIS 画布缩放到目标区域附近，再开始第一轮正负点交互，这样首轮 crop 会按当前可见范围读取更合适的源影像尺度。连续添加点时界面只以最新点集刷新预览，避免多轮 SAM 预测同时回写画布；清空提示点会同步清空 worker 上下文；负点用于从当前活动 crop 内的迭代 mask 中排除区域，预览不应覆盖负点，边界附近连续补负点时应表现为沿上一轮边界逐步收缩。插件会对最终预览 polygon 做稳妥的边界简化和平滑，若平滑导致几何异常、面积变化过大、顶点数过多或覆盖负点，会自动回退到更保守的几何。
-6. 编辑完成后点击“导出结果”，插件会按所选格式直接从当前草稿层导出最终 Shapefile、GeoTIFF 或 DXF 边界线。
-
-## 模型目录
-
-模型目录结构说明见 [`docs/model_layout.md`](docs/model_layout.md)。
+1. 在 `推理` 页签中选择 PyTorch bundle、输入图层或本地影像、DEM 文件和可选预处理项。
+2. 在 `编辑与导出` 页签中选择导出格式和导出目录。
+3. 回到 `推理` 页签点击运行；插件会在基础参数校验通过后检查 PyTorch 统一运行环境，然后生成类别 GeoTIFF、后处理审计 JSON 和草稿矢量图层。
+4. 推理完成后插件自动切到 `编辑与导出` 页签，可手动编辑草稿层，也可启动 AI 辅助编辑追加对象。
+5. 编辑完成后点击“导出结果”，插件会从当前草稿层导出所选格式。
 
 ## 仓库结构
 
 ```text
 semantic_segmentation/
-|-- README.md                          # 项目说明文档
-|-- LICENSE                            # 开源许可证
-|-- docs/                              # 额外文档
-|   |-- install.md                     # 依赖安装说明
-|   `-- model_layout.md                # 模型目录结构说明
-`-- land_cover_classification/         # QGIS 插件主体目录
-    |-- __init__.py                    # 插件入口
-    |-- land_cover_classification.py   # 主插件类，负责菜单与对话框入口
+|-- README.md
+|-- LICENSE
+|-- docs/
+|   |-- install.md
+|   `-- model_layout.md
+`-- land_cover_classification/
+    |-- __init__.py
+    |-- land_cover_classification.py
     |-- land_cover_classification_dialog.py
-    |                                   # 主对话框逻辑、草稿层编辑与结果导出
     |-- land_cover_classification_dialog_base.ui
-    |                                   # Qt Designer 维护的界面文件
-    |-- inference.py                   # 核心推理逻辑，输出单波段类别栅格
-    |-- inference_runner.py            # 独立推理子进程入口
-    |-- preprocess.py                  # 推理前预处理链
-    |-- model_scan.py                  # 扫描可用模型并解析 model.yml
-    |-- deps_check.py                  # 运行依赖检查与提示
-    |-- sam_deps_check.py              # SAM 专用运行环境检查
-    |-- sam_worker.py                  # SAM 独立子进程入口
-    |-- ai_segment_tool.py             # AI 编辑地图交互工具
-    |-- metadata.txt                   # QGIS 插件元数据
-    |-- pb_tool.cfg                    # pb_tool 打包配置
-    |-- vendor/                        # 随插件打包的第三方代码
-    |   |-- PaddleRS/                  # 内置 PaddleRS 代码与依赖
-    |   `-- sam_runtime/               # SAM 专用 venv 创建脚本与运行环境说明
-    `-- models/                        # 模型根目录
-        |-- semantic_segmentation/     # 语义分割模型默认存放位置
-        `-- sam2/                      # SAM2.1 权重默认存放位置
+    |-- pytorch_inference_core.py
+    |-- pytorch_inference_runner.py
+    |-- pytorch_deps_check.py
+    |-- _inference_paddlers_legacy.py
+    |-- _inference_runner_paddlers_legacy.py
+    |-- preprocess.py
+    |-- model_scan.py
+    |-- sam_deps_check.py
+    |-- sam_worker.py
+    |-- ai_segment_tool.py
+    |-- vendor/
+    |   |-- PaddleRS/
+    |   `-- sam_runtime/      # 插件统一运行环境
+    `-- models/
+        |-- semantic_segmentation/
+        `-- sam2/
 ```
 
 ## 许可
 
-本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。内置的 PaddleRS 代码同样遵循 Apache-2.0，相关许可证位于 `land_cover_classification/vendor/PaddleRS/LICENSE`。SAM2、PyTorch 及其余 SAM runtime 依赖的第三方说明位于 `land_cover_classification/vendor/sam_runtime/NOTICE.txt`。
+本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。`vendor/PaddleRS/` 作为遗留代码保留在盘中但插件不再调用；统一运行环境中的第三方依赖遵循各自上游许可证。

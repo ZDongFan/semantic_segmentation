@@ -6,30 +6,30 @@
 name=LandCoverClassification
 qgisMinimumVersion=3.28
 qgisMaximumVersion=3.99
-description=基于 PaddleRS 的遥感影像语义分割插件。需要 paddlepaddle==2.4.2。
+description=基于 PyTorch bundle 的遥感影像语义分割插件，支持 DEM 规则后处理与 SAM AI 辅助编辑。
 version=0.1
 author=zdf
 email=819754924@qq.com
 
-about=在 QGIS 中直接对栅格图层或磁盘影像运行 PaddleRS 语义分割模型。同时支持带地理坐标的 GeoTIFF(滑窗推理)与普通 RGB 影像。
+about=在 QGIS 中对栅格图层或磁盘影像运行 PyTorch 语义分割 bundle。推理使用独立 venv 子进程，支持 DEM 派生因子后处理，并将结果组织为草稿矢量编辑与导出流程。
 
 # 必填字段结束
 
 # 推荐字段:
 
 hasProcessingProvider=no
-# 如需提供变更日志,取消下行注释:
+# 如需提供变更日志，取消下行注释:
 # changelog=
 
 # 标签用逗号分隔(允许空格)
-tags=raster,segmentation,paddle,remote sensing,deep learning
+tags=raster,segmentation,pytorch,remote sensing,deep learning,dem
 
 category=Raster
 icon=icon.png
 # 实验性标记
 experimental=True
 
-# 弃用标记(整插件粒度,而非单个版本)
+# 弃用标记(整插件粒度，而非单个版本)
 deprecated=False
 
 # 自 QGIS 3.8 起可以声明依赖的其他插件(逗号分隔)
