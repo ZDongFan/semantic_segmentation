@@ -26,6 +26,7 @@ class AiSegmentMapTool(QgsMapTool):
         self._on_points_changed = on_points_changed
         self._positive_points = []
         self._negative_points = []
+        self._point_history = []
         self._disposed = False
 
         self._preview_band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
@@ -53,23 +54,25 @@ class AiSegmentMapTool(QgsMapTool):
         point = self.toMapCoordinates(event.pos())
         if event.button() == Qt.LeftButton:
             self._positive_points.append(point)
+            self._point_history.append('positive')
             self._refresh_point_bands()
             self._emit_points_changed()
         elif event.button() == Qt.RightButton:
             self._negative_points.append(point)
+            self._point_history.append('negative')
             self._refresh_point_bands()
             self._emit_points_changed()
 
     def undo_last_point(self):
-        # 撤销最后一次添加的点,无论正负
-        if self._positive_points and (not self._negative_points or
-                                      len(self._positive_points) >=
-                                      len(self._negative_points)):
-            self._positive_points.pop()
-        elif self._negative_points:
-            self._negative_points.pop()
-        elif self._positive_points:
-            self._positive_points.pop()
+        # 按真实点击顺序撤销,避免用正负点数量猜测导致撤错点。
+        while self._point_history:
+            point_type = self._point_history.pop()
+            if point_type == 'positive' and self._positive_points:
+                self._positive_points.pop()
+                break
+            if point_type == 'negative' and self._negative_points:
+                self._negative_points.pop()
+                break
         self._refresh_point_bands()
         self._emit_points_changed()
 
@@ -79,6 +82,7 @@ class AiSegmentMapTool(QgsMapTool):
             return
         self._positive_points = []
         self._negative_points = []
+        self._point_history = []
         self._refresh_point_bands()
         self._emit_points_changed()
 
