@@ -678,9 +678,33 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
     config = dict(postprocess_config or {})
     factor_dict = _factors_to_dict(factors, config)
     threshold = _postprocess_threshold(config)
-    mask = prob_map >= threshold
+    prob_arr = np.asarray(prob_map, dtype="float32")
+    finite_prob = prob_arr[np.isfinite(prob_arr)]
+    if finite_prob.size:
+        prob_stats = {
+            "min": float(np.min(finite_prob)),
+            "max": float(np.max(finite_prob)),
+            "mean": float(np.mean(finite_prob)),
+            "p50": float(np.percentile(finite_prob, 50)),
+            "p90": float(np.percentile(finite_prob, 90)),
+            "p95": float(np.percentile(finite_prob, 95)),
+            "p99": float(np.percentile(finite_prob, 99)),
+        }
+    else:
+        prob_stats = {
+            "min": None,
+            "max": None,
+            "mean": None,
+            "p50": None,
+            "p90": None,
+            "p95": None,
+            "p99": None,
+        }
+    mask = prob_arr >= threshold
+    threshold_pixel_count = int(mask.sum())
     if config.get("morph_opening", True):
         mask = _binary_opening(mask)
+    post_opening_pixel_count = int(mask.sum())
     labels, count = _label_components(mask)
     pixel_area = _pixel_area(transform)
     min_area = _min_area_m2(config)
@@ -779,6 +803,9 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
     summary = {
         "schema_version": SUPPORTED_SCHEMA_VERSION,
         "threshold": threshold,
+        "prob_stats": prob_stats,
+        "threshold_pixel_count": threshold_pixel_count,
+        "post_opening_pixel_count": post_opening_pixel_count,
         "min_area_m2": min_area,
         "component_count": count,
         "kept": kept,
