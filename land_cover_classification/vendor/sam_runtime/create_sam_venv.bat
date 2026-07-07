@@ -51,20 +51,56 @@ echo Upgrading pip, setuptools, and wheel...
 "%VENV_PY%" -m pip install --upgrade pip setuptools wheel
 if errorlevel 1 exit /b 1
 
+if "%SAM_TORCH_CPU_INDEX%"=="" set "SAM_TORCH_CPU_INDEX=https://download.pytorch.org/whl/cpu"
+if "%SAM_TORCH_PACKAGES%"=="" set "SAM_TORCH_PACKAGES=torch torchvision"
+
 set "USE_CUDA_TORCH=0"
+set "TORCH_INSTALL_MODE=cpu"
 where nvidia-smi >nul 2>nul
-if not errorlevel 1 set "USE_CUDA_TORCH=1"
+if not errorlevel 1 (
+    set "USE_CUDA_TORCH=1"
+    if "%SAM_TORCH_CUDA_INDEX%"=="" (
+        if "%SAM_TORCH_CUDA_INDEXES%"=="" (
+            for /f "usebackq delims=" %%I in (`"%VENV_PY%" -c "import re, subprocess; candidates=[((12,8),'cu128'),((12,6),'cu126'),((12,4),'cu124'),((12,1),'cu121'),((11,8),'cu118')]; p=subprocess.run(['nvidia-smi'],capture_output=True,text=True,errors='ignore'); m=re.search(r'CUDA Version:\s*(\d+)\.(\d+)', p.stdout); v=tuple(map(int,m.groups())) if m else (99,99); print(' '.join('https://download.pytorch.org/whl/'+name for req,name in candidates if v >= req))"`) do (
+                set "SAM_TORCH_CUDA_INDEXES=%%I"
+            )
+        )
+    ) else (
+        set "SAM_TORCH_CUDA_INDEXES=%SAM_TORCH_CUDA_INDEX%"
+    )
+)
 
 if "%USE_CUDA_TORCH%"=="1" (
-    echo NVIDIA environment detected. Installing CUDA PyTorch wheels...
-    "%VENV_PY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+    echo NVIDIA environment detected. Trying CUDA PyTorch wheels first...
+    set "TORCH_INSTALLED=0"
+    for %%I in (!SAM_TORCH_CUDA_INDEXES!) do (
+        if "!TORCH_INSTALLED!"=="0" (
+            echo Trying PyTorch wheel index: %%I
+            "%VENV_PY%" -m pip install --force-reinstall %SAM_TORCH_PACKAGES% --index-url "%%I"
+            if not errorlevel 1 (
+                "%VENV_PY%" -c "import sys, torch; print('torch', torch.__version__, 'cuda_runtime', torch.version.cuda, 'cuda_available', torch.cuda.is_available()); sys.exit(0 if torch.version.cuda and torch.cuda.is_available() else 1)"
+                if not errorlevel 1 (
+                    set "TORCH_INSTALLED=1"
+                    set "TORCH_INSTALL_MODE=cuda"
+                )
+            )
+        )
+    )
+    if not "!TORCH_INSTALLED!"=="1" (
+        echo CUDA PyTorch installation failed or CUDA is unavailable at runtime. Falling back to CPU PyTorch wheels...
+        "%VENV_PY%" -m pip install --force-reinstall %SAM_TORCH_PACKAGES% --index-url "%SAM_TORCH_CPU_INDEX%"
+        if errorlevel 1 (
+            echo Failed to install PyTorch.
+            exit /b 1
+        )
+    )
 ) else (
     echo NVIDIA environment not detected. Installing CPU PyTorch wheels...
-    "%VENV_PY%" -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
-)
-if errorlevel 1 (
-    echo Failed to install PyTorch.
-    exit /b 1
+    "%VENV_PY%" -m pip install --force-reinstall %SAM_TORCH_PACKAGES% --index-url "%SAM_TORCH_CPU_INDEX%"
+    if errorlevel 1 (
+        echo Failed to install PyTorch.
+        exit /b 1
+    )
 )
 
 set "SAM2_BUILD_CUDA=0"
@@ -92,6 +128,13 @@ echo Verifying the unified plugin runtime...
 if errorlevel 1 (
     echo Unified plugin runtime verification failed.
     exit /b 1
+)
+if "!TORCH_INSTALL_MODE!"=="cuda" (
+    "%VENV_PY%" -c "import sys, torch; sys.exit(0 if torch.version.cuda and torch.cuda.is_available() else 1)"
+    if errorlevel 1 (
+        echo Unified plugin runtime verification failed: PyTorch was expected to use CUDA, but it is running as CPU-only.
+        exit /b 1
+    )
 )
 
 echo Unified plugin venv created successfully: %VENV_DIR%

@@ -68,7 +68,8 @@ create_sam_venv.bat
 
 脚本分两层判断 CUDA:
 
-- 检测到 NVIDIA 环境时，优先安装 CUDA 版 PyTorch。
+- 检测到 NVIDIA 环境时，会根据驱动报告的 CUDA 能力按兼容顺序尝试 PyTorch 官方 CUDA wheel 源；安装失败或运行时不可用时回退到 CPU 版 PyTorch。
+- 可通过 `SAM_TORCH_CUDA_INDEX` 指定单个 CUDA wheel 源，或通过 `SAM_TORCH_CUDA_INDEXES` 指定多个候选源；可通过 `SAM_TORCH_PACKAGES` 指定 `torch` / `torchvision` 的版本范围。
 - 只有同时检测到 `nvcc` 和 C/C++ 编译工具链时，才设置 `SAM2_BUILD_CUDA=1` 构建 SAM2 CUDA 扩展。
 - 缺少 CUDA 编译工具链时会设置 `SAM2_BUILD_CUDA=0`，仍允许使用 GPU PyTorch 或 CPU 推理。
 

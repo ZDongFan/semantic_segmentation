@@ -17,6 +17,49 @@ class _Transform:
 
 class DemRuleSyntheticTest(unittest.TestCase):
 
+    def test_morphology_merge_fill_and_area_filter(self):
+        prob = np.zeros((80, 80), dtype="float32")
+        prob[10:30, 10:30] = 0.9
+        prob[10:30, 32:52] = 0.9
+        prob[14:18, 14:18] = 0.0
+        prob[70:72, 70:72] = 0.9
+
+        factors = {
+            "slope": np.full_like(prob, 25.0),
+            "relief": np.full_like(prob, 20.0),
+            "tpi": np.zeros_like(prob),
+        }
+        config = {
+            "threshold": 0.5,
+            "morph_closing": True,
+            "morph_close_size": 3,
+            "fill_holes": True,
+            "max_hole_area_m2": 100,
+            "smooth_boundary": False,
+            "morph_opening": False,
+            "min_area_m2": 10,
+            "rules": {
+                "slope": {"enabled": False},
+                "relief": {"enabled": False},
+                "tpi": {"enabled": False},
+            },
+        }
+
+        label, summary = apply_postprocess(
+            prob,
+            factors,
+            transform=_Transform(),
+            postprocess_config=config,
+        )
+
+        self.assertEqual(1, int(label[20, 31]))
+        self.assertEqual(1, int(label[15, 15]))
+        self.assertEqual(0, int(label[70, 70]))
+        self.assertEqual(1, summary["kept"])
+        self.assertEqual(1, summary["dropped"])
+        self.assertGreater(summary["post_fill_holes_pixel_count"],
+                           summary["post_closing_pixel_count"])
+
     def test_slope_relief_tpi_rules(self):
         prob = np.zeros((1024, 1024), dtype="float32")
         slope = np.full_like(prob, 25.0)

@@ -27,6 +27,9 @@ PYTORCH_REQUIREMENTS = [
     ("PyYAML", "yaml"),
 ]
 
+CUDA_CHECK_TIMEOUT_SECONDS = 30
+RUNTIME_CHECK_TIMEOUT_SECONDS = 180
+
 
 def plugin_dir():
     return os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +74,59 @@ def requirements():
     return list(PYTORCH_REQUIREMENTS)
 
 
+def _cuda_status(python_executable):
+    """单独探测 torch/CUDA，避免依赖导入超时时误报 GPU 不可用。"""
+    probe = (
+        "import json\n"
+        "cuda_available = False\n"
+        "torch_version = ''\n"
+        "error = ''\n"
+        "try:\n"
+        "    import torch\n"
+        "    torch_version = getattr(torch, '__version__', '')\n"
+        "    cuda_available = bool(torch.cuda.is_available())\n"
+        "except Exception as exc:\n"
+        "    error = '{}: {}'.format(type(exc).__name__, exc)\n"
+        "print(json.dumps({'cuda_available': cuda_available, "
+        "'torch_version': torch_version, 'cuda_error': error}, "
+        "ensure_ascii=False))\n"
+    )
+    try:
+        result = subprocess.run(
+            [python_executable, "-c", probe],
+            capture_output=True,
+            env=runtime_environment(python_executable),
+            text=True,
+            timeout=CUDA_CHECK_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "cuda_available": False,
+            "torch_version": "",
+            "cuda_checked": False,
+            "cuda_error": str(exc),
+        }
+
+    if result.returncode != 0:
+        return {
+            "cuda_available": False,
+            "torch_version": "",
+            "cuda_checked": False,
+            "cuda_error": result.stderr.strip(),
+        }
+
+    try:
+        payload = json.loads(result.stdout.strip() or "{}")
+    except ValueError:
+        payload = {}
+    return {
+        "cuda_available": bool(payload.get("cuda_available", False)),
+        "torch_version": payload.get("torch_version", ""),
+        "cuda_checked": True,
+        "cuda_error": payload.get("cuda_error", ""),
+    }
+
+
 def check_runtime(python_executable=None):
     """探测目标解释器是否能导入 PyTorch 主推理依赖。"""
     python_executable = python_executable or default_python_executable()
@@ -80,8 +136,10 @@ def check_runtime(python_executable=None):
             "error": "未找到插件统一 Python 解释器: {}".format(python_executable),
             "cuda_available": False,
             "torch_version": "",
+            "cuda_checked": False,
         }
 
+    cuda_status = _cuda_status(python_executable)
     probe = (
         "import json\n"
         "missing = []\n"
@@ -90,16 +148,7 @@ def check_runtime(python_executable=None):
         "        __import__(mod)\n"
         "    except Exception:\n"
         "        missing.append(display)\n"
-        "cuda_available = False\n"
-        "torch_version = ''\n"
-        "try:\n"
-        "    import torch\n"
-        "    torch_version = getattr(torch, '__version__', '')\n"
-        "    cuda_available = bool(torch.cuda.is_available())\n"
-        "except Exception:\n"
-        "    pass\n"
-        "print(json.dumps({{'missing': missing, 'cuda_available': cuda_available, "
-        "'torch_version': torch_version}}, ensure_ascii=False))\n"
+        "print(json.dumps({{'missing': missing}}, ensure_ascii=False))\n"
     ).format(modules=requirements())
 
     try:
@@ -108,23 +157,35 @@ def check_runtime(python_executable=None):
             capture_output=True,
             env=runtime_environment(python_executable),
             text=True,
-            timeout=60,
+            timeout=RUNTIME_CHECK_TIMEOUT_SECONDS,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {
+    except subprocess.TimeoutExpired:
+        status = {
+            "missing": [],
+            "error": (
+                "PyTorch 主推理依赖检查超过 {} 秒仍未完成；"
+                "这通常是首次导入 torch/torchvision/rasterio 等重依赖较慢，"
+                "不是 CUDA 不可用。请稍后重试，或在命令行运行 "
+                "`pytorch_deps_check.py --json` 查看完整诊断。"
+            ).format(RUNTIME_CHECK_TIMEOUT_SECONDS),
+        }
+        status.update(cuda_status)
+        return status
+    except OSError as exc:
+        status = {
             "missing": [name for name, _ in requirements()],
             "error": "调用插件统一解释器失败: {}".format(exc),
-            "cuda_available": False,
-            "torch_version": "",
         }
+        status.update(cuda_status)
+        return status
 
     if result.returncode != 0:
-        return {
+        status = {
             "missing": [name for name, _ in requirements()],
             "error": result.stderr.strip() or "PyTorch 主推理依赖探测失败。",
-            "cuda_available": False,
-            "torch_version": "",
         }
+        status.update(cuda_status)
+        return status
 
     try:
         payload = json.loads(result.stdout.strip() or "{}")
@@ -132,8 +193,7 @@ def check_runtime(python_executable=None):
         payload = {}
     payload.setdefault("missing", [name for name, _ in requirements()])
     payload.setdefault("error", "")
-    payload.setdefault("cuda_available", False)
-    payload.setdefault("torch_version", "")
+    payload.update(cuda_status)
     return payload
 
 
@@ -168,7 +228,12 @@ def installation_hint(status=None):
     if status.get("error"):
         lines.extend(["", "诊断信息:", "  {}".format(status["error"])])
 
-    if venv_ready() and not status.get("cuda_available", False):
+    if (
+        venv_ready()
+        and not status.get("error")
+        and status.get("cuda_checked", True)
+        and not status.get("cuda_available", False)
+    ):
         lines.extend([
             "",
             "未检测到可用 CUDA，插件会自动降级为 CPU 推理。大幅面影像可能耗时较长。",

@@ -56,6 +56,8 @@ FIELD_CLASS_NAME = "class_name"
 FIELD_SOURCE_ID = "source_id"
 BACKGROUND_CLASS_NAMES = {"background"}
 DRAFT_SIMPLIFY_PIXEL_TOLERANCE = 5
+DRAFT_SMOOTH_ITERATIONS = 1
+DRAFT_SMOOTH_OFFSET = 0.25
 AI_GEOMETRY_SIMPLIFY_PIXEL_TOLERANCE = 2
 AI_GEOMETRY_SMOOTH_ITERATIONS = 1
 AI_GEOMETRY_SMOOTH_OFFSET = 0.25
@@ -878,7 +880,19 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             simplified = simplified.makeValid()
         if simplified is None or simplified.isEmpty():
             return None
-        return simplified
+        try:
+            smoothed = simplified.smooth(
+                DRAFT_SMOOTH_ITERATIONS,
+                DRAFT_SMOOTH_OFFSET)
+        except Exception:
+            return simplified
+        if smoothed is None or smoothed.isEmpty():
+            return simplified
+        if not smoothed.isGeosValid():
+            smoothed = smoothed.makeValid()
+        if smoothed is None or smoothed.isEmpty():
+            return simplified
+        return smoothed
 
     def _ai_preview_simplify_tolerance(self):
         gt = self._ai_image_geotransform
@@ -996,13 +1010,16 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.outputFileWidget.setFilePath(self._vector_output_path())
         self.rasterFileWidget.setFilePath(self._raster_output_path())
 
-    def _ensure_pytorch_runtime_ready(self):
-        self.statusLabel.setText("正在检查 PyTorch 运行环境...")
-        QtWidgets.QApplication.processEvents()
-        ok, message = pytorch_deps_check.ensure_ready()
-        if ok:
+    def _ensure_pytorch_venv_available(self):
+        if pytorch_deps_check.venv_ready():
             return True
-        message = message or "PyTorch 运行环境未就绪。"
+        status = {
+            "missing": [name for name, _ in pytorch_deps_check.requirements()],
+            "error": "",
+            "cuda_available": False,
+            "cuda_checked": False,
+        }
+        message = pytorch_deps_check.installation_hint(status)
         self.statusLabel.setText("PyTorch 运行环境未就绪:\n{}".format(message))
         QtWidgets.QMessageBox.warning(
             self, "缺少插件统一运行环境", message)
@@ -1040,12 +1057,40 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if not dem_path:
             return
 
-        if not self._ensure_pytorch_runtime_ready():
+        flags = {
+            "clahe": self.claheCheck.isChecked(),
+            "sharpen": self.sharpenCheck.isChecked(),
+            "median": self.medianCheck.isChecked(),
+            "gaussian": self.gaussianCheck.isChecked(),
+        }
+        context = {
+            "model_path": model_path,
+            "input_path": input_path,
+            "dem_path": dem_path,
+            "vector_path": self._vector_output_path(),
+            "raster_path": self._raster_output_path(),
+            "flags": flags,
+            "georef": is_georeferenced(input_path),
+        }
+        if not self._ensure_pytorch_venv_available():
+            return
+        self._start_run_after_validation(context)
+
+    def _start_run_after_validation(self, context):
+        if not context:
+            self._warn("运行参数已丢失，请重新点击运行。")
             return
 
-        vector_path = self._vector_output_path()
+        model_path = context["model_path"]
+        input_path = context["input_path"]
+        dem_path = context["dem_path"]
+        vector_path = context["vector_path"]
+        raster_path = context["raster_path"]
+        flags = context["flags"]
+        georef = context["georef"]
+
         self.outputFileWidget.setFilePath(vector_path)
-        self.rasterFileWidget.setFilePath(self._raster_output_path())
+        self.rasterFileWidget.setFilePath(raster_path)
         if os.path.exists(vector_path):
             answer = QtWidgets.QMessageBox.question(
                 self, "覆盖确认",
@@ -1061,15 +1106,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._class_labels = self._read_class_labels(model_path)
         self._input_layer = self._resolve_input_layer()
         self._input_path = input_path
-
-        flags = {
-            "clahe": self.claheCheck.isChecked(),
-            "sharpen": self.sharpenCheck.isChecked(),
-            "median": self.medianCheck.isChecked(),
-            "gaussian": self.gaussianCheck.isChecked(),
-        }
-        georef = is_georeferenced(input_path)
         self._start_inference_process(model_path, input_path, dem_path, flags, georef)
+
     def _on_export_raster(self):
         if not self._layer_is_usable(self._draft_layer):
             self._warn("请先完成草稿层编辑。")

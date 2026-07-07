@@ -485,6 +485,21 @@ def _normalize_dem_stack(dem_stack, preprocess):
     return arr
 
 
+def _apply_active_dem_channels(dem_stack, names, preprocess):
+    import numpy as np
+
+    active = preprocess.get("active_dem_channels") or preprocess.get("enabled_dem_channels")
+    if not active:
+        return dem_stack
+
+    active_names = {str(name) for name in active}
+    arr = np.asarray(dem_stack, dtype="float32").copy()
+    for idx, name in enumerate(names):
+        if str(name) not in active_names:
+            arr[idx] = 0.0
+    return arr
+
+
 def _build_model_inputs(image_tile, dem_tile, use_dual_inputs, device):
     import numpy as np
     import torch
@@ -516,6 +531,8 @@ def sliding_window_predict(model, image, factors, bundle, device_cfg,
     elif factor_arrays:
         dem_stack = np.stack(factor_arrays, axis=0).astype("float32")
         dem_stack = _normalize_dem_stack(dem_stack, bundle.preprocess)
+        dem_stack = _apply_active_dem_channels(
+            dem_stack, _dem_channel_names(bundle, factor_cfg), bundle.preprocess)
     else:
         raise ValueError("当前模型需要 DEM 输入，但 bundle 没有提供 DEM 因子通道。")
 
@@ -578,6 +595,16 @@ def _min_area_m2(config):
     return float(config.get("min_area_m2", 500.0))
 
 
+def _config_int(config, keys, default):
+    for key in keys:
+        if key in config:
+            try:
+                return max(1, int(config.get(key)))
+            except (TypeError, ValueError):
+                return default
+    return default
+
+
 def _pixel_area(transform):
     try:
         return abs(transform.a * transform.e - transform.b * transform.d)
@@ -588,10 +615,54 @@ def _pixel_area(transform):
             return 1.0
 
 
-def _binary_opening(mask):
+def _morph_structure(size):
+    import numpy as np
+
+    return np.ones((max(1, int(size)), max(1, int(size))), dtype=bool)
+
+
+def _binary_opening(mask, size=3):
     try:
         from scipy import ndimage
-        return ndimage.binary_opening(mask, structure=[[1, 1, 1]] * 3)
+        return ndimage.binary_opening(mask, structure=_morph_structure(size))
+    except Exception:
+        return mask
+
+
+def _binary_closing(mask, size=3):
+    try:
+        from scipy import ndimage
+        return ndimage.binary_closing(mask, structure=_morph_structure(size))
+    except Exception:
+        return mask
+
+
+def _smooth_binary_mask(mask, size=3):
+    try:
+        from scipy import ndimage
+        structure = _morph_structure(size)
+        smoothed = ndimage.binary_closing(mask, structure=structure)
+        return ndimage.binary_opening(smoothed, structure=structure)
+    except Exception:
+        return mask
+
+
+def _fill_holes(mask, max_hole_area_m2=0, pixel_area=1.0):
+    try:
+        from scipy import ndimage
+        filled = ndimage.binary_fill_holes(mask)
+        holes = filled & ~mask
+        if not holes.any() or not max_hole_area_m2:
+            return filled
+
+        labels, count = _label_components(holes)
+        output = mask.copy()
+        max_pixels = max(1, int(float(max_hole_area_m2) / max(pixel_area, 1e-9)))
+        for comp_id in range(1, count + 1):
+            hole_mask = labels == comp_id
+            if int(hole_mask.sum()) <= max_pixels:
+                output[hole_mask] = True
+        return output
     except Exception:
         return mask
 
@@ -702,11 +773,24 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
         }
     mask = prob_arr >= threshold
     threshold_pixel_count = int(mask.sum())
+    pixel_area = _pixel_area(transform)
+    if config.get("morph_closing", False):
+        close_size = _config_int(config, ("morph_close_size", "closing_size"), 5)
+        mask = _binary_closing(mask, close_size)
+    post_closing_pixel_count = int(mask.sum())
+    if config.get("fill_holes", False):
+        max_hole_area = float(config.get("max_hole_area_m2", 0) or 0)
+        mask = _fill_holes(mask, max_hole_area, pixel_area)
+    post_fill_holes_pixel_count = int(mask.sum())
+    if config.get("smooth_boundary", False):
+        smooth_size = _config_int(config, ("smooth_size", "smooth_boundary_size"), 3)
+        mask = _smooth_binary_mask(mask, smooth_size)
+    post_smooth_pixel_count = int(mask.sum())
     if config.get("morph_opening", True):
-        mask = _binary_opening(mask)
+        open_size = _config_int(config, ("morph_open_size", "opening_size"), 3)
+        mask = _binary_opening(mask, open_size)
     post_opening_pixel_count = int(mask.sum())
     labels, count = _label_components(mask)
-    pixel_area = _pixel_area(transform)
     min_area = _min_area_m2(config)
     filled_mask = np.asarray(filled_mask, dtype=bool) if filled_mask is not None else None
 
@@ -805,6 +889,9 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
         "threshold": threshold,
         "prob_stats": prob_stats,
         "threshold_pixel_count": threshold_pixel_count,
+        "post_closing_pixel_count": post_closing_pixel_count,
+        "post_fill_holes_pixel_count": post_fill_holes_pixel_count,
+        "post_smooth_pixel_count": post_smooth_pixel_count,
         "post_opening_pixel_count": post_opening_pixel_count,
         "min_area_m2": min_area,
         "component_count": count,

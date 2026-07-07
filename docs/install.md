@@ -43,7 +43,9 @@ Linux / macOS：
 land_cover_classification/vendor/sam_runtime/create_sam_venv.sh
 ```
 
-脚本会检测 `nvidia-smi`。检测到 NVIDIA GPU 时优先安装 CUDA 12.4 版 `torch` / `torchvision`；否则安装 CPU 版。随后会安装 SAM2、OpenCV、rasterio、segmentation-models-pytorch、timm、scipy、PyYAML 等主推理和 AI 编辑共用依赖。
+脚本会检测 `nvidia-smi`。检测到 NVIDIA GPU 时会根据驱动报告的 CUDA 能力，从 PyTorch 官方 CUDA wheel 源中按兼容顺序尝试安装 `torch` / `torchvision`；如果 CUDA wheel 安装或运行时校验失败，会回退到 CPU 版，保证插件仍可运行。未检测到 NVIDIA 环境时直接安装 CPU 版。随后会安装 SAM2、OpenCV、rasterio、segmentation-models-pytorch、timm、scipy、PyYAML 等主推理和 AI 编辑共用依赖。
+
+如需在特殊环境中手动指定 PyTorch wheel 源，可设置 `SAM_TORCH_CUDA_INDEX` 或 `SAM_TORCH_CUDA_INDEXES`；如需指定包版本范围，可设置 `SAM_TORCH_PACKAGES`。
 
 已有 `venv/` 时脚本会停止，避免覆盖本机环境。如需重建，可先手动删除 `venv/`，或设置：
 
