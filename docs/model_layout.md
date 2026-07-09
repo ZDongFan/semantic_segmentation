@@ -30,18 +30,17 @@ models/semantic_segmentation/
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "framework": "pytorch",
   "task": "semantic_segmentation",
-  "display_name": "Landslide smoke v0",
+  "display_name": "Landslide MIT-B2 DEM v3",
   "weights": "weights.pt",
   "class_names": ["background", "landslide"],
   "landslide_class_id": 1
 }
 ```
 
-当前插件消费侧支持的 `schema_version` 为 `1`。版本不匹配时，插件会拒绝运行并提示重新导出 bundle。
-
+`schema_version` 可以存在，但推理侧不再通过它判断新旧兼容性；有效性完全由 `postprocess.json`、`dem_factors.py.FACTOR_NAMES` 和规则结构校验决定。
 ### arch.py
 
 `arch.py` 必须提供：
@@ -56,43 +55,86 @@ def build_model(cfg):
 
 ### dem_factors.py
 
-`dem_factors.py` 必须提供：
+`dem_factors.py` 必须声明固定通道顺序并提供显式契约调用入口：
 
 ```python
-def compute_factors(dem_array, transform):
+FACTOR_NAMES = ["slope", "aspect_sin", "aspect_cos", "tpi", "relief"]
+
+
+def compute_factors(dem_array, transform, dem_factors, crs_unit):
     ...
 ```
 
-返回值可以是 `dict`，也可以是形如 `[C, H, W]` 的数组。数组通道默认按
-`elevation, slope, relief, tpi, aspect` 解释；如需自定义顺序，可在 `postprocess.json`
-中提供 `factor_names`。
+返回值可以是 `dict`，也可以是形如 `[C, H, W]` 的数组；数组通道必须与 `FACTOR_NAMES` 和 `postprocess.json.dem_factors` 完全一致。推理侧不再提供 `5x5 pixels` 或旧默认通道顺序回退。
 
+当 `postprocess.json.dem_factors.*.scale_mode` 为 `meters` 时，输入影像 CRS 单位必须为米制，`dem_factors.py` 应按 `window_m / 像素大小` 换算窗口像素数，而不是写死固定像素窗口。
 ## DEM 后处理规则
 
 PyTorch 推理必须同时选择与输入影像覆盖范围相交的 DEM 文件。插件会把 DEM 重投影到输入影像格网，调用 bundle 内的 `dem_factors.py` 计算派生因子，然后执行规则后处理。
 
-`postprocess.json` 可配置概率阈值、最小面积和三条规则：
+`postprocess.json` 必须显式声明 DEM 因子契约、训练数据分辨率和规则结构：
 
 ```json
 {
-  "schema_version": 1,
-  "threshold": 0.5,
-  "min_area_m2": 500,
+  "schema_version": 2,
+  "threshold": 0.6,
+  "dem_factors": {
+    "slope": {"method": "gradient", "unit": "degree"},
+    "aspect_sin": {"method": "aspect_sin", "unit": "ratio"},
+    "aspect_cos": {"method": "aspect_cos", "unit": "ratio"},
+    "tpi": {
+      "method": "center_minus_local_mean",
+      "scale_mode": "meters",
+      "window_m": 50.0,
+      "unit": "m"
+    },
+    "relief": {
+      "method": "local_max_minus_min",
+      "scale_mode": "meters",
+      "window_m": 50.0,
+      "unit": "m"
+    }
+  },
+  "training_data": {
+    "image_resolution_m": 2.388657,
+    "dem_resolution_m": 12.5,
+    "crs_unit": "m"
+  },
+  "min_area_m2": 300,
   "rules": {
-    "slope": {"enabled": true, "slope_min_deg": 8.0},
-    "relief": {"enabled": true, "relief_min_m": 5.0},
-    "tpi": {"enabled": true, "tpi_max_ridge": 4.0}
-  }
+    "slope": {
+      "enabled": false,
+      "slope_min_deg": 8.0,
+      "factor": "slope",
+      "stat": "median",
+      "operator": ">="
+    },
+    "relief": {
+      "enabled": false,
+      "relief_min_m": 5.0,
+      "factor": "relief",
+      "stat": "median",
+      "operator": ">="
+    },
+    "tpi": {
+      "enabled": false,
+      "tpi_max_ridge": 4.0,
+      "factor": "tpi",
+      "stat": "mean",
+      "operator": "<="
+    }
+  },
+  "rule_order": ["slope", "relief", "tpi"]
 }
 ```
 
-后处理顺序为：模型 landslide 概率图、阈值化、3×3 开运算、8 连通域、最小面积过滤、
-`slope -> relief -> TPI` 规则流水线。每次运行会写出：
+规则即使禁用也必须通过结构校验。支持的 `stat` 为 `median`、`mean`、`min`、`max`，支持的 `operator` 为 `>=`、`>`、`<=`、`<`。规则比较阈值继续使用语义字段：`slope_min_deg`、`relief_min_m`、`tpi_max_ridge`。
+
+后处理顺序为：模型 landslide 概率图、阈值化、可选形态学处理、8 连通域、最小面积过滤、按 `rule_order` 执行规则。每次运行会写出：
 
 `<output>.postprocess.json`
 
-该文件包含每个 component 的面积、规则指标、保留/丢弃决策和触发规则，便于审计与调参。
-
+该文件包含 `dem_factors`、`training_data`、运行时分辨率、分辨率差异告警、规则契约、每个 component 的面积、保留/丢弃决策和触发规则，便于审计与调参。
 ## Legacy PaddleRS
 
 `vendor/PaddleRS/` 和旧推理入口以 `_inference_paddlers_legacy.py`、

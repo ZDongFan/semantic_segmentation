@@ -16,10 +16,25 @@ from dataclasses import dataclass
 
 SUPPORTED_SCHEMA_VERSION = 1
 DEFAULT_CLASS_LABELS = ["background", "landslide"]
-DEFAULT_FACTOR_NAMES = ["elevation", "slope", "relief", "tpi", "aspect"]
+EXPECTED_FACTOR_NAMES = ["slope", "aspect_sin", "aspect_cos", "tpi", "relief"]
+EXPECTED_DEM_FACTOR_METHODS = {
+    "slope": "gradient",
+    "aspect_sin": "aspect_sin",
+    "aspect_cos": "aspect_cos",
+    "tpi": "center_minus_local_mean",
+    "relief": "local_max_minus_min",
+}
 FACTOR_NAME_KEYS = ("factor_names", "dem_factor_names", "dem_channels", "channels")
 DUAL_INPUT_MODES = ("dual", "dual_branch", "image_dem", "two_input", "two_inputs")
 CONCAT_INPUT_MODES = ("concat", "stack", "single", "single_tensor")
+SUPPORTED_RULE_STATS = ("median", "mean", "min", "max")
+SUPPORTED_RULE_OPERATORS = (">=", ">", "<=", "<")
+RULE_THRESHOLD_KEYS = {
+    "slope": "slope_min_deg",
+    "relief": "relief_min_m",
+    "tpi": "tpi_max_ridge",
+}
+METER_UNITS = {"m", "meter", "meters", "metre", "metres"}
 LOG = logging.getLogger("LandCoverClassification.pytorch")
 
 
@@ -80,6 +95,126 @@ def class_labels_from_manifest(manifest):
     return list(DEFAULT_CLASS_LABELS)
 
 
+def _normalize_unit(value):
+    unit = str(value or "").strip().lower()
+    return "m" if unit in METER_UNITS else unit
+
+
+def _is_meter_unit(value):
+    return _normalize_unit(value) == "m"
+
+
+def _require_dict(value, path):
+    if not isinstance(value, dict):
+        raise ValueError("{} 必须是对象".format(path))
+    return value
+
+
+def _require_number(value, path, positive=False):
+    if isinstance(value, bool):
+        raise ValueError("{} 必须是数值".format(path))
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("{} 必须是数值".format(path))
+    if positive and number <= 0:
+        raise ValueError("{} 必须大于 0".format(path))
+    return number
+
+
+def _module_factor_names(dem_module):
+    names = getattr(dem_module, "FACTOR_NAMES", None)
+    if not names:
+        raise ValueError("bundle 的 dem_factors.py 必须声明 FACTOR_NAMES")
+    return [str(name) for name in names]
+
+
+def _validate_dem_factors_contract(config, module_factor_names=None):
+    dem_factors = _require_dict(config.get("dem_factors"), "postprocess.dem_factors")
+    declared_names = [str(name) for name in dem_factors.keys()]
+    if module_factor_names is not None and declared_names != list(module_factor_names):
+        raise ValueError(
+            "postprocess.dem_factors 必须与 dem_factors.py.FACTOR_NAMES 完全一致: {} != {}".format(
+                declared_names, list(module_factor_names)))
+    if declared_names != EXPECTED_FACTOR_NAMES:
+        raise ValueError("postprocess.dem_factors 必须按 v3 因子顺序声明: {}".format(
+            ", ".join(EXPECTED_FACTOR_NAMES)))
+
+    for name in EXPECTED_FACTOR_NAMES:
+        factor_cfg = _require_dict(dem_factors.get(name), "postprocess.dem_factors.{}".format(name))
+        expected_method = EXPECTED_DEM_FACTOR_METHODS[name]
+        if factor_cfg.get("method") != expected_method:
+            raise ValueError("postprocess.dem_factors.{}.method 必须是 {}".format(name, expected_method))
+        if name in ("tpi", "relief"):
+            if factor_cfg.get("scale_mode") != "meters":
+                raise ValueError("postprocess.dem_factors.{}.scale_mode 必须是 meters".format(name))
+            _require_number(factor_cfg.get("window_m"),
+                            "postprocess.dem_factors.{}.window_m".format(name), positive=True)
+            if not _is_meter_unit(factor_cfg.get("unit")):
+                raise ValueError("postprocess.dem_factors.{}.unit 必须是 m".format(name))
+    return dem_factors
+
+
+def _validate_training_data_contract(config):
+    training = _require_dict(config.get("training_data"), "postprocess.training_data")
+    _require_number(training.get("image_resolution_m"),
+                    "postprocess.training_data.image_resolution_m", positive=True)
+    _require_number(training.get("dem_resolution_m"),
+                    "postprocess.training_data.dem_resolution_m", positive=True)
+    if not _is_meter_unit(training.get("crs_unit")):
+        raise ValueError("postprocess.training_data.crs_unit 必须为米制")
+    return training
+
+
+def _validate_rules_contract(config, dem_factors):
+    rules = _require_dict(config.get("rules"), "postprocess.rules")
+    if not rules:
+        raise ValueError("postprocess.rules 不能为空")
+    rule_order = config.get("rule_order")
+    if rule_order is not None:
+        if not isinstance(rule_order, list) or not all(isinstance(item, str) for item in rule_order):
+            raise ValueError("postprocess.rule_order 必须是规则名数组")
+        if len(set(rule_order)) != len(rule_order):
+            raise ValueError("postprocess.rule_order 不能包含重复规则")
+        if set(rule_order) != set(rules.keys()):
+            raise ValueError("postprocess.rule_order 必须覆盖 rules 中的全部规则")
+
+    for name, rule_cfg in rules.items():
+        if name not in RULE_THRESHOLD_KEYS:
+            raise ValueError("不支持的规则: {}".format(name))
+        rule_cfg = _require_dict(rule_cfg, "postprocess.rules.{}".format(name))
+        for key in ("enabled", "factor", "stat", "operator"):
+            if key not in rule_cfg:
+                raise ValueError("postprocess.rules.{}.{} 缺失".format(name, key))
+        if not isinstance(rule_cfg.get("enabled"), bool):
+            raise ValueError("postprocess.rules.{}.enabled 必须是布尔值".format(name))
+        factor_name = str(rule_cfg.get("factor"))
+        if factor_name not in dem_factors:
+            raise ValueError("postprocess.rules.{}.factor 不存在于 dem_factors: {}".format(name, factor_name))
+        if str(rule_cfg.get("stat")) not in SUPPORTED_RULE_STATS:
+            raise ValueError("postprocess.rules.{}.stat 不支持: {}".format(name, rule_cfg.get("stat")))
+        if str(rule_cfg.get("operator")) not in SUPPORTED_RULE_OPERATORS:
+            raise ValueError("postprocess.rules.{}.operator 不支持: {}".format(name, rule_cfg.get("operator")))
+        _require_number(rule_cfg.get(RULE_THRESHOLD_KEYS[name]),
+                        "postprocess.rules.{}.{}".format(name, RULE_THRESHOLD_KEYS[name]))
+    return rules
+
+
+def validate_postprocess_contract(config, module_factor_names=None):
+    """校验 v3 显式米制 DEM 因子与规则契约。"""
+    if not isinstance(config, dict):
+        raise ValueError("postprocess 配置必须是对象")
+    dem_factors = _validate_dem_factors_contract(config, module_factor_names)
+    _validate_training_data_contract(config)
+    _validate_rules_contract(config, dem_factors)
+    return True
+
+
+def validate_bundle_contract(bundle):
+    """校验 bundle 是否满足当前推理侧强制契约。"""
+    validate_postprocess_contract(bundle.postprocess, _module_factor_names(bundle.dem_module))
+    return True
+
 def is_georeferenced(image_path):
     """判断影像是否带有有效地理参考。"""
     try:
@@ -118,12 +253,6 @@ def load_bundle(bundle_dir):
             manifest.get("framework")))
     if manifest.get("task") != "semantic_segmentation":
         raise ValueError("不支持的 task: {}".format(manifest.get("task")))
-    schema_version = int(manifest.get("schema_version", 0))
-    if schema_version != SUPPORTED_SCHEMA_VERSION:
-        raise ValueError(
-            "不兼容的 bundle schema_version={}，当前插件仅支持 {}。请重新导出 bundle。"
-            .format(schema_version, SUPPORTED_SCHEMA_VERSION))
-
     arch_module = _load_module(
         "lcc_bundle_arch_{}".format(abs(hash(bundle_dir))),
         os.path.join(bundle_dir, "arch.py"),
@@ -132,7 +261,7 @@ def load_bundle(bundle_dir):
         "lcc_bundle_dem_{}".format(abs(hash(bundle_dir))),
         os.path.join(bundle_dir, "dem_factors.py"),
     )
-    return Bundle(
+    bundle = Bundle(
         path=bundle_dir,
         manifest=manifest,
         preprocess=_read_json(os.path.join(bundle_dir, "preprocess.json"), {}),
@@ -140,6 +269,8 @@ def load_bundle(bundle_dir):
         arch_module=arch_module,
         dem_module=dem_module,
     )
+    validate_bundle_contract(bundle)
+    return bundle
 
 
 def select_device():
@@ -282,8 +413,58 @@ def read_image(image_path, preprocess_flags=None, preprocess=None):
     return image, profile, transform, crs
 
 
+def _pixel_size_xy(transform):
+    if transform is None:
+        return None
+    try:
+        return abs(float(transform.a)), abs(float(transform.e))
+    except AttributeError:
+        try:
+            return abs(float(transform[0])), abs(float(transform[4]))
+        except Exception:
+            return None
+
+
+def _resolution_from_transform(transform):
+    size = _pixel_size_xy(transform)
+    if not size:
+        return None
+    return float((size[0] + size[1]) / 2.0)
+
+
+def _crs_unit(crs):
+    if crs is None:
+        return None
+    for attr in ("linear_units", "linear_unit_name"):
+        value = getattr(crs, attr, None)
+        if value:
+            return _normalize_unit(value)
+    try:
+        units = crs.to_dict().get("units")
+        if units:
+            return _normalize_unit(units)
+    except Exception:
+        pass
+    try:
+        pyproj_crs = crs.to_pyproj()
+        axis_info = getattr(pyproj_crs, "axis_info", None) or []
+        if axis_info:
+            return _normalize_unit(getattr(axis_info[0], "unit_name", None))
+    except Exception:
+        pass
+    return None
+
+
+def _require_runtime_meter_crs(dem_factors, crs_unit):
+    for name, factor_cfg in dem_factors.items():
+        if factor_cfg.get("scale_mode") == "meters" and not _is_meter_unit(crs_unit):
+            raise ValueError(
+                "postprocess.dem_factors.{} 使用 meters 尺度，运行时影像 CRS 单位必须为米制，当前为 {}".format(
+                    name, crs_unit or "unknown"))
+
+
 def align_dem_to_image(dem_path, image_profile):
-    """把 DEM 重投影到输入影像格网，返回填补后的 DEM 和填补掩膜。"""
+    """把 DEM 重投影到输入影像格网，返回 DEM、填补掩膜与源 DEM 元数据。"""
     import numpy as np
     import rasterio
     from rasterio.warp import Resampling, reproject
@@ -293,8 +474,16 @@ def align_dem_to_image(dem_path, image_profile):
     dst_transform = image_profile["transform"]
     dst_crs = image_profile.get("crs")
     destination = np.full((height, width), np.nan, dtype="float32")
+    dem_info = {
+        "path": dem_path,
+        "resolution": None,
+        "crs_unit": None,
+    }
 
     with rasterio.open(dem_path) as dem:
+        dem_info["crs_unit"] = _crs_unit(dem.crs)
+        if dem.res and dem_info["crs_unit"] == "m":
+            dem_info["resolution"] = float((abs(float(dem.res[0])) + abs(float(dem.res[1]))) / 2.0)
         source = dem.read(1).astype("float32")
         src_nodata = dem.nodata
         if src_nodata is not None:
@@ -316,26 +505,36 @@ def align_dem_to_image(dem_path, image_profile):
         raise ValueError("DEM 与输入影像没有有效重叠区域。")
     fill_value = float(np.nanmean(destination))
     destination[filled_mask] = fill_value
-    return destination, filled_mask
+    return destination, filled_mask, dem_info
 
 
-def compute_dem_factors(bundle, dem_array, transform):
-    """调用 bundle 内 dem_factors.py 计算派生因子。"""
+def compute_dem_factors(bundle, dem_array, transform, postprocess_config, crs_unit):
+    """按显式 DEM 因子契约调用 bundle 内 dem_factors.py。"""
     if not hasattr(bundle.dem_module, "compute_factors"):
-        raise AttributeError("bundle 的 dem_factors.py 缺少 compute_factors(dem_array, transform)")
-    factors = bundle.dem_module.compute_factors(dem_array, transform)
-    return factors
+        raise AttributeError("bundle 的 dem_factors.py 缺少 compute_factors(dem_array, transform, dem_factors=..., crs_unit=...)")
+    validate_postprocess_contract(postprocess_config, _module_factor_names(bundle.dem_module))
+    dem_factors = postprocess_config["dem_factors"]
+    _require_runtime_meter_crs(dem_factors, crs_unit)
+    return bundle.dem_module.compute_factors(
+        dem_array,
+        transform,
+        dem_factors=dem_factors,
+        crs_unit=crs_unit,
+    )
 
 
 def _factor_names(*configs):
     for config in configs:
         if not config:
             continue
+        dem_factors = config.get("dem_factors") if isinstance(config, dict) else None
+        if isinstance(dem_factors, dict) and dem_factors:
+            return [str(name) for name in dem_factors.keys()]
         for key in FACTOR_NAME_KEYS:
             names = config.get(key)
             if names:
                 return [str(name) for name in names]
-    return list(DEFAULT_FACTOR_NAMES)
+    raise ValueError("DEM 因子缺少显式通道名声明")
 
 
 def _factor_config(bundle, *configs):
@@ -358,13 +557,12 @@ def _factors_to_dict(factors, config):
     if arr.ndim != 3:
         raise ValueError("DEM 因子必须是 dict 或 [C,H,W] 数组。")
     names = _factor_names(config)
-    if arr.shape[0] > len(names):
-        raise ValueError("DEM 因子通道数 {} 超过已声明通道名数量 {}。".format(arr.shape[0], len(names)))
+    if arr.shape[0] != len(names):
+        raise ValueError("DEM 因子通道数 {} 必须等于显式声明通道数 {}。".format(arr.shape[0], len(names)))
     result = {}
     for idx in range(arr.shape[0]):
         result[names[idx]] = arr[idx]
     return result
-
 
 def _window_starts(length, tile_size, overlap):
     stride = max(1, tile_size - overlap)
@@ -445,7 +643,7 @@ def _use_dual_inputs(model, bundle):
 def _dem_channel_names(bundle, factor_cfg):
     model_cfg = _model_config(bundle)
     dem_channels = int(model_cfg.get("dem_in_channels", 0) or 0)
-    names = _factor_names(bundle.preprocess, factor_cfg, bundle.postprocess, bundle.manifest)
+    names = _factor_names(factor_cfg, bundle.postprocess, bundle.preprocess, bundle.manifest)
     if dem_channels > len(names):
         raise ValueError("模型声明需要 {} 个 DEM 通道，但 bundle 只声明了 {} 个。".format(dem_channels, len(names)))
     if dem_channels > 0:
@@ -582,11 +780,6 @@ def sliding_window_predict(model, image, factors, bundle, device_cfg,
     return prob_sum / weight_sum
 
 
-def _rule_config(config, name):
-    rules = config.get("rules") or {}
-    return rules.get(name) or config.get(name) or {}
-
-
 def _postprocess_threshold(config):
     return float(config.get("threshold", config.get("prob_threshold", 0.5)))
 
@@ -699,37 +892,62 @@ def _label_components_fallback(mask):
     return labels, comp_id
 
 
-def _bbox(mask):
-    import numpy as np
-
-    ys, xs = np.where(mask)
-    return int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
-
-
-def _expanded_bbox(mask, pad):
-    y0, y1, x0, x1 = _bbox(mask)
-    height, width = mask.shape
-    return max(0, y0 - pad), min(height, y1 + pad), max(0, x0 - pad), min(width, x1 + pad)
-
-
-def _finite_median(values, default=None):
+def _finite_stat(values, stat):
     import numpy as np
 
     values = np.asarray(values)
     values = values[np.isfinite(values)]
     if values.size == 0:
-        return default
-    return float(np.median(values))
+        return None
+    if stat == "median":
+        return float(np.median(values))
+    if stat == "mean":
+        return float(np.mean(values))
+    if stat == "min":
+        return float(np.min(values))
+    if stat == "max":
+        return float(np.max(values))
+    raise ValueError("不支持的规则统计量: {}".format(stat))
 
 
-def _finite_mean(values, default=None):
-    import numpy as np
+def _compare_rule(observed, operator, threshold):
+    if observed is None:
+        return False
+    if operator == ">=":
+        return observed >= threshold
+    if operator == ">":
+        return observed > threshold
+    if operator == "<=":
+        return observed <= threshold
+    if operator == "<":
+        return observed < threshold
+    raise ValueError("不支持的规则比较符: {}".format(operator))
 
-    values = np.asarray(values)
-    values = values[np.isfinite(values)]
-    if values.size == 0:
-        return default
-    return float(np.mean(values))
+
+def _ordered_rule_items(config):
+    rules = config["rules"]
+    rule_order = config.get("rule_order")
+    names = list(rule_order) if rule_order else list(rules.keys())
+    return [(name, rules[name]) for name in names]
+
+
+def _rule_threshold_value(name, rule_cfg):
+    return _require_number(rule_cfg.get(RULE_THRESHOLD_KEYS[name]),
+                           "postprocess.rules.{}.{}".format(name, RULE_THRESHOLD_KEYS[name]))
+
+
+def _rules_contract_summary(config):
+    return {
+        name: {
+            "enabled": bool(rule_cfg["enabled"]),
+            "factor": str(rule_cfg["factor"]),
+            "stat": str(rule_cfg["stat"]),
+            "operator": str(rule_cfg["operator"]),
+            "threshold_key": RULE_THRESHOLD_KEYS[name],
+            "threshold_value": float(_rule_threshold_value(name, rule_cfg)),
+        }
+        for name, rule_cfg in config["rules"].items()
+    }
 
 
 def _record_decision(component, decision, rule=None, threshold=None):
@@ -740,13 +958,26 @@ def _record_decision(component, decision, rule=None, threshold=None):
         component["threshold"] = threshold
 
 
+def _drop_by_rule(component, evaluation):
+    component.update({
+        "decision": "drop",
+        "rule": evaluation["rule"],
+        "factor": evaluation["factor"],
+        "stat": evaluation["stat"],
+        "operator": evaluation["operator"],
+        "threshold_value": evaluation["threshold_value"],
+        "observed_value": evaluation["observed_value"],
+    })
+
+
 def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
                       postprocess_config=None, output_path=None,
-                      progress_callback=None):
-    """按 slope、relief、TPI 规则处理概率图并生成审计摘要。"""
+                      progress_callback=None, runtime_metadata=None):
+    """按显式规则契约处理概率图并生成审计摘要。"""
     import numpy as np
 
     config = dict(postprocess_config or {})
+    validate_postprocess_contract(config)
     factor_dict = _factors_to_dict(factors, config)
     threshold = _postprocess_threshold(config)
     prob_arr = np.asarray(prob_map, dtype="float32")
@@ -798,13 +1029,7 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
     components = []
     kept = 0
     dropped = 0
-
-    slope_cfg = _rule_config(config, "slope")
-    relief_cfg = _rule_config(config, "relief")
-    tpi_cfg = _rule_config(config, "tpi")
-    slope_min = float(slope_cfg.get("slope_min_deg", slope_cfg.get("min_deg", 8.0)))
-    relief_min = float(relief_cfg.get("relief_min_m", relief_cfg.get("min_m", 5.0)))
-    tpi_max = float(tpi_cfg.get("tpi_max_ridge", tpi_cfg.get("max_ridge", 4.0)))
+    ordered_rules = _ordered_rule_items(config)
 
     for comp_id in range(1, count + 1):
         comp_mask = labels == comp_id
@@ -815,6 +1040,7 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
             "pixel_count": pixel_count,
             "area_m2": area_m2,
             "threshold": threshold,
+            "rule_evaluations": [],
         }
 
         if area_m2 < min_area:
@@ -836,56 +1062,58 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
                 components.append(component)
                 continue
 
-        slope = factor_dict.get("slope")
-        if slope_cfg.get("enabled", True) and slope is not None:
-            median_slope = _finite_median(slope[comp_mask])
-            component["median_slope"] = median_slope
-            if median_slope is not None and median_slope < slope_min:
-                _record_decision(component, "drop", "slope", slope_min)
+        dropped_by_rule = False
+        for rule_name, rule_cfg in ordered_rules:
+            if not rule_cfg["enabled"]:
+                continue
+            factor_name = str(rule_cfg["factor"])
+            if factor_name not in factor_dict:
+                raise ValueError("规则 {} 需要的 DEM 因子不存在: {}".format(rule_name, factor_name))
+            stat = str(rule_cfg["stat"])
+            operator = str(rule_cfg["operator"])
+            threshold_value = float(_rule_threshold_value(rule_name, rule_cfg))
+            observed_value = _finite_stat(factor_dict[factor_name][comp_mask], stat)
+            passed = _compare_rule(observed_value, operator, threshold_value)
+            evaluation = {
+                "rule": rule_name,
+                "factor": factor_name,
+                "stat": stat,
+                "operator": operator,
+                "threshold_value": threshold_value,
+                "observed_value": observed_value,
+                "passed": bool(passed),
+            }
+            component["rule_evaluations"].append(evaluation)
+            if not passed:
+                _drop_by_rule(component, evaluation)
                 dropped += 1
                 components.append(component)
+                dropped_by_rule = True
                 LOG.info(
-                    "DROP comp_id=%s area_m2=%.3f rule=slope median_slope=%.3f threshold=%.3f",
-                    comp_id, area_m2, median_slope, slope_min)
-                continue
+                    "DROP comp_id=%s area_m2=%.3f rule=%s factor=%s stat=%s observed=%s operator=%s threshold=%.3f",
+                    comp_id, area_m2, rule_name, factor_name, stat,
+                    observed_value, operator, threshold_value)
+                break
 
-        relief = factor_dict.get("relief")
-        if relief_cfg.get("enabled", True) and relief is not None:
-            y0, y1, x0, x1 = _expanded_bbox(comp_mask, 2)
-            median_relief = _finite_median(relief[y0:y1, x0:x1])
-            component["median_relief"] = median_relief
-            if median_relief is not None and median_relief < relief_min:
-                _record_decision(component, "drop", "relief", relief_min)
-                dropped += 1
-                components.append(component)
-                LOG.info(
-                    "DROP comp_id=%s area_m2=%.3f rule=relief median_relief=%.3f threshold=%.3f",
-                    comp_id, area_m2, median_relief, relief_min)
-                continue
-
-        tpi = factor_dict.get("tpi")
-        if tpi_cfg.get("enabled", True) and tpi is not None:
-            mean_tpi = _finite_mean(tpi[comp_mask])
-            component["mean_tpi"] = mean_tpi
-            if mean_tpi is not None and mean_tpi > tpi_max:
-                _record_decision(component, "drop", "tpi", tpi_max)
-                dropped += 1
-                components.append(component)
-                LOG.info(
-                    "DROP comp_id=%s area_m2=%.3f rule=tpi mean_tpi=%.3f threshold=%.3f",
-                    comp_id, area_m2, mean_tpi, tpi_max)
-                continue
+        if dropped_by_rule:
+            continue
 
         output[comp_mask] = 1
         kept += 1
         _record_decision(component, "keep")
         components.append(component)
-        LOG.info("KEEP comp_id=%s area_m2=%.3f median_slope=%s median_relief=%s mean_tpi=%s",
-                 comp_id, area_m2, component.get("median_slope"),
-                 component.get("median_relief"), component.get("mean_tpi"))
+        LOG.info("KEEP comp_id=%s area_m2=%.3f", comp_id, area_m2)
 
+    runtime_metadata = dict(runtime_metadata or {})
     summary = {
         "schema_version": SUPPORTED_SCHEMA_VERSION,
+        "contract": "explicit_dem_factors_v3",
+        "dem_factors": config["dem_factors"],
+        "training_data": config["training_data"],
+        "runtime_resolution": runtime_metadata.get("runtime_resolution", {}),
+        "resolution_warnings": runtime_metadata.get("resolution_warnings", []),
+        "rules": _rules_contract_summary(config),
+        "rule_order": [name for name, _rule_cfg in ordered_rules],
         "threshold": threshold,
         "prob_stats": prob_stats,
         "threshold_pixel_count": threshold_pixel_count,
@@ -908,7 +1136,6 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
         progress_callback("postprocess", kept, max(1, kept + dropped), kept=kept, dropped=dropped)
     return output, summary
 
-
 def _tiff_block_size(length, preferred=256):
     if length < 16:
         return None
@@ -918,7 +1145,7 @@ def _tiff_block_size(length, preferred=256):
 
 
 def write_class_geotiff(output_path, label_map, image_profile):
-    """???????????????? GeoTIFF?"""
+    """写出单波段类别 GeoTIFF。"""
     import rasterio
 
     profile = image_profile.copy()
@@ -941,6 +1168,8 @@ def write_class_geotiff(output_path, label_map, image_profile):
         profile.update(tiled=False)
     with rasterio.open(output_path, "w", **profile) as dst:
         dst.write(label_map.astype("uint8"), 1)
+
+
 def _merge_postprocess_config(bundle, overrides):
     config = dict(bundle.postprocess or {})
     for key, value in (overrides or {}).items():
@@ -953,24 +1182,76 @@ def _merge_postprocess_config(bundle, overrides):
     return config
 
 
+def _resolution_warning(kind, runtime_resolution, training_resolution):
+    if runtime_resolution is None:
+        return None
+    training_resolution = float(training_resolution)
+    if training_resolution <= 0:
+        return None
+    relative_difference = abs(float(runtime_resolution) - training_resolution) / training_resolution
+    if relative_difference <= 0.25:
+        return None
+    return {
+        "kind": kind,
+        "runtime_resolution_m": float(runtime_resolution),
+        "training_resolution_m": training_resolution,
+        "relative_difference": float(relative_difference),
+    }
+
+
+def _runtime_metadata(config, image_transform, image_crs_unit, dem_info):
+    training = config["training_data"]
+    image_resolution = _resolution_from_transform(image_transform) if _is_meter_unit(image_crs_unit) else None
+    dem_resolution = dem_info.get("resolution") if dem_info else None
+    warnings = []
+    image_warning = _resolution_warning(
+        "image_resolution_mismatch",
+        image_resolution,
+        training["image_resolution_m"],
+    )
+    if image_warning:
+        warnings.append(image_warning)
+    dem_warning = _resolution_warning(
+        "dem_resolution_mismatch",
+        dem_resolution,
+        training["dem_resolution_m"],
+    )
+    if dem_warning:
+        warnings.append(dem_warning)
+    return {
+        "runtime_resolution": {
+            "image_resolution_m": image_resolution,
+            "image_crs_unit": image_crs_unit,
+            "dem_resolution_m": dem_resolution,
+            "dem_crs_unit": (dem_info or {}).get("crs_unit"),
+        },
+        "resolution_warnings": warnings,
+    }
+
+
 def run_inference(params, progress_callback=None):
     """执行完整 PyTorch 推理流程。"""
     bundle = load_bundle(params["model_path"])
+    config = _merge_postprocess_config(
+        bundle, params.get("postprocess_overrides") or {})
+    validate_postprocess_contract(config, _module_factor_names(bundle.dem_module))
     device_cfg = select_device()
     if progress_callback is not None:
         progress_callback("load", 1, 1, device=device_cfg["name"])
 
     model = build_model(bundle, device_cfg)
-    image, profile, transform, _crs = read_image(
+    image, profile, transform, crs = read_image(
         params["input_path"],
         preprocess_flags=params.get("preprocess_flags") or {},
         preprocess=bundle.preprocess,
     )
+    runtime_crs_unit = _crs_unit(crs)
     if progress_callback is not None:
         progress_callback("dem", 0, 1)
-    dem, filled_mask = align_dem_to_image(params["dem_path"], profile)
-    raw_factors = compute_dem_factors(bundle, dem, transform)
-    factors = _factors_to_dict(raw_factors, _factor_config(bundle))
+    dem, filled_mask, dem_info = align_dem_to_image(params["dem_path"], profile)
+    raw_factors = compute_dem_factors(bundle, dem, transform, config, runtime_crs_unit)
+    factors = _factors_to_dict(raw_factors, _factor_config(bundle, config))
+    runtime_metadata = _runtime_metadata(config, transform, runtime_crs_unit, dem_info)
     if progress_callback is not None:
         progress_callback("dem", 1, 1)
 
@@ -982,8 +1263,6 @@ def run_inference(params, progress_callback=None):
         device_cfg,
         progress_callback=progress_callback,
     )
-    config = _merge_postprocess_config(
-        bundle, params.get("postprocess_overrides") or {})
     label_map, summary = apply_postprocess(
         prob_map,
         factors,
@@ -992,6 +1271,7 @@ def run_inference(params, progress_callback=None):
         postprocess_config=config,
         output_path=params["output_path"],
         progress_callback=progress_callback,
+        runtime_metadata=runtime_metadata,
     )
     write_class_geotiff(params["output_path"], label_map, profile)
     return {
@@ -1001,7 +1281,6 @@ def run_inference(params, progress_callback=None):
         "kept": summary.get("kept", 0),
         "dropped": summary.get("dropped", 0),
     }
-
 
 def run_inference_from_file(params_path, progress_callback=None):
     """从 JSON 参数文件读取配置并执行推理。"""
