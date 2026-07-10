@@ -102,8 +102,8 @@ land_cover_classification/models/semantic_segmentation/
 - `preprocess.json`
 - `postprocess.json`
 - `README.md`
+详细 schema 见 [model_layout.md](model_layout.md)。缺少 manifest.json 的目录会被跳过，不显示在模型下拉框中。
 
-详细 schema 见 [`model_layout.md`](model_layout.md)。遗留 PaddleRS `model.yml` 目录会被跳过，不再显示在模型下拉框中。
 
 ## 四、准备 SAM AI 编辑资源
 
@@ -119,6 +119,4 @@ land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt
 
 1. 重启 QGIS。
 2. 启用 `LandCoverClassification` 插件。
-3. 首次打开插件时会检查插件统一运行环境；缺失时会弹窗指向 `vendor/sam_runtime/` 下的环境创建脚本。
-4. PaddleRS 推理入口已下线，首次启动会弹出一次性提示；旧 `vendor/PaddleRS/` 仅作为 legacy 代码保留在盘中。
-5. 运行推理时必须选择输入影像和对应 DEM 文件。
+3. 运行推理时必须选择输入影像和对应 DEM 文件。

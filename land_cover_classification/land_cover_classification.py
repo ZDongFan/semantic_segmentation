@@ -202,17 +202,6 @@ class LandCoverClassification:
     def run(self):
         """打开插件主对话框。"""
 
-        settings = QSettings()
-        notice_key = "LandCoverClassification/paddlers_deprecated_notice_shown"
-        if not settings.value(notice_key, False, type=bool):
-            from qgis.PyQt.QtWidgets import QMessageBox
-            QMessageBox.information(
-                self.iface.mainWindow(),
-                self.tr("PaddleRS 已下线"),
-                self.tr("PaddleRS 推理入口已下线，请使用 PyTorch bundle。详见 docs/model_layout.md。"),
-            )
-            settings.setValue(notice_key, True)
-
         # 延迟构造对话框,只在首次使用时创建一次。
         if self.first_start or self.dock is None:
             self.first_start = False

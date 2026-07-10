@@ -82,14 +82,6 @@ def scan(root_dir):
                      "info")
             continue
 
-        if os.path.isfile(os.path.join(sub_dir, "model.yml")):
-            _log(
-                "跳过遗留 PaddleRS 模型 '{}': PaddleRS 推理路径已下线，"
-                "请使用 landslide_training 仓库重新训练并导出 PyTorch bundle。"
-                .format(sub_dir),
-                "warning",
-            )
-        else:
-            _log("跳过 '{}':缺少 manifest.json".format(sub_dir), "info")
+        _log("跳过 '{}':缺少 manifest.json".format(sub_dir), "info")
 
     return results

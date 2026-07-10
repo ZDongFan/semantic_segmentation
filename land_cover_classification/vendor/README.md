@@ -1,12 +1,5 @@
-# Vendored PaddleRS
+# 插件运行环境
 
-`PaddleRS/` 子目录是 [PaddleCV-SIG/PaddleRS](https://github.com/PaddleCV-SIG/PaddleRS)
-项目的 vendor 副本。
+`sam_runtime/` 提供 PyTorch 主推理和 SAM AI 辅助编辑共用的独立运行环境创建脚本与说明文档。
 
-本目录只保留运行时所需的 `paddlers/` Python 包,`docs/`、`examples/`、
-`tests/`、`setup.py` 等开发构建产物未被包含,以减小插件体积。
-
-上游的 Apache-2.0 LICENSE 保留在 `PaddleRS/LICENSE`。
-
-插件的 `__init__.py` 会把 `vendor/PaddleRS/` 插入到 `sys.path` 最前面,
-从而保证插件内 `import paddlers` 始终命中本副本。
+请使用 `sam_runtime/create_sam_venv.bat` 或 `sam_runtime/create_sam_venv.sh` 创建 `venv/`；不要将重依赖安装到 QGIS 主进程 Python 环境。

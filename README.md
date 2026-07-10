@@ -51,15 +51,12 @@ semantic_segmentation/
     |-- pytorch_inference_core.py
     |-- pytorch_inference_runner.py
     |-- pytorch_deps_check.py
-    |-- _inference_paddlers_legacy.py
-    |-- _inference_runner_paddlers_legacy.py
     |-- preprocess.py
     |-- model_scan.py
     |-- sam_deps_check.py
     |-- sam_worker.py
     |-- ai_segment_tool.py
     |-- vendor/
-    |   |-- PaddleRS/
     |   `-- sam_runtime/      # 插件统一运行环境
     `-- models/
         |-- semantic_segmentation/
@@ -68,4 +65,4 @@ semantic_segmentation/
 
 ## 许可
 
-本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。`vendor/PaddleRS/` 作为遗留代码保留在盘中但插件不再调用；统一运行环境中的第三方依赖遵循各自上游许可证。
+本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。统一运行环境中的第三方依赖遵循各自上游许可证。
