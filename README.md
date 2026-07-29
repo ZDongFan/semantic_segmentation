@@ -6,12 +6,13 @@
 
 ## 主要功能
 
-- 扫描 `manifest.json` 格式的 PyTorch 语义分割 bundle，并在模型下拉框中列出。
+- 扫描模型根目录下带 `manifest.json` 的 PyTorch 语义分割 bundle，并在模型下拉框中列出；bundle 子目录名由外部模型提供方决定，不作为兼容性判断条件。
 - 使用插件统一运行环境 `vendor/sam_runtime/venv/` 子进程执行 PyTorch 主推理和 SAM AI 编辑，QGIS 主进程不导入 `torch`；打开插件面板时不检查 / 加载 venv，点击“运行”后才检查 PyTorch 主推理环境。
-- 推理时必选 DEM 文件，插件会把 DEM 对齐到输入影像格网，并调用 bundle 内 `dem_factors.py` 计算派生因子。
+- 生产推理采用“核心区 + halo”流式处理：输入影像通过有限 `rasterio.windows.Window` 读取，DEM 只重投影到当前局部格网，并调用 bundle 内 `dem_factors.py` 计算局部派生因子。
 - 支持 GPU 推理，并在 CUDA 不可用时自动降级到 CPU；CPU 路径使用更小 tile 保护内存。
-- 对 landslide 概率图执行 threshold、连通域、最小面积过滤，以及 slope、relief、TPI 三条 DEM 规则后处理。
-- 每次推理写出单波段类别 GeoTIFF 和 `<output>.postprocess.json` 审计文件。
+- 概率、类别与中间结果直接按窗口写入 tiled GeoTIFF，不保留整幅 DEM、DEM 因子栈、概率图、标签图或连通域数组。
+- 对 landslide 概率执行 threshold、形态学、填洞、跨块连通域、最小面积过滤，以及 slope、relief、TPI 三条 DEM 规则后处理；全局组件通过磁盘中间栅格归并，避免在块边界截断对象。
+- 每次推理写出单波段类别 GeoTIFF 和 `<output>.postprocess.json` 审计文件；栅格矢量化使用类别波段作为 mask，避免生成整幅背景多边形。
 - 自动将类别栅格矢量化为草稿图层，支持编辑后导出 `Raster (GeoTIFF)`、`Vector (Shapefile)` 或 `Vector (DXF / CAD)`。
 - AI 辅助编辑使用独立 SAM worker 子进程，支持左键正样本点、右键负样本点、撤销、清空、停止和“回到 AI 点选模式”。
 
@@ -34,6 +35,8 @@
 4. 推理完成后插件自动切到 `编辑与导出` 页签，可手动编辑草稿层，也可启动 AI 辅助编辑追加对象。
 5. 编辑完成后点击“导出结果”，插件会从当前草稿层导出所选格式。
 
+插件不在正常运行前额外执行一遍用户侧“干跑”。点击运行后，生产流程直接按窗口读取和处理；开发验证应使用合成小栅格、伪超大元数据和 mock 断言，不应把真实超大影像完整推理作为定位问题的前置条件。
+
 ## 仓库结构
 
 ```text
@@ -49,6 +52,7 @@ semantic_segmentation/
     |-- land_cover_classification_dialog.py
     |-- land_cover_classification_dialog_base.ui
     |-- pytorch_inference_core.py
+    |-- pytorch_streaming.py
     |-- pytorch_inference_runner.py
     |-- pytorch_deps_check.py
     |-- preprocess.py
@@ -62,6 +66,14 @@ semantic_segmentation/
         |-- semantic_segmentation/
         `-- sam2/
 ```
+
+## 大影像与 DEM 注意事项
+
+- 输入影像和 DEM 可以使用不同 CRS，但必须具有有效地理参考并存在空间交集；米制 DEM 因子还要求输入影像 CRS 单位为米。
+- DEM 的 NoData 会在每个局部窗口内处理。运行时会先把 rasterio 返回的 `MaskedArray` 转换为带 NaN NoData 的普通 `float32` 数组，再执行局部重投影，避免不同 rasterio/GDAL 版本把有效窗口误判为全 NoData。
+- 如果提示“当前推理块范围内未获得有效 DEM 高程”，不等同于两幅栅格一定没有空间交集；还应检查交叠区域是否全为 NoData、CRS 是否正确，以及 DEM 是否能被正常重投影。
+- 插件对生产中间栅格、类别栅格和编辑后导出的 GeoTIFF 自动使用 BigTIFF；不提供文件大小上限开关，也不要求用户预估压缩后的文件大小。
+- 流式设计限制的是 Python 峰值内存，不保证大影像处理很快。高度碎片化的结果可能增加磁盘组件元数据、SQLite 临时空间和矢量化耗时。
 
 ## 许可
 

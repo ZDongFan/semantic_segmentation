@@ -28,6 +28,23 @@ def _emit(event, **payload):
     print("LCC_EVENT " + json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def _exception_details(exc):
+    """按外层到根因顺序展开异常链，供 QGIS 主进程显示和记录。"""
+    details = []
+    visited = set()
+    current = exc
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        name = "{}.{}".format(
+            type(current).__module__, type(current).__name__)
+        details.append("{}: {}".format(name, current))
+        cause = current.__cause__
+        if cause is None and not current.__suppress_context__:
+            cause = current.__context__
+        current = cause
+    return details
+
+
 def _progress(stage, done, total, **extra):
     ranges = {
         "load": (0, 8),
@@ -81,7 +98,12 @@ def main(argv=None):
         _emit("done", **result)
         return 0
     except BaseException as exc:  # noqa: BLE001 - 子进程边界需要兜底。
-        _emit("error", message=str(exc), traceback=traceback.format_exc())
+        _emit(
+            "error",
+            message=str(exc),
+            details=_exception_details(exc),
+            traceback=traceback.format_exc(),
+        )
         return 2
 
 

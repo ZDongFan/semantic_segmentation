@@ -399,15 +399,22 @@ def _normalize_image(image, preprocess):
     return arr
 
 
-def read_image(image_path, preprocess_flags=None, preprocess=None):
-    """读取输入影像，返回数组、profile、transform 与 CRS。"""
+def read_image(image_path, preprocess_flags=None, preprocess=None, window=None):
+    """读取一个有限影像窗口，返回数组、局部 profile、transform 与 CRS。"""
     import rasterio
 
+    if window is None:
+        raise ValueError("read_image 必须显式传入有限大小的 rasterio Window。")
     with rasterio.open(image_path) as src:
-        image = src.read()
+        image = src.read(window=window)
         profile = src.profile.copy()
-        transform = src.transform
+        transform = src.window_transform(window)
         crs = src.crs
+    profile.update(
+        width=int(window.width),
+        height=int(window.height),
+        transform=transform,
+    )
     image = _apply_array_preprocess(image, preprocess_flags or {})
     image = _normalize_image(image, preprocess or {})
     return image, profile, transform, crs
@@ -463,17 +470,16 @@ def _require_runtime_meter_crs(dem_factors, crs_unit):
                     name, crs_unit or "unknown"))
 
 
-def align_dem_to_image(dem_path, image_profile):
-    """把 DEM 重投影到输入影像格网，返回 DEM、填补掩膜与源 DEM 元数据。"""
-    import numpy as np
+def align_dem_to_image(dem_path, image_profile, window=None):
+    """把 DEM 重投影到一个有限影像窗口。"""
     import rasterio
-    from rasterio.warp import Resampling, reproject
+    from rasterio.windows import transform as window_transform
+    from land_cover_classification.pytorch_streaming import _align_dem_window
 
-    height = int(image_profile["height"])
-    width = int(image_profile["width"])
-    dst_transform = image_profile["transform"]
+    if window is None:
+        raise ValueError("align_dem_to_image 必须显式传入有限大小的 rasterio Window。")
+    dst_transform = window_transform(window, image_profile["transform"])
     dst_crs = image_profile.get("crs")
-    destination = np.full((height, width), np.nan, dtype="float32")
     dem_info = {
         "path": dem_path,
         "resolution": None,
@@ -484,27 +490,10 @@ def align_dem_to_image(dem_path, image_profile):
         dem_info["crs_unit"] = _crs_unit(dem.crs)
         if dem.res and dem_info["crs_unit"] == "m":
             dem_info["resolution"] = float((abs(float(dem.res[0])) + abs(float(dem.res[1]))) / 2.0)
-        source = dem.read(1).astype("float32")
-        src_nodata = dem.nodata
-        if src_nodata is not None:
-            source[source == src_nodata] = np.nan
-        reproject(
-            source=source,
-            destination=destination,
-            src_transform=dem.transform,
-            src_crs=dem.crs,
-            src_nodata=np.nan,
-            dst_transform=dst_transform,
-            dst_crs=dst_crs,
-            dst_nodata=np.nan,
-            resampling=Resampling.bilinear,
+        destination, filled_mask = _align_dem_window(
+            dem, dst_crs, dst_transform,
+            int(window.height), int(window.width),
         )
-
-    filled_mask = ~np.isfinite(destination)
-    if filled_mask.all():
-        raise ValueError("DEM 与输入影像没有有效重叠区域。")
-    fill_value = float(np.nanmean(destination))
-    destination[filled_mask] = fill_value
     return destination, filled_mask, dem_info
 
 
@@ -716,7 +705,7 @@ def _forward_model(model, inputs):
 
 def sliding_window_predict(model, image, factors, bundle, device_cfg,
                            progress_callback=None):
-    """执行滑窗推理并返回 landslide 概率图。"""
+    """单块输入适配回归；生产推理由 pytorch_streaming 直接写窗口。"""
     import numpy as np
     import torch
 
@@ -736,48 +725,31 @@ def sliding_window_predict(model, image, factors, bundle, device_cfg,
 
     image = image.astype("float32", copy=False)
     _, height, width = image.shape
+    tile_size = int(device_cfg["tile_size"])
+    if height > 2048 or width > 2048:
+        raise ValueError("该函数只接受单个有限推理块；生产推理必须使用流式入口。")
+    tile_size = max(tile_size, height, width)
     if dem_stack.shape[1:] != (height, width):
         raise ValueError("DEM 因子尺寸 {} 与影像尺寸 {} 不一致。".format(dem_stack.shape[1:], (height, width)))
 
-    tile_size = int(device_cfg["tile_size"])
-    overlap = int(device_cfg["overlap"])
-    y_starts = _window_starts(height, tile_size, overlap)
-    x_starts = _window_starts(width, tile_size, overlap)
-    total = max(1, len(y_starts) * len(x_starts))
-    prob_sum = np.zeros((height, width), dtype="float32")
-    weight_sum = np.zeros((height, width), dtype="float32")
     class_id = int(bundle.landslide_class_id)
-
-    done = 0
+    image_tile = _pad_tile(image, tile_size)
+    dem_tile = _pad_tile(dem_stack, tile_size)
     with torch.no_grad():
-        for y0 in y_starts:
-            for x0 in x_starts:
-                y1 = min(height, y0 + tile_size)
-                x1 = min(width, x0 + tile_size)
-                image_tile = _pad_tile(image[:, y0:y1, x0:x1], tile_size)
-                dem_tile = _pad_tile(dem_stack[:, y0:y1, x0:x1], tile_size)
-                inputs = _build_model_inputs(
-                    image_tile, dem_tile, use_dual_inputs, device_cfg["device"])
-                if device_cfg["use_amp"]:
-                    with torch.cuda.amp.autocast():
-                        logits = _forward_model(model, inputs)
-                else:
-                    logits = _forward_model(model, inputs)
-                logits = logits[:, :, :image_tile.shape[1], :image_tile.shape[2]]
-                logits = logits[:, :, :y1 - y0, :x1 - x0]
-                probs = torch.softmax(logits, dim=1)
-                if class_id >= probs.shape[1]:
-                    raise ValueError("landslide_class_id 超出模型输出通道数。")
-                prob = probs[0, class_id].detach().cpu().numpy().astype("float32")
-                weight = _hann_weight(y1 - y0, x1 - x0)
-                prob_sum[y0:y1, x0:x1] += prob * weight
-                weight_sum[y0:y1, x0:x1] += weight
-                done += 1
-                if progress_callback is not None:
-                    progress_callback("predict", done, total)
-
-    weight_sum[weight_sum == 0] = 1.0
-    return prob_sum / weight_sum
+        inputs = _build_model_inputs(
+            image_tile, dem_tile, use_dual_inputs, device_cfg["device"])
+        if device_cfg["use_amp"]:
+            with torch.cuda.amp.autocast():
+                logits = _forward_model(model, inputs)
+        else:
+            logits = _forward_model(model, inputs)
+        probs = torch.softmax(logits[:, :, :height, :width], dim=1)
+        if class_id >= probs.shape[1]:
+            raise ValueError("landslide_class_id 超出模型输出通道数。")
+        probability = probs[0, class_id].detach().cpu().numpy().astype("float32")
+    if progress_callback is not None:
+        progress_callback("predict", 1, 1)
+    return probability
 
 
 def _postprocess_threshold(config):
@@ -973,7 +945,7 @@ def _drop_by_rule(component, evaluation):
 def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
                       postprocess_config=None, output_path=None,
                       progress_callback=None, runtime_metadata=None):
-    """按显式规则契约处理概率图并生成审计摘要。"""
+    """小型数组回归基准；生产后处理使用磁盘流式实现。"""
     import numpy as np
 
     config = dict(postprocess_config or {})
@@ -981,6 +953,8 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
     factor_dict = _factors_to_dict(factors, config)
     threshold = _postprocess_threshold(config)
     prob_arr = np.asarray(prob_map, dtype="float32")
+    if prob_arr.size > 16 * 1024 * 1024:
+        raise ValueError("内存版后处理仅用于小型回归基准；生产后处理必须使用流式入口。")
     finite_prob = prob_arr[np.isfinite(prob_arr)]
     if finite_prob.size:
         prob_stats = {
@@ -1144,30 +1118,69 @@ def _tiff_block_size(length, preferred=256):
     return max(16, size)
 
 
-def write_class_geotiff(output_path, label_map, image_profile):
-    """写出单波段类别 GeoTIFF。"""
-    import rasterio
+GEOTIFF_CREATION_OPTIONS = (
+    "COMPRESS=LZW",
+    "TILED=YES",
+    "BIGTIFF=YES",
+)
 
-    profile = image_profile.copy()
-    width = int(profile.get("width", label_map.shape[1]))
-    height = int(profile.get("height", label_map.shape[0]))
-    block_x = _tiff_block_size(width)
-    block_y = _tiff_block_size(height)
+
+def build_geotiff_profile(source_profile, dtype, count=1, nodata=0,
+                           preferred_block_size=256):
+    """构建不受经典 TIFF 4 GiB 限制的分块 GeoTIFF profile。"""
+    profile = dict(source_profile)
+    width = int(profile["width"])
+    height = int(profile["height"])
+    block_x = _tiff_block_size(width, preferred_block_size)
+    block_y = _tiff_block_size(height, preferred_block_size)
     profile.update(
         driver="GTiff",
-        count=1,
-        dtype="uint8",
-        nodata=0,
+        count=int(count),
+        dtype=dtype,
+        nodata=nodata,
         compress="lzw",
+        bigtiff="YES",
     )
-    for key in ("blockxsize", "blockysize", "interleave"):
+    for key in ("blockxsize", "blockysize", "interleave", "photometric"):
         profile.pop(key, None)
     if block_x is not None and block_y is not None:
         profile.update(tiled=True, blockxsize=block_x, blockysize=block_y)
     else:
         profile.update(tiled=False)
+    return profile
+
+
+def write_class_geotiff(output_path, label_map, image_profile):
+    """写出单波段类别 GeoTIFF。"""
+    import rasterio
+
+    source_profile = image_profile.copy()
+    source_profile.setdefault("width", label_map.shape[1])
+    source_profile.setdefault("height", label_map.shape[0])
+    profile = build_geotiff_profile(
+        source_profile, "uint8", count=1, nodata=0,
+        preferred_block_size=256)
+    width = int(profile["width"])
+    height = int(profile["height"])
+    block_x = profile.get("blockxsize")
+    block_y = profile.get("blockysize")
     with rasterio.open(output_path, "w", **profile) as dst:
-        dst.write(label_map.astype("uint8"), 1)
+        from rasterio.windows import Window
+
+        block_width = block_x or min(256, width)
+        block_height = block_y or min(256, height)
+        for row in range(0, height, block_height):
+            for col in range(0, width, block_width):
+                window = Window(
+                    col, row,
+                    min(block_width, width - col),
+                    min(block_height, height - row),
+                )
+                data = label_map[
+                    row:row + int(window.height),
+                    col:col + int(window.width),
+                ].astype("uint8")
+                dst.write(data, 1, window=window)
 
 
 def _merge_postprocess_config(bundle, overrides):
@@ -1230,57 +1243,10 @@ def _runtime_metadata(config, image_transform, image_crs_unit, dem_info):
 
 
 def run_inference(params, progress_callback=None):
-    """执行完整 PyTorch 推理流程。"""
-    bundle = load_bundle(params["model_path"])
-    config = _merge_postprocess_config(
-        bundle, params.get("postprocess_overrides") or {})
-    validate_postprocess_contract(config, _module_factor_names(bundle.dem_module))
-    device_cfg = select_device()
-    if progress_callback is not None:
-        progress_callback("load", 1, 1, device=device_cfg["name"])
+    """执行完整 PyTorch 推理流程；生产路径始终使用窗口化流式实现。"""
+    from land_cover_classification.pytorch_streaming import run_streaming_inference
 
-    model = build_model(bundle, device_cfg)
-    image, profile, transform, crs = read_image(
-        params["input_path"],
-        preprocess_flags=params.get("preprocess_flags") or {},
-        preprocess=bundle.preprocess,
-    )
-    runtime_crs_unit = _crs_unit(crs)
-    if progress_callback is not None:
-        progress_callback("dem", 0, 1)
-    dem, filled_mask, dem_info = align_dem_to_image(params["dem_path"], profile)
-    raw_factors = compute_dem_factors(bundle, dem, transform, config, runtime_crs_unit)
-    factors = _factors_to_dict(raw_factors, _factor_config(bundle, config))
-    runtime_metadata = _runtime_metadata(config, transform, runtime_crs_unit, dem_info)
-    if progress_callback is not None:
-        progress_callback("dem", 1, 1)
-
-    prob_map = sliding_window_predict(
-        model,
-        image,
-        factors,
-        bundle,
-        device_cfg,
-        progress_callback=progress_callback,
-    )
-    label_map, summary = apply_postprocess(
-        prob_map,
-        factors,
-        transform=transform,
-        filled_mask=filled_mask,
-        postprocess_config=config,
-        output_path=params["output_path"],
-        progress_callback=progress_callback,
-        runtime_metadata=runtime_metadata,
-    )
-    write_class_geotiff(params["output_path"], label_map, profile)
-    return {
-        "label_path": params["output_path"],
-        "postprocess_path": summary.get("postprocess_path"),
-        "device": device_cfg["name"],
-        "kept": summary.get("kept", 0),
-        "dropped": summary.get("dropped", 0),
-    }
+    return run_streaming_inference(params, progress_callback=progress_callback)
 
 def run_inference_from_file(params_path, progress_callback=None):
     """从 JSON 参数文件读取配置并执行推理。"""

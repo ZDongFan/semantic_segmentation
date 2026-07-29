@@ -2,6 +2,7 @@
 """DEM 后处理契约与规则执行器的合成用例。"""
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,30 @@ from land_cover_classification.pytorch_inference_core import (
     load_bundle,
     validate_postprocess_contract,
 )
+from land_cover_classification.model_scan import scan as scan_models
+
+
+ROOT = Path(__file__).resolve().parents[2]
+MODEL_ROOT = ROOT / "land_cover_classification" / "models" / "semantic_segmentation"
+
+
+def _current_contract_bundle_path():
+    candidates = []
+    external = os.environ.get("LCC_TEST_BUNDLE")
+    if external:
+        candidates.append(Path(external).expanduser().resolve())
+    candidates.extend(Path(entry["path"]) for entry in scan_models(str(MODEL_ROOT)))
+    for path in candidates:
+        postprocess_path = path / "postprocess.json"
+        if not postprocess_path.is_file():
+            continue
+        try:
+            config = json.loads(postprocess_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if config.get("dem_factors") and config.get("training_data") and config.get("rules"):
+            return path
+    raise unittest.SkipTest("当前项目未找到符合显式 DEM 因子与规则契约的 bundle")
 
 
 class _Transform:
@@ -99,11 +124,8 @@ def _factors(shape, slope=20.0, relief=10.0, tpi=0.0):
 
 class DemContractTest(unittest.TestCase):
 
-    def test_v3_current_structure_passes_contract(self):
-        model_dir = Path("D:/模型/landslide_mitb2_dem_v3")
-        if not model_dir.is_dir():
-            self.skipTest("本机未提供 v3 bundle")
-        bundle = load_bundle(str(model_dir))
+    def test_current_bundle_structure_passes_contract(self):
+        bundle = load_bundle(str(_current_contract_bundle_path()))
         self.assertEqual(
             ["slope", "aspect_sin", "aspect_cos", "tpi", "relief"],
             list(bundle.postprocess["dem_factors"].keys()),

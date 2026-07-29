@@ -2,6 +2,7 @@
 """测试 PyTorch 推理输入适配逻辑。"""
 
 import importlib.util
+import os
 import tempfile
 import unittest
 
@@ -14,9 +15,31 @@ from land_cover_classification.pytorch_inference_core import (
     sliding_window_predict,
     write_class_geotiff,
 )
+from land_cover_classification.model_scan import scan as scan_models
 
 
 DEM_CHANNELS = ["slope", "aspect_sin", "aspect_cos", "tpi", "relief"]
+ROOT = Path(__file__).resolve().parents[2]
+MODEL_ROOT = ROOT / "land_cover_classification" / "models" / "semantic_segmentation"
+
+
+def _decoder_arch_path():
+    candidates = []
+    external = os.environ.get("LCC_TEST_BUNDLE")
+    if external:
+        candidates.append(Path(external).expanduser().resolve())
+    candidates.extend(Path(entry["path"]) for entry in scan_models(str(MODEL_ROOT)))
+    for bundle_path in candidates:
+        arch_path = bundle_path / "arch.py"
+        if not arch_path.is_file():
+            continue
+        try:
+            source = arch_path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        if "def _call_decoder(" in source:
+            return arch_path
+    raise unittest.SkipTest("当前项目没有提供包含 _call_decoder 的 PyTorch bundle")
 
 
 class _Bundle:
@@ -94,9 +117,7 @@ class PytorchInputAdapterTest(unittest.TestCase):
         self.assertGreater(model.calls, 0)
 
     def test_bundle_decoder_adapter_supports_both_smp_conventions(self):
-        arch_path = Path(
-            "land_cover_classification/models/semantic_segmentation/"
-            "landslide_mitb2_dem_v1/arch.py")
+        arch_path = _decoder_arch_path()
         spec = importlib.util.spec_from_file_location("lcc_test_bundle_arch", arch_path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -116,8 +137,8 @@ class PytorchInputAdapterTest(unittest.TestCase):
                 return self.forward(features)
 
         features = [object(), object(), object()]
-        self.assertEqual(3, module._run_decoder(VarargsDecoder(), features))
-        self.assertEqual(3, module._run_decoder(ListDecoder(), features))
+        self.assertEqual(3, module._call_decoder(VarargsDecoder(), features))
+        self.assertEqual(3, module._call_decoder(ListDecoder(), features))
 
     def test_write_geotiff_sanitizes_invalid_tile_profile(self):
         import rasterio
@@ -139,6 +160,12 @@ class PytorchInputAdapterTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             output = tmp_dir + "/label.tif"
             write_class_geotiff(output, label, profile)
+            with open(output, "rb") as handle:
+                self.assertIn(
+                    handle.read(4),
+                    (b"II+\x00", b"MM\x00+"),
+                    "生产 GeoTIFF 必须使用 BigTIFF 头",
+                )
             with rasterio.open(output) as src:
                 self.assertEqual((512, 512), (src.width, src.height))
                 self.assertEqual(1, src.count)

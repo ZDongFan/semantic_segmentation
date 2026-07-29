@@ -28,6 +28,7 @@ from qgis.core import (
     QgsFillSymbol,
     QgsGeometry,
     QgsMapLayerProxyModel,
+    QgsMessageLog,
     QgsPointXY,
     QgsProject,
     QgsRendererCategory,
@@ -41,7 +42,7 @@ from qgis.gui import QgsFileWidget
 from . import pytorch_deps_check
 from . import sam_deps_check
 from .ai_segment_tool import AiSegmentMapTool
-from .pytorch_inference_core import is_georeferenced
+from .pytorch_inference_core import GEOTIFF_CREATION_OPTIONS, is_georeferenced
 from .model_scan import get_model_info
 from .model_scan import scan as scan_models
 
@@ -356,6 +357,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._params_file = None
         self._launcher_file = None
         self._process_error_message = ""
+        self._process_error_details = []
+        self._process_error_traceback = ""
+        self._process_output_buffer = ""
+        self._process_diagnostics = []
         self._label_path = None
         self._draft_path = None
         self._draft_layer = None
@@ -560,6 +565,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _start_inference_process(self, model_path, input_path, dem_path, flags, georef):
         self._process_error_message = ""
+        self._process_error_details = []
+        self._process_error_traceback = ""
+        self._process_output_buffer = ""
+        self._process_diagnostics = []
         fd, self._label_path = tempfile.mkstemp(
             prefix="lcc_label_", suffix=".tif")
         os.close(fd)
@@ -701,30 +710,69 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         data = bytes(self._process.readAllStandardOutput()).decode(
             "utf-8", errors="replace")
-        for line in data.splitlines():
-            if not line.startswith("LCC_EVENT "):
-                continue
-            try:
-                payload = json.loads(line[len("LCC_EVENT "):])
-            except ValueError:
-                continue
-            event = payload.get("event")
-            if event == "progress":
-                self.progressBar.setValue(int(payload.get("value", 0)))
-            elif event == "error":
-                self._process_error_message = payload.get("message", "")
-            elif event == "done":
-                self._label_path = payload.get("label_path", self._label_path)
+        self._consume_process_output(data)
+
+    def _consume_process_output(self, data, final=False):
+        self._process_output_buffer += data
+        lines = self._process_output_buffer.split("\n")
+        if final:
+            self._process_output_buffer = ""
+        else:
+            self._process_output_buffer = lines.pop()
+        for line in lines:
+            self._handle_process_line(line.rstrip("\r"))
+
+    def _handle_process_line(self, line):
+        if not line:
+            return
+        if not line.startswith("LCC_EVENT "):
+            self._process_diagnostics.append(line)
+            return
+        try:
+            payload = json.loads(line[len("LCC_EVENT "):])
+        except ValueError:
+            self._process_diagnostics.append(line)
+            return
+        event = payload.get("event")
+        if event == "progress":
+            self.progressBar.setValue(int(payload.get("value", 0)))
+        elif event == "error":
+            self._process_error_message = payload.get("message", "")
+            self._process_error_details = payload.get("details") or []
+            self._process_error_traceback = payload.get("traceback", "")
+        elif event == "done":
+            self._label_path = payload.get("label_path", self._label_path)
+
+    def _inference_error_text(self, exit_code):
+        message = self._process_error_message
+        if not message:
+            message = "推理子进程异常退出(exit_code={})。".format(exit_code)
+        if self._process_error_details:
+            root_cause = self._process_error_details[-1]
+            if root_cause and root_cause not in message:
+                message = "{}\n底层错误：{}".format(message, root_cause)
+        return message
+
+    def _log_inference_error(self, message):
+        sections = [message]
+        if self._process_error_traceback:
+            sections.append(self._process_error_traceback)
+        if self._process_diagnostics:
+            sections.append("子进程输出：\n{}".format(
+                "\n".join(self._process_diagnostics)))
+        QgsMessageLog.logMessage(
+            "\n\n".join(sections), SETTINGS_GROUP, Qgis.Critical)
 
     def _on_process_finished(self, exit_code, exit_status):
         if self._process is None:
             return
+        self._on_process_output()
+        self._consume_process_output("", final=True)
         if exit_code == 0 and exit_status == QProcess.NormalExit:
             self._on_process_completed()
         else:
-            msg = self._process_error_message
-            if not msg:
-                msg = "推理子进程异常退出(exit_code={})。".format(exit_code)
+            msg = self._inference_error_text(exit_code)
+            self._log_inference_error(msg)
             self.statusLabel.setText(msg)
             self.iface.messageBar().pushCritical("地物分类", msg)
         self._cleanup_process()
@@ -800,7 +848,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         layer = ds.CreateLayer("draft", srs=srs, geom_type=ogr.wkbPolygon)
         layer.CreateField(ogr.FieldDefn(FIELD_CLASS_ID, ogr.OFTInteger))
         field_index = layer.GetLayerDefn().GetFieldIndex(FIELD_CLASS_ID)
-        result = gdal.Polygonize(src.GetRasterBand(1), None, layer,
+        class_band = src.GetRasterBand(1)
+        result = gdal.Polygonize(class_band, class_band, layer,
                                  field_index, [], callback=None)
         ds = None
         src = None
@@ -1309,24 +1358,79 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         center_x = (xmin + xmax) / 2.0
         center_y = (ymin + ymax) / 2.0
 
-        with open(path, "r", encoding="utf-8", errors="replace") as dxf_file:
-            lines = dxf_file.read().splitlines()
+        header_values = {
+            "$EXTMIN": {"10": xmin, "20": ymin},
+            "$EXTMAX": {"10": xmax, "20": ymax},
+            "$LIMMIN": {"10": xmin - padding, "20": ymin - padding},
+            "$LIMMAX": {"10": xmax + padding, "20": ymax + padding},
+        }
+        active_vport_values = {
+            "12": center_x,
+            "22": center_y,
+            "40": view_height,
+            "41": max(view_width / view_height, 0.001),
+        }
+        fd, temp_path = tempfile.mkstemp(
+            prefix="lcc_dxf_", suffix=".tmp", dir=os.path.dirname(path) or ".")
+        os.close(fd)
+        try:
+            self._rewrite_dxf_view_streaming(
+                path, temp_path, header_values, active_vport_values)
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
-        self._replace_dxf_header_xy(lines, "$EXTMIN", xmin, ymin)
-        self._replace_dxf_header_xy(lines, "$EXTMAX", xmax, ymax)
-        self._replace_dxf_header_xy(
-            lines, "$LIMMIN", xmin - padding, ymin - padding)
-        self._replace_dxf_header_xy(
-            lines, "$LIMMAX", xmax + padding, ymax + padding)
-        self._replace_active_vport_value(lines, "12", center_x)
-        self._replace_active_vport_value(lines, "22", center_y)
-        self._replace_active_vport_value(lines, "40", view_height)
-        self._replace_active_vport_value(
-            lines, "41", max(view_width / view_height, 0.001))
+    def _rewrite_dxf_view_streaming(self, source_path, output_path,
+                                    header_values, active_vport_values):
+        current_header = None
+        entity = []
+        buffering_vport = False
 
-        with open(path, "w", encoding="utf-8", newline="\n") as dxf_file:
-            dxf_file.write("\n".join(lines))
-            dxf_file.write("\n")
+        with open(source_path, "r", encoding="utf-8", errors="replace") as source, \
+                open(output_path, "w", encoding="utf-8", newline="\n") as output:
+            while True:
+                code_line = source.readline()
+                if not code_line:
+                    break
+                value_line = source.readline()
+                if not value_line:
+                    output.write(code_line.rstrip("\r\n") + "\n")
+                    break
+                pair = [code_line.rstrip("\r\n"), value_line.rstrip("\r\n")]
+                code = pair[0].strip()
+                value = pair[1].strip()
+
+                if buffering_vport and code == "0":
+                    self._write_dxf_entity(output, entity, active_vport_values)
+                    entity = []
+                    buffering_vport = False
+                if not buffering_vport and code == "0" and value == "VPORT":
+                    buffering_vport = True
+                    entity = pair
+                    continue
+                if buffering_vport:
+                    entity.extend(pair)
+                    continue
+
+                if code == "9":
+                    current_header = value if value in header_values else None
+                elif current_header and code in header_values[current_header]:
+                    pair[1] = self._format_dxf_float(
+                        header_values[current_header][code])
+                output.write(pair[0] + "\n" + pair[1] + "\n")
+
+            if buffering_vport:
+                self._write_dxf_entity(output, entity, active_vport_values)
+
+    def _write_dxf_entity(self, output, lines, active_vport_values):
+        active = self._dxf_range_has_value(
+            lines, 0, len(lines), "2", "*Active")
+        if active:
+            for code, value in active_vport_values.items():
+                self._replace_dxf_value_in_range(
+                    lines, 0, len(lines), code, value)
+        output.write("\n".join(lines) + "\n")
 
     def _replace_dxf_header_xy(self, lines, variable_name, x_value, y_value):
         for index, line in enumerate(lines):
@@ -1401,7 +1505,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             template.RasterYSize,
             1,
             gdal.GDT_Byte,
-            ["COMPRESS=LZW", "TILED=YES"],
+            list(GEOTIFF_CREATION_OPTIONS),
         )
         if dst is None:
             template = None
