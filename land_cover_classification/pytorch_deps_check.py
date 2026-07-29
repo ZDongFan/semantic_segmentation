@@ -54,7 +54,10 @@ def runtime_environment(python_executable=None):
     for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "QGIS_PREFIX_PATH"):
         env.pop(key, None)
     env["PYTHONNOUSERSITE"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+    env["GDAL_FILENAME_IS_UTF8"] = "YES"
+    env["CPL_DEBUG"] = "OFF"
     env["VIRTUAL_ENV"] = default_venv_dir()
 
     python_dir = os.path.dirname(os.path.abspath(python_executable))

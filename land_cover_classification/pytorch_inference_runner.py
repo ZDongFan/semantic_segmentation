@@ -8,9 +8,90 @@ from __future__ import print_function
 
 import argparse
 import json
+import locale
+import logging
 import os
 import sys
 import traceback
+
+
+DEFAULT_DIAGNOSTIC_COUNT_LIMIT = 256
+DEFAULT_DIAGNOSTIC_CHAR_LIMIT = 64 * 1024
+
+
+class BoundedDiagnostics:
+    """保存有界、去重的子进程诊断，避免重复警告长期占用 QGIS 内存。"""
+
+    def __init__(self, count_limit=DEFAULT_DIAGNOSTIC_COUNT_LIMIT,
+                 char_limit=DEFAULT_DIAGNOSTIC_CHAR_LIMIT):
+        self.count_limit = max(1, int(count_limit))
+        self.char_limit = max(256, int(char_limit))
+        self._lines = []
+        self._seen = set()
+        self._chars = 0
+        self.duplicate_count = 0
+        self.dropped_count = 0
+
+    def append(self, line):
+        line = str(line)
+        key = line if len(line) <= self.char_limit else (len(line), hash(line))
+        if key in self._seen:
+            self.duplicate_count += 1
+            return False
+        if len(self._lines) >= self.count_limit:
+            self.dropped_count += 1
+            return False
+        remaining = self.char_limit - self._chars
+        if remaining <= 0:
+            self.dropped_count += 1
+            return False
+        if len(line) > remaining:
+            marker = "…[单行诊断已截断]"
+            line = line[:max(0, remaining - len(marker))] + marker
+            self.dropped_count += 1
+        self._lines.append(line)
+        self._seen.add(key)
+        self._chars += len(line)
+        return True
+
+    def as_lines(self):
+        lines = list(self._lines)
+        if self.duplicate_count or self.dropped_count:
+            lines.append(
+                "[诊断日志已限流：去重 {} 行，因数量或容量上限省略 {} 行]".format(
+                    self.duplicate_count, self.dropped_count))
+        return lines
+
+    def __bool__(self):
+        return bool(self._lines or self.duplicate_count or self.dropped_count)
+
+
+def decode_process_line(data):
+    """按协议 UTF-8 优先解码，并兼容 Windows 本地编码的 GDAL 原生日志。"""
+    if isinstance(data, str):
+        return data
+    data = bytes(data)
+    encodings = ["utf-8"]
+    preferred = locale.getpreferredencoding(False)
+    if preferred and preferred.lower().replace("-", "") != "utf8":
+        encodings.append(preferred)
+    if os.name == "nt" and "mbcs" not in encodings:
+        encodings.append("mbcs")
+    for encoding in encodings:
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="backslashreplace")
+
+
+def _configure_process_io():
+    """固定协议输出编码，并阻止第三方日志编码异常打印递归 traceback。"""
+    logging.raiseExceptions = False
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 def _plugin_parent():
@@ -79,6 +160,7 @@ def _write_debug_snapshot(path):
 
 
 def main(argv=None):
+    _configure_process_io()
     parser = argparse.ArgumentParser()
     parser.add_argument("--params", required=True)
     parser.add_argument("--debug-env")

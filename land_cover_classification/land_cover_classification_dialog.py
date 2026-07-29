@@ -43,6 +43,7 @@ from . import pytorch_deps_check
 from . import sam_deps_check
 from .ai_segment_tool import AiSegmentMapTool
 from .pytorch_inference_core import GEOTIFF_CREATION_OPTIONS, is_georeferenced
+from .pytorch_inference_runner import BoundedDiagnostics, decode_process_line
 from .model_scan import get_model_info
 from .model_scan import scan as scan_models
 
@@ -74,6 +75,16 @@ DXF_DEFAULT_LAYER_NAME = "landslide"
 LANDSLIDE_CLASS_NAME = "landslide"
 DIALOG_PANEL_WIDTH = 400
 STATUS_WRAP_WIDTH = 50
+
+INFERENCE_STAGE_LABELS = {
+    "start": "正在准备推理",
+    "load": "正在加载模型",
+    "dem": "正在对齐 DEM",
+    "predict": "正在执行模型预测",
+    "postprocess": "正在执行后处理",
+    "write": "正在写出结果",
+    "done": "推理完成",
+}
 
 
 def _default_model_root():
@@ -359,8 +370,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process_error_message = ""
         self._process_error_details = []
         self._process_error_traceback = ""
-        self._process_output_buffer = ""
-        self._process_diagnostics = []
+        self._process_output_buffer = b""
+        self._process_diagnostics = BoundedDiagnostics()
         self._label_path = None
         self._draft_path = None
         self._draft_layer = None
@@ -567,8 +578,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process_error_message = ""
         self._process_error_details = []
         self._process_error_traceback = ""
-        self._process_output_buffer = ""
-        self._process_diagnostics = []
+        self._process_output_buffer = b""
+        self._process_diagnostics = BoundedDiagnostics()
         fd, self._label_path = tempfile.mkstemp(
             prefix="lcc_label_", suffix=".tif")
         os.close(fd)
@@ -708,19 +719,20 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def _on_process_output(self):
         if self._process is None:
             return
-        data = bytes(self._process.readAllStandardOutput()).decode(
-            "utf-8", errors="replace")
+        data = bytes(self._process.readAllStandardOutput())
         self._consume_process_output(data)
 
     def _consume_process_output(self, data, final=False):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         self._process_output_buffer += data
-        lines = self._process_output_buffer.split("\n")
+        lines = self._process_output_buffer.split(b"\n")
         if final:
-            self._process_output_buffer = ""
+            self._process_output_buffer = b""
         else:
             self._process_output_buffer = lines.pop()
         for line in lines:
-            self._handle_process_line(line.rstrip("\r"))
+            self._handle_process_line(decode_process_line(line.rstrip(b"\r")))
 
     def _handle_process_line(self, line):
         if not line:
@@ -735,7 +747,15 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         event = payload.get("event")
         if event == "progress":
-            self.progressBar.setValue(int(payload.get("value", 0)))
+            value = max(0, min(100, int(payload.get("value", 0))))
+            self.progressBar.setValue(value)
+            stage = str(payload.get("stage", ""))
+            status = payload.get("status") or INFERENCE_STAGE_LABELS.get(stage)
+            if status:
+                if stage == "postprocess":
+                    self.statusLabel.setText("后处理：{}（{}%）".format(status, value))
+                else:
+                    self.statusLabel.setText("{}（{}%）".format(status, value))
         elif event == "error":
             self._process_error_message = payload.get("message", "")
             self._process_error_details = payload.get("details") or []
@@ -759,7 +779,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             sections.append(self._process_error_traceback)
         if self._process_diagnostics:
             sections.append("子进程输出：\n{}".format(
-                "\n".join(self._process_diagnostics)))
+                "\n".join(self._process_diagnostics.as_lines())))
         QgsMessageLog.logMessage(
             "\n\n".join(sections), SETTINGS_GROUP, Qgis.Critical)
 
@@ -767,7 +787,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if self._process is None:
             return
         self._on_process_output()
-        self._consume_process_output("", final=True)
+        self._consume_process_output(b"", final=True)
         if exit_code == 0 and exit_status == QProcess.NormalExit:
             self._on_process_completed()
         else:

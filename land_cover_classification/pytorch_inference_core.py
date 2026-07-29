@@ -703,6 +703,18 @@ def _forward_model(model, inputs):
     return _extract_logits(model(*inputs))
 
 
+def _amp_autocast(torch_module):
+    """返回 CUDA AMP 上下文，并兼容尚无 ``torch.amp`` 的旧版 PyTorch。"""
+    amp = getattr(torch_module, "amp", None)
+    autocast = getattr(amp, "autocast", None)
+    if autocast is not None:
+        try:
+            return autocast(device_type="cuda")
+        except TypeError:
+            return autocast("cuda")
+    return torch_module.cuda.amp.autocast()
+
+
 def sliding_window_predict(model, image, factors, bundle, device_cfg,
                            progress_callback=None):
     """单块输入适配回归；生产推理由 pytorch_streaming 直接写窗口。"""
@@ -739,7 +751,7 @@ def sliding_window_predict(model, image, factors, bundle, device_cfg,
         inputs = _build_model_inputs(
             image_tile, dem_tile, use_dual_inputs, device_cfg["device"])
         if device_cfg["use_amp"]:
-            with torch.cuda.amp.autocast():
+            with _amp_autocast(torch):
                 logits = _forward_model(model, inputs)
         else:
             logits = _forward_model(model, inputs)
