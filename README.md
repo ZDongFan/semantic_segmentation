@@ -4,6 +4,8 @@
 
 插件主体位于 `land_cover_classification/` 目录下。可用 PyTorch bundle 默认放在 `land_cover_classification/models/semantic_segmentation/`；SAM2 权重默认放在 `land_cover_classification/models/sam2/`。
 
+模型和权重由外部提供并被 `.gitignore` 忽略。因此远端仓库只保留 `.gitkeep` 是正常状态，不代表本机模型目录为空；模型配置或推理问题应以本机实际存在的 bundle 为准。
+
 ## 主要功能
 
 - 扫描模型根目录下带 `manifest.json` 的 PyTorch 语义分割 bundle，并在模型下拉框中列出；bundle 子目录名由外部模型提供方决定，不作为兼容性判断条件。

@@ -8,6 +8,12 @@
 该路径可在插件对话框的“模型根目录”字段中修改，并持久化到
 `QSettings("LandCoverClassification/model_root")`。
 
+## 外部模型资产与本机发现
+
+真实 PyTorch bundle 由外部提供，放置在上述模型根目录下，但默认被 `.gitignore` 忽略，因此远端仓库和干净检出中通常只保留 `.gitkeep`。这表示模型资产不入库，不表示当前工作区没有可用模型。
+
+排查模型选择、`postprocess.json` 参数、DEM 因子或推理结果时，必须先枚举模型根目录中实际存在的本机 bundle，再读取所选 bundle 的配置。当前工作区用于验证的外部 bundle 为 `landslide_mitb2_dem_50m_v1/`；它不是插件代码的固定默认值，且不得提交其 `weights.pt` 或其他 bundle 文件。
+
 ## PyTorch Bundle
 
 每个可用模型必须放在独立子目录中，目录结构如下：

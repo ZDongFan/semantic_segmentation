@@ -90,6 +90,8 @@ land_cover_classification/vendor/sam_runtime/venv/bin/python land_cover_classifi
 land_cover_classification/models/semantic_segmentation/
 ```
 
+该目录中的真实 bundle 由外部提供，默认被 `.gitignore` 忽略；远端仓库只保留 `.gitkeep` 是正常状态，不代表本机目录没有模型。当前开发工作区的验证 bundle 可位于 `landslide_mitb2_dem_50m_v1/` 子目录，但它仅供本机验证，不应提交到远端。
+
 每个 bundle 至少包含：
 
 - `manifest.json`
