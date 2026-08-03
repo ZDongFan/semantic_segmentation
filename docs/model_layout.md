@@ -145,3 +145,7 @@ PyTorch 推理必须同时选择与输入影像覆盖范围相交的 DEM 文件�
 `<output>.postprocess.json`
 
 该文件包含 `dem_factors`、`training_data`、运行时分辨率、分辨率差异告警、规则契约、每个 component 的面积、保留/丢弃决策和触发规则，便于审计与调参。
+
+## landslide 工作区契约
+
+会话草稿工作区固定映射为 `background=0`、`landslide=1`。启动推理前，插件会在 `manifest.json.class_names` 中以大小写不敏感的方式查找唯一的 `landslide`；若声明 `landslide_class_id`，它必须和该索引一致。缺失、重复或冲突会在启动子进程前明确失败，而不会把其他类别写入草稿。

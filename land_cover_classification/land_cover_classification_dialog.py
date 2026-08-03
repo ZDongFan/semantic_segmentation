@@ -3,9 +3,11 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import textwrap
+import uuid
 
 from qgis.PyQt import sip, uic
 from qgis.PyQt import QtWidgets
@@ -14,6 +16,7 @@ from qgis.PyQt.QtCore import (
     QProcessEnvironment,
     QSettings,
     Qt,
+    QTimer,
     QVariant,
 )
 from qgis.PyQt.QtGui import QColor
@@ -41,7 +44,11 @@ from qgis.gui import QgsFileWidget
 
 from . import pytorch_deps_check
 from . import sam_deps_check
+from .ai_edit_controller import AiEditController
 from .ai_segment_tool import AiSegmentMapTool
+from .draft_session import DraftComposer, DraftSession
+from .export_service import ExportService
+from .inference_controller import BundleContractError, InferenceController
 from .pytorch_inference_core import GEOTIFF_CREATION_OPTIONS, is_georeferenced
 from .pytorch_inference_runner import BoundedDiagnostics, decode_process_line
 from .model_scan import get_model_info
@@ -358,6 +365,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def __init__(self, iface, parent=None):
         super().__init__(parent)
         self.setupUi(self)
+        self._configure_workflow_tabs()
         self._configure_layout_constraints()
         self.statusLabel = _MirroredLabel(
             self.statusLabel, self.exportStatusLabel)
@@ -373,6 +381,14 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process_output_buffer = b""
         self._process_diagnostics = BoundedDiagnostics()
         self._label_path = None
+        self._draft_session = DraftSession()
+        self._draft_composer = DraftComposer()
+        self._inference_controller = InferenceController()
+        self._ai_controller = AiEditController()
+        self._export_service = ExportService()
+        self._draft_commit_completed = False
+        self._working_image_change_in_progress = False
+        self._stale_cleanup_scheduled = False
         self._draft_path = None
         self._draft_layer = None
         self._draft_layer_id = None
@@ -403,6 +419,28 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._wire_signals()
         self._refresh_models()
 
+    def _configure_workflow_tabs(self):
+        """把界面组织为当前草稿、推理和导出三个独立工作区。"""
+        self.inferenceLayout.removeWidget(self.inputGroup)
+        self.rootLayout.insertWidget(0, self.inputGroup)
+
+        self.draftTab = QtWidgets.QWidget(self.mainTabWidget)
+        self.draftLayout = QtWidgets.QVBoxLayout(self.draftTab)
+        self.draftLayout.setContentsMargins(0, 0, 0, 0)
+        self.exportLayout.removeWidget(self.aiEditGroup)
+        self.draftLayout.addWidget(self.aiEditGroup)
+        self.undoFusionBtn = QtWidgets.QPushButton("撤销最近融合", self.draftTab)
+        self.undoFusionBtn.setEnabled(False)
+        self.draftLayout.addWidget(self.undoFusionBtn)
+        self.retryFusionBtn = QtWidgets.QPushButton("重试推理融合", self.draftTab)
+        self.retryFusionBtn.setEnabled(False)
+        self.draftLayout.addWidget(self.retryFusionBtn)
+        self.draftLayout.addStretch(1)
+        self.mainTabWidget.insertTab(0, self.draftTab, "草稿编辑")
+        self.mainTabWidget.setTabText(
+            self.mainTabWidget.indexOf(self.inferenceTab), "模型推理")
+        self.mainTabWidget.setTabText(
+            self.mainTabWidget.indexOf(self.exportTab), "导出")
     def _init_defaults(self):
         settings = QSettings()
         default_root = _default_model_root()
@@ -458,6 +496,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.fileRadio.toggled.connect(self._on_input_source_changed)
         self.layerCombo.layerChanged.connect(self._suggest_output_paths)
         self.inputFileWidget.fileChanged.connect(self._suggest_output_paths)
+        self.layerCombo.layerChanged.connect(self._on_working_image_changed)
+        self.inputFileWidget.fileChanged.connect(self._on_working_image_changed)
         self.mDemFile.fileChanged.connect(self._on_dem_file_changed)
 
         self.runBtn.clicked.connect(self._on_run)
@@ -472,6 +512,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.aiUndoPointBtn.clicked.connect(self._on_ai_undo_point)
         self.aiClearPointsBtn.clicked.connect(self._on_ai_clear_points)
         self.aiAppendDraftBtn.clicked.connect(self._on_ai_append_draft)
+        self.undoFusionBtn.clicked.connect(self._on_undo_fusion)
+        self.retryFusionBtn.clicked.connect(self._on_retry_fusion)
 
         QgsProject.instance().layersWillBeRemoved.connect(
             self._on_layers_will_be_removed)
@@ -541,6 +583,264 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.layerCombo.setEnabled(layer_mode)
         self.inputFileWidget.setEnabled(not layer_mode)
         self._suggest_output_paths()
+        self._on_working_image_changed()
+
+    def _is_plugin_session_draft_layer(self, layer):
+        """按插件临时 GeoPackage 来源识别草稿层，不依赖显示名称。"""
+        try:
+            if str(layer.providerType()).lower() != "ogr":
+                return False
+            source = str(layer.source() or "")
+            source_path, separator, layer_spec = source.partition("|")
+            if not separator or "layername=draft" not in layer_spec.lower():
+                return False
+            source_path = os.path.abspath(source_path)
+            if not source_path.lower().endswith(".gpkg"):
+                return False
+            file_name = os.path.basename(source_path).lower()
+            session_dir = os.path.basename(os.path.dirname(source_path)).lower()
+            return (
+                session_dir.startswith("lcc_draft_session_")
+                or file_name.startswith("lcc_draft_")
+            )
+        except Exception:
+            return False
+
+    def _remove_stale_session_draft_layers(self, defer=False):
+        """移除未被当前面板追踪的插件临时草稿层。"""
+        if defer:
+            if self._stale_cleanup_scheduled:
+                return
+            self._stale_cleanup_scheduled = True
+            QTimer.singleShot(0, self._run_stale_session_draft_cleanup)
+            return
+
+        tracked_id = self._draft_layer_id
+        stale_ids = [
+            layer.id()
+            for layer in QgsProject.instance().mapLayers().values()
+            if layer.id() != tracked_id
+            and self._is_plugin_session_draft_layer(layer)
+        ]
+        if stale_ids:
+            QgsProject.instance().removeMapLayers(stale_ids)
+        self._remove_orphaned_draft_layer_tree_nodes()
+
+    def _remove_orphaned_draft_layer_tree_nodes(self):
+        """移除没有对应 QgsMapLayer 的插件草稿树节点。"""
+        project = QgsProject.instance()
+        layer_ids = set(project.mapLayers().keys())
+        for node in list(project.layerTreeRoot().findLayers()):
+            if node.layerId() in layer_ids:
+                continue
+            normalized_name = "".join(
+                str(node.name() or "").lower().split())
+            if normalized_name != "地物分类草稿" and not (
+                    "ai" in normalized_name and "mask" in normalized_name):
+                continue
+            parent = node.parent()
+            if parent is not None:
+                parent.removeChildNode(node)
+
+    def _run_stale_session_draft_cleanup(self):
+        """在当前 Qt 图层模型信号返回后执行遗留草稿清理。"""
+        try:
+            self._remove_stale_session_draft_layers()
+        finally:
+            self._stale_cleanup_scheduled = False
+
+    def _on_working_image_changed(self, *args, **kwargs):
+        """影像通过基础校验后只加载或切换底图，不创建草稿层。"""
+        sender = self.sender()
+        if sender is self.layerCombo and not self.layerRadio.isChecked():
+            return
+        if sender is self.inputFileWidget and not self.fileRadio.isChecked():
+            return
+        if self._working_image_change_in_progress:
+            return
+        self._working_image_change_in_progress = True
+        try:
+            self._initialize_working_image()
+        finally:
+            self._working_image_change_in_progress = False
+
+    def _initialize_working_image(self):
+        """只加载工作影像；会话草稿在首次产生结果时延迟创建。"""
+        input_path = self._resolve_input_path()
+        if not input_path or not os.path.isfile(input_path):
+            return
+        input_path = os.path.abspath(input_path)
+        self._remove_stale_session_draft_layers(defer=True)
+
+        if self._draft_session.is_active and (
+                self._draft_session.input_path == input_path):
+            self._input_path = input_path
+            self._input_layer = self._resolve_input_layer()
+            if self._load_reference_input_layer() is None:
+                self._warn("无法将工作影像加载到 QGIS 画布。")
+            return
+
+        if (not self._draft_session.is_active
+                and self._input_path == input_path):
+            self._input_layer = self._resolve_input_layer()
+            if self._load_reference_input_layer() is None:
+                self._warn("无法将工作影像加载到 QGIS 画布。")
+            return
+
+        if self._draft_session.is_dirty:
+            answer = QtWidgets.QMessageBox.question(
+                self, "切换工作影像",
+                "当前会话草稿尚未导出，切换影像后将丢失。是否继续？")
+            if answer != QtWidgets.QMessageBox.Yes:
+                return
+
+        self._stop_ai_editing(silent=True)
+        self._discard_draft_session()
+        try:
+            self._input_path = input_path
+            self._input_layer = self._resolve_input_layer()
+            if self._load_reference_input_layer() is None:
+                raise IOError("无法将工作影像加载到 QGIS 画布。")
+            self._class_labels = ["background", LANDSLIDE_CLASS_NAME]
+            self._draft_path = None
+            self._label_path = None
+            self.exportRasterBtn.setEnabled(False)
+            self.undoFusionBtn.setEnabled(False)
+            self.retryFusionBtn.setEnabled(False)
+            self._switch_to_draft_tab()
+            self.statusLabel.setText(
+                "工作影像已加载，可启动 AI 编辑或运行模型推理。")
+        except Exception as exc:  # noqa: BLE001
+            self._warn("加载工作影像失败: {}".format(exc))
+
+    def _ensure_draft_session(self, input_path=None):
+        """首次需要持久化结果时创建磁盘会话，但暂不加载 QGIS 图层。"""
+        path = input_path or self._input_path or self._resolve_input_path()
+        path = self._normalize_input_path(path)
+        if not path or not os.path.isfile(path):
+            self._warn("请先选择有效的工作影像。")
+            return False
+        path = os.path.abspath(path)
+
+        if self._draft_session.is_active:
+            if self._draft_session.input_path == path:
+                return True
+            self._warn("当前会话草稿属于另一张影像，请先切换工作影像。")
+            return False
+
+        if self._load_reference_input_layer() is None:
+            self._warn("无法将工作影像加载到 QGIS 画布。")
+            return False
+        try:
+            generation = self._draft_session.begin(
+                path, self._draft_composer.create_empty)
+        except Exception as exc:  # noqa: BLE001
+            self._warn("创建会话草稿失败: {}".format(exc))
+            return False
+
+        self._input_path = path
+        self._class_labels = ["background", LANDSLIDE_CLASS_NAME]
+        self._draft_path = generation
+        self._draft_layer = None
+        self._draft_layer_id = None
+        return True
+
+    def _discard_draft_session(self):
+        """从项目移除旧会话层后清理其临时目录。"""
+        if self._draft_layer_id:
+            try:
+                QgsProject.instance().removeMapLayer(self._draft_layer_id)
+            except Exception:
+                pass
+        self._draft_layer = None
+        self._draft_layer_id = None
+        self._draft_session.layer = None
+        try:
+            QgsApplication.processEvents()
+        except Exception:
+            pass
+        residue = self._draft_session.close()
+        if residue:
+            QTimer.singleShot(
+                100, lambda path=residue: shutil.rmtree(path, ignore_errors=True))
+
+    def _attach_session_draft_layer(self, generation):
+        """加载会话 generation 并连接 QGIS 原生编辑的快照回调。"""
+        layer = QgsVectorLayer(
+            "{}|layername=draft".format(generation), "地物分类草稿", "ogr")
+        if not layer.isValid():
+            raise IOError("无法加载会话草稿: {}".format(generation))
+        QgsProject.instance().addMapLayer(layer, False)
+        self._draft_layer = layer
+        self._draft_layer_id = layer.id()
+        self._draft_path = generation
+        self._draft_session.layer = layer
+        layer.editingStarted.connect(self._on_draft_editing_started)
+        layer.beforeCommitChanges.connect(self._on_draft_before_commit)
+        layer.afterCommitChanges.connect(self._on_draft_after_commit)
+        layer.editingStopped.connect(self._on_draft_editing_stopped)
+        self._apply_vector_style(layer, draft=True)
+        self._place_layer_above_input(layer)
+        self._activate_layer(layer)
+
+    def _on_draft_editing_started(self):
+        if not self._draft_session.is_replacing:
+            self._draft_commit_completed = False
+            self._draft_session.begin_edit_snapshot()
+
+    def _on_draft_before_commit(self):
+        if self._draft_session.is_replacing:
+            return
+        try:
+            self._draft_composer.mark_manual_changes(
+                self._draft_layer, self._draft_session.edit_snapshot_path)
+        except Exception as exc:  # noqa: BLE001
+            self._warn("规范化草稿编辑失败: {}".format(exc))
+
+    def _on_draft_after_commit(self):
+        if self._draft_session.is_replacing:
+            return
+        try:
+            generation = self._draft_composer.compose_current(self._draft_session)
+            self._draft_session.activate_generation(generation, self._draft_layer)
+            self._draft_commit_completed = True
+            self._invalidate_fusion_undo()
+            self._apply_vector_style(self._draft_layer, draft=True)
+        except Exception as exc:  # noqa: BLE001
+            self._warn("保存草稿 generation 失败: {}".format(exc))
+        finally:
+            self._draft_session.clear_edit_snapshot()
+
+    def _on_draft_editing_stopped(self):
+        if not self._draft_commit_completed:
+            self._draft_session.clear_edit_snapshot()
+
+    def _invalidate_fusion_undo(self):
+        """后续编辑或新 generation 会使一次性融合回退失效。"""
+        self._draft_session.fusion_snapshot_path = None
+        self.undoFusionBtn.setEnabled(False)
+
+    def _on_undo_fusion(self):
+        """仅在未发生后续修改时回到最近一次融合前的 generation。"""
+        snapshot = self._draft_session.fusion_snapshot_path
+        if not snapshot or not os.path.isfile(snapshot):
+            self._warn("没有可撤销的最近融合。")
+            self.undoFusionBtn.setEnabled(False)
+            return
+        try:
+            self._draft_session.activate_generation(snapshot, self._draft_layer)
+            self._draft_path = snapshot
+            self._draft_layer = self._draft_session.layer
+            self._apply_vector_style(self._draft_layer, draft=True)
+            self._draft_session.fusion_snapshot_path = None
+            self.undoFusionBtn.setEnabled(False)
+            self.statusLabel.setText("已撤销最近一次推理融合。")
+        except Exception as exc:  # noqa: BLE001
+            self._warn("撤销最近融合失败: {}".format(exc))
+    def _switch_to_draft_tab(self):
+        index = self.mainTabWidget.indexOf(self.draftTab)
+        if index >= 0:
+            self.mainTabWidget.setCurrentIndex(index)
 
     def _resolve_input_path(self):
         if self.layerRadio.isChecked():
@@ -580,9 +880,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process_error_traceback = ""
         self._process_output_buffer = b""
         self._process_diagnostics = BoundedDiagnostics()
-        fd, self._label_path = tempfile.mkstemp(
-            prefix="lcc_label_", suffix=".tif")
-        os.close(fd)
+        if not self._draft_session.is_active:
+            raise RuntimeError("推理会话尚未初始化。")
+        self._label_path = os.path.join(
+            self._draft_session.directory,
+            "latest_label_{}.tif".format(uuid.uuid4().hex))
         params = {
             "model_path": model_path,
             "input_path": input_path,
@@ -591,9 +893,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "preprocess_flags": flags,
             "postprocess_overrides": {},
         }
-        fd, self._params_file = tempfile.mkstemp(
-            prefix="lcc_params_", suffix=".json")
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        self._params_file = os.path.join(
+            self._draft_session.directory,
+            "pytorch_params_{}.json".format(uuid.uuid4().hex))
+        with open(self._params_file, "w", encoding="utf-8") as handle:
             json.dump(params, handle, ensure_ascii=False)
 
         self._process = QProcess(self)
@@ -797,21 +1100,92 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self.iface.messageBar().pushCritical("地物分类", msg)
         self._cleanup_process()
 
+    def _create_fusion_snapshot(self):
+        """为本次候选融合保存一次性回退 generation。"""
+        current = self._draft_session.fusion_snapshot_path
+        if current and os.path.isfile(current):
+            try:
+                os.remove(current)
+            except OSError:
+                pass
+        snapshot = os.path.join(
+            self._draft_session.directory,
+            "fusion_snapshot_{}.gpkg".format(uuid.uuid4().hex))
+        shutil.copy2(self._draft_session.generation_path, snapshot)
+        self._draft_session.fusion_snapshot_path = snapshot
+
+    def _finish_inference_fusion(self, candidate_path, run_id):
+        """合成已保存的候选并在成功后切换可见草稿。"""
+        generation = self._draft_composer.merge_inference_candidate(
+            self._draft_session, candidate_path, run_id)
+        if self._layer_is_usable(self._draft_layer):
+            self._draft_session.activate_generation(
+                generation, self._draft_layer)
+        else:
+            self._draft_session.activate_generation(generation)
+            self._attach_session_draft_layer(generation)
+        self._draft_path = generation
+        self._draft_layer = self._draft_session.layer
+        self._draft_layer_id = self._draft_layer.id()
+        self._draft_session.clear_pending_inference()
+        self._draft_session.last_postprocess_path = (
+            self._label_path + ".postprocess.json" if self._label_path else None)
+        self._apply_vector_style(self._draft_layer, draft=True)
+        self._place_layer_above_input(self._draft_layer)
+        self._activate_layer(self._draft_layer)
+        self.exportRasterBtn.setEnabled(True)
+        self.undoFusionBtn.setEnabled(True)
+        self.retryFusionBtn.setEnabled(False)
+        self._switch_to_draft_tab()
+        self.statusLabel.setText("推理结果已融合到会话草稿，可继续 AI 或原生编辑。")
+        self.iface.messageBar().pushSuccess(
+            "地物分类", "最新推理已融合，人工和 AI 草稿区域保持优先。")
+
     def _on_process_completed(self):
         try:
-            self.statusLabel.setText("正在生成可编辑草稿层...")
+            self.statusLabel.setText("正在将最新推理融合到会话草稿...")
             self.progressBar.setValue(100)
             self._load_reference_input_layer()
-            self._draft_layer = self._create_draft_layer(self._label_path)
-            self._place_layer_above_input(self._draft_layer)
-            self._activate_layer(self._draft_layer)
-            self.exportRasterBtn.setEnabled(True)
-            self._switch_to_export_tab()
-            self.statusLabel.setText("草稿层已生成,请编辑后导出结果。")
-            self.iface.messageBar().pushSuccess(
-                "地物分类", "可编辑草稿层已加载,可在编辑与导出页启动 AI 编辑。")
+            if not self._draft_session.is_active:
+                raise RuntimeError("当前工作影像的会话草稿已失效。")
+            self._create_fusion_snapshot()
+            candidate = self._draft_composer.build_inference_candidate(
+                self._draft_session,
+                self._label_path,
+                self._inference_controller.landslide_class_id,
+                self._inference_controller.run_id,
+            )
+            self._draft_session.set_pending_inference(
+                candidate, self._inference_controller.run_id)
+            self._finish_inference_fusion(
+                candidate, self._inference_controller.run_id)
         except Exception as exc:  # noqa: BLE001
-            self._warn("生成草稿层失败:{}".format(exc))
+            retryable = self._draft_session.has_pending_inference
+            self.retryFusionBtn.setEnabled(retryable)
+            suffix = "可点击“重试推理融合”再次合成。" if retryable else ""
+            self._warn("融合推理草稿失败，已保留原草稿: {} {}".format(exc, suffix))
+
+    def _on_retry_fusion(self):
+        """重试最近一次已完成矢量化的推理候选融合。"""
+        if not self._draft_session.has_pending_inference:
+            self.retryFusionBtn.setEnabled(False)
+            self._warn("没有可重试融合的推理候选。")
+            return
+        if (self._layer_is_usable(self._draft_layer)
+                and not self._commit_layer_if_needed(self._draft_layer)):
+            return
+        try:
+            snapshot = self._draft_session.fusion_snapshot_path
+            if not snapshot or not os.path.isfile(snapshot):
+                self._create_fusion_snapshot()
+            self.statusLabel.setText("正在重试推理草稿融合...")
+            self._finish_inference_fusion(
+                self._draft_session.pending_inference_candidate_path,
+                self._draft_session.pending_inference_run_id)
+        except Exception as exc:  # noqa: BLE001
+            self.retryFusionBtn.setEnabled(
+                self._draft_session.has_pending_inference)
+            self._warn("重试融合失败，原草稿未改变: {}".format(exc))
 
     def _switch_to_export_tab(self):
         try:
@@ -822,14 +1196,49 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             pass
 
     def _load_reference_input_layer(self):
-        if self._input_layer is not None and self._input_layer.isValid():
-            return
-        if not self._input_path:
-            return
-        name = os.path.splitext(os.path.basename(self._input_path))[0]
-        layer = self.iface.addRasterLayer(self._input_path, name)
-        if layer is not None and layer.isValid():
-            self._input_layer = layer
+        """确保当前工作影像已作为可见底图加载到 QGIS 画布。"""
+        input_path = self._input_path or self._resolve_input_path()
+        if not input_path:
+            return None
+        input_path = os.path.abspath(input_path)
+        normalized_path = os.path.normcase(os.path.normpath(input_path))
+
+        def matches_working_image(layer):
+            if layer is None or not layer.isValid():
+                return False
+            try:
+                source_path = self._normalize_input_path(layer.source())
+            except Exception:
+                return False
+            if not source_path:
+                return False
+            source_path = os.path.normcase(os.path.normpath(
+                os.path.abspath(source_path)))
+            return source_path == normalized_path
+
+        layer = self._input_layer
+        if not matches_working_image(layer):
+            layer = None
+            for candidate in QgsProject.instance().mapLayers().values():
+                if matches_working_image(candidate):
+                    layer = candidate
+                    break
+        if layer is None:
+            name = os.path.splitext(os.path.basename(input_path))[0]
+            layer = self.iface.addRasterLayer(input_path, name)
+        if layer is None or not layer.isValid():
+            return None
+
+        self._input_layer = layer
+        root = QgsProject.instance().layerTreeRoot()
+        node = root.findLayer(layer.id())
+        if node is not None:
+            node.setItemVisibilityChecked(True)
+        canvas = self.iface.mapCanvas() if self.iface is not None else None
+        if canvas is not None:
+            canvas.setExtent(layer.extent())
+            canvas.refresh()
+        return layer
 
     def _create_draft_layer(self, label_path):
         draft_fd, self._draft_path = tempfile.mkstemp(
@@ -1103,29 +1512,27 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if not model_path or not os.path.isdir(model_path):
             self._warn("所选模型路径无效。")
             return
-
         input_path = self._resolve_input_path()
-        if not input_path:
-            self._warn("请选择输入图层或输入文件。")
+        if not input_path or not os.path.isfile(input_path):
+            self._warn("请选择有效的输入图层或影像文件。")
             return
-        if not os.path.exists(input_path):
-            self._warn("输入文件不存在:{}".format(input_path))
+        input_path = os.path.abspath(input_path)
+        self._on_working_image_changed()
+        if self._input_path != input_path:
+            self._warn("当前工作影像未成功加载。")
             return
-
-        out_dir = self._output_directory_path()
-        if not out_dir:
-            self._warn("请选择导出目录。")
-            return
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except OSError as exc:
-            self._warn("无法创建导出目录:{}".format(exc))
-            return
-
         dem_path = self._resolve_dem_path()
         if not dem_path:
             return
-
+        try:
+            manifest = get_model_info(model_path)
+            self._inference_controller.prepare(manifest, uuid.uuid4().hex)
+        except BundleContractError as exc:
+            self._warn("模型不满足 landslide 草稿契约: {}".format(exc))
+            return
+        except Exception as exc:  # noqa: BLE001
+            self._warn("读取模型 manifest 失败: {}".format(exc))
+            return
         flags = {
             "clahe": self.claheCheck.isChecked(),
             "sharpen": self.sharpenCheck.isChecked(),
@@ -1136,100 +1543,68 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "model_path": model_path,
             "input_path": input_path,
             "dem_path": dem_path,
-            "vector_path": self._vector_output_path(),
-            "raster_path": self._raster_output_path(),
             "flags": flags,
             "georef": is_georeferenced(input_path),
         }
         if not self._ensure_pytorch_venv_available():
             return
+        if (self._layer_is_usable(self._draft_layer)
+                and not self._commit_layer_if_needed(self._draft_layer)):
+            return
+        self._invalidate_fusion_undo()
+        self._draft_session.clear_pending_inference()
+        self.retryFusionBtn.setEnabled(False)
+        self._stop_ai_editing(silent=True)
+        if not self._ensure_draft_session(input_path):
+            return
         self._start_run_after_validation(context)
-
     def _start_run_after_validation(self, context):
         if not context:
             self._warn("运行参数已丢失，请重新点击运行。")
             return
-
         model_path = context["model_path"]
         input_path = context["input_path"]
         dem_path = context["dem_path"]
-        vector_path = context["vector_path"]
-        raster_path = context["raster_path"]
         flags = context["flags"]
         georef = context["georef"]
-
-        self.outputFileWidget.setFilePath(vector_path)
-        self.rasterFileWidget.setFilePath(raster_path)
-        if os.path.exists(vector_path):
-            answer = QtWidgets.QMessageBox.question(
-                self, "覆盖确认",
-                "最终 Shapefile 已存在，确认后会覆盖同名结果。是否继续？")
-            if answer != QtWidgets.QMessageBox.Yes:
-                return
-            try:
-                _remove_existing_shapefile(vector_path)
-            except OSError as exc:
-                self._warn("无法覆盖已有 Shapefile:{}".format(exc))
-                return
-
         self._class_labels = self._read_class_labels(model_path)
         self._input_layer = self._resolve_input_layer()
         self._input_path = input_path
         self._start_inference_process(model_path, input_path, dem_path, flags, georef)
-
     def _on_export_raster(self):
-        if not self._layer_is_usable(self._draft_layer):
-            self._warn("请先完成草稿层编辑。")
+        if not self._draft_session.is_active or not self._layer_is_usable(
+                self._draft_layer):
+            self._warn("当前没有可导出的草稿。")
             return
         if not self._commit_layer_if_needed(self._draft_layer):
             return
-
-        if self._selected_output_format() == OUTPUT_FORMAT_VECTOR:
-            path = self._vector_output_path()
-            if not path:
-                self._warn("请选择导出目录。")
-                return
-            try:
-                _remove_existing_shapefile(path)
-                self._export_draft_vector(path)
-            except Exception as exc:  # noqa: BLE001
-                self._warn("导出 Shapefile 失败:{}".format(exc))
-                return
-            self.iface.messageBar().pushSuccess(
-                "地物分类", "草稿矢量已导出:{}".format(path))
-            return
-
-        if self._selected_output_format() == OUTPUT_FORMAT_DXF:
-            path = self._dxf_output_path()
-            if not path:
-                self._warn("请选择导出目录。")
-                return
-            try:
-                self._export_draft_dxf(path)
-            except Exception as exc:  # noqa: BLE001
-                self._warn("导出 DXF 失败:{}".format(exc))
-                return
-            self.iface.messageBar().pushSuccess(
-                "地物分类", "DXF 边界已导出:{}".format(path))
-            return
-
-        path = self._raster_output_path()
+        output_format = self._selected_output_format()
+        paths = {
+            OUTPUT_FORMAT_VECTOR: self._vector_output_path(),
+            OUTPUT_FORMAT_DXF: self._dxf_output_path(),
+            OUTPUT_FORMAT_RASTER: self._raster_output_path(),
+        }
+        path = paths[output_format]
         if not path:
             self._warn("请选择导出目录。")
             return
-        self.rasterFileWidget.setFilePath(path)
-        out_dir = os.path.dirname(path) or "."
-        if not os.path.isdir(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
         try:
-            self._rasterize_draft_layer(path)
-            self.iface.addRasterLayer(path, os.path.splitext(
-                os.path.basename(path))[0])
-            self.iface.messageBar().pushSuccess(
-                "地物分类", "草稿栅格已导出:{}".format(path))
+            if output_format == OUTPUT_FORMAT_VECTOR:
+                _remove_existing_shapefile(path)
+            self._export_service.export(
+                self._draft_session, output_format, path)
+            audit = self._draft_session.last_postprocess_path
+            if audit and os.path.isfile(audit):
+                shutil.copy2(audit, path + ".postprocess.json")
+            self._draft_session.mark_exported()
+            if output_format == OUTPUT_FORMAT_RASTER:
+                self.rasterFileWidget.setFilePath(path)
+                self.iface.addRasterLayer(
+                    path, os.path.splitext(os.path.basename(path))[0])
+            self.statusLabel.setText("当前会话草稿已导出: {}".format(path))
+            self.iface.messageBar().pushSuccess("地物分类", "导出成功: {}".format(path))
         except Exception as exc:  # noqa: BLE001
-            self._warn("导出栅格失败:{}".format(exc))
-
+            self._warn("导出失败: {}".format(exc))
     def _export_draft_vector(self, path):
         layer = self._draft_layer
         if not self._layer_is_usable(layer):
@@ -1585,10 +1960,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         return sorted(values)
 
     def _class_name(self, class_id):
-        if 0 <= class_id < len(self._class_labels):
-            return self._class_labels[class_id]
+        if class_id == 0:
+            return "background"
+        if class_id == 1:
+            return LANDSLIDE_CLASS_NAME
         return str(class_id)
-
     def _is_background_class_id(self, class_id):
         return (
             self._class_name(class_id).strip().lower()
@@ -1596,11 +1972,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         )
 
     def _background_class_id(self):
-        for class_id, label in enumerate(self._class_labels):
-            if str(label).strip().lower() in BACKGROUND_CLASS_NAMES:
-                return class_id
         return 0
-
     def _class_color(self, class_id):
         colors = [
             QColor(230, 25, 75),
@@ -1658,66 +2030,67 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             level=Qgis.Warning, duration=5)
 
     def closeEvent(self, event):
+        if self._draft_session.is_dirty:
+            answer = QtWidgets.QMessageBox.question(
+                self, "关闭插件",
+                "当前会话草稿尚未导出，关闭后将丢失。是否关闭？")
+            if answer != QtWidgets.QMessageBox.Yes:
+                event.ignore()
+                return
         if self._process is not None:
             self._process.kill()
         self._stop_ai_editing(silent=True)
+        self._discard_draft_session()
         super().closeEvent(event)
 
-    # ------------------------------------------------------------------
     # AI 辅助编辑相关
     # ------------------------------------------------------------------
 
     def _on_ai_start(self):
-        if not self._ensure_draft_layer():
-            self._warn("请先运行推理生成草稿图层,再启动 AI 编辑。")
-            return
         image_path = self._input_path or self._resolve_input_path()
-        if not image_path or not os.path.isfile(image_path):
-            self._warn("找不到推理使用的输入影像,无法启动 AI 编辑。")
+        message = self._ai_controller.startable(self._draft_session, image_path)
+        if message:
+            self._warn(message)
             return
-
+        self._remove_stale_session_draft_layers(defer=True)
+        self._input_path = image_path
+        if self._load_reference_input_layer() is None:
+            self._warn("无法将工作影像加载到 QGIS 画布，无法启动 AI 编辑。")
+            return
         ok, message = sam_deps_check.ensure_ready()
         if not ok:
-            QtWidgets.QMessageBox.warning(
-                self, "SAM 环境未就绪", message)
+            QtWidgets.QMessageBox.warning(self, "SAM 环境未就绪", message)
             return
-
         if not self._start_ai_worker():
             return
-
         self._ai_image_path = image_path
         self._ai_image_loaded = False
         try:
             self._load_ai_image_metadata(image_path)
         except Exception as exc:  # noqa: BLE001
-            self._warn("无法读取影像元数据:{}".format(exc))
+            self._warn("无法读取工作影像元数据: {}".format(exc))
             self._stop_ai_editing(silent=True)
             return
-
-        if not self._send_ai_command({"op": "set_image",
-                                      "image_path": image_path}):
+        if not self._send_ai_command({"op": "set_image", "image_path": image_path}):
             self._stop_ai_editing(silent=True)
             return
         self._ai_image_loaded = True
-
         canvas = self.iface.mapCanvas()
         self._ai_previous_tool = canvas.mapTool()
         self._ai_tool = AiSegmentMapTool(canvas, self._on_ai_points_changed)
         canvas.setMapTool(self._ai_tool)
         self._mark_draft_layer_ai_preview()
         self._remove_legacy_ai_preview_layers()
-
+        self._ai_controller.active = True
         self.aiStartBtn.setEnabled(False)
         self.aiStopBtn.setEnabled(True)
         self.aiReactivateBtn.setEnabled(True)
         self.aiUndoPointBtn.setEnabled(True)
         self.aiClearPointsBtn.setEnabled(True)
         self.aiAppendDraftBtn.setEnabled(False)
-        self.aiStatusLabel.setText(
-            "AI 编辑已启动。左键添加正点,右键添加负点。")
+        self.aiStatusLabel.setText("AI 编辑已启动。左键添加正点，右键添加负点。")
         self.iface.messageBar().pushInfo(
-            "地物分类", "AI 编辑已启动,请在画布上标注正负样本点。")
-
+            "地物分类", "AI 编辑已启动，请在画布中标注正负样本点。")
     def _on_ai_stop(self):
         self._stop_ai_editing(silent=False)
 
@@ -1737,24 +2110,22 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         canvas = self.iface.mapCanvas() if self.iface else None
         self._clear_ai_preview()
         self._restore_draft_layer_name()
-        if self._ai_tool is not None:
-            try:
-                self._ai_tool.clear_points()
-                self._ai_tool.clear_preview()
-            except Exception:
-                pass
-            if canvas is not None and self._ai_previous_tool is not None:
-                try:
-                    canvas.setMapTool(self._ai_previous_tool)
-                except Exception:
-                    pass
-            try:
-                self._ai_tool.dispose()
-            except Exception:
-                pass
+        ai_tool = self._ai_tool
+        previous_tool = self._ai_previous_tool
         self._ai_tool = None
         self._ai_previous_tool = None
+        if ai_tool is not None:
+            try:
+                ai_tool.dispose()
+            except Exception:
+                pass
+        if canvas is not None and previous_tool is not None:
+            try:
+                canvas.setMapTool(previous_tool)
+            except Exception:
+                pass
         self._ai_preview_geometry = None
+        self._ai_controller.stop()
         self._ai_pending_id = None
 
         if self._ai_worker is not None:
@@ -1807,57 +2178,54 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.aiStatusLabel.setText("已清空提示点。")
 
     def _on_ai_append_draft(self):
-        if not self._ensure_draft_layer() or self._ai_preview_geometry is None:
+        if self._ai_preview_geometry is None:
             return
         class_id = self._ai_landslide_class_id()
         self._write_ai_geometry_to_draft(self._ai_preview_geometry, class_id)
 
     def _ai_landslide_class_id(self):
-        for class_id, label in enumerate(self._class_labels or []):
-            if str(label).strip().lower() == LANDSLIDE_CLASS_NAME:
-                return class_id
-        for class_id, _label in enumerate(self._class_labels or []):
-            if not self._is_background_class_id(class_id):
-                return class_id
+        """工作区类别固定为 background=0、landslide=1。"""
         return 1
-
     def _write_ai_geometry_to_draft(self, geometry, class_id):
         layer = self._draft_layer
         geometry = self._coerce_ai_geometry_for_layer(geometry, layer)
         if geometry is None or geometry.isEmpty():
             self._warn("当前没有可写入的 AI 预览几何。")
             return
-        if not layer.isEditable():
-            if not layer.startEditing():
-                self._warn("草稿层无法进入编辑状态。")
-                return
-
-        class_name = self._class_name(class_id)
-        new_feature = QgsFeature(layer.fields())
-        new_feature.setGeometry(geometry)
-        new_feature.setAttribute(FIELD_CLASS_ID, class_id)
-        new_feature.setAttribute(FIELD_CLASS_NAME, class_name)
-        new_source_id = self._next_draft_source_id(layer)
-        new_feature.setAttribute(FIELD_SOURCE_ID, new_source_id)
-        layer.addFeature(new_feature)
-
-        if not layer.commitChanges():
-            self._warn("写入草稿层失败:{}".format(layer.commitErrors()))
-            layer.rollBack()
+        if not self._ensure_draft_session():
             return
-        layer.triggerRepaint()
-        self._apply_vector_style(layer, draft=True)
 
+        layer = self._draft_layer
+        if (self._layer_is_usable(layer)
+                and not self._commit_layer_if_needed(layer)):
+            return
+        try:
+            generation = self._draft_composer.append_user_geometry(
+                self._draft_session, geometry)
+            if self._layer_is_usable(layer):
+                self._draft_session.activate_generation(generation, layer)
+            else:
+                self._draft_session.activate_generation(generation)
+                self._attach_session_draft_layer(generation)
+            self._draft_path = generation
+            self._draft_layer = self._draft_session.layer
+            self._apply_vector_style(self._draft_layer, draft=True)
+            self._place_layer_above_input(self._draft_layer)
+            self._activate_layer(self._draft_layer)
+            self.exportRasterBtn.setEnabled(True)
+            self._invalidate_fusion_undo()
+        except Exception as exc:  # noqa: BLE001
+            self._warn("写入 AI 草稿失败，原草稿未改变: {}".format(exc))
+            return
         if self._ai_tool is not None:
             self._ai_tool.clear_points()
         self._clear_ai_preview()
         self._restore_draft_layer_name()
         self.aiAppendDraftBtn.setEnabled(False)
-        self.aiStatusLabel.setText(
-            "追加 1 个 landslide 草稿对象,类别 {}({})。".format(
-                class_id, class_name))
+        self.aiStatusLabel.setText("已追加 landslide 草稿对象。")
         self.iface.messageBar().pushSuccess(
-            "地物分类", "AI 编辑结果已写入草稿层。")
+            "地物分类", "AI 编辑结果已写入会话草稿。")
+
     def _next_draft_source_id(self, layer):
         max_source = 0
         for feature in layer.getFeatures():
@@ -1999,6 +2367,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._ai_preview_geometry = (
                 QgsGeometry(geometry) if geometry is not None
                 and not geometry.isEmpty() else None)
+            self._ai_controller.set_preview(self._ai_preview_geometry)
             enabled = self._ai_preview_geometry is not None
             if enabled:
                 self._show_ai_preview_on_draft(self._ai_preview_geometry)
@@ -2313,24 +2682,31 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if self._ai_tool is not None:
             self._ai_tool.clear_preview()
         self._ai_preview_geometry = None
+        self._ai_controller.clear_preview()
 
     def _show_ai_preview_on_draft(self, geometry):
-        layer = self._draft_layer if self._layer_is_usable(
-            self._draft_layer) else None
         if self._ai_tool is None:
             return
         preview_geometry = self._preview_geometry_for_canvas(geometry)
         if preview_geometry is None or preview_geometry.isEmpty():
             self._ai_tool.clear_preview()
             return
-        self._ai_tool.show_preview(preview_geometry, layer)
+        if self._layer_is_usable(self._draft_layer):
+            reference = self._draft_layer
+        elif self._ai_image_crs is not None and self._ai_image_crs.isValid():
+            # 尚未生成草稿时，预览几何位于输入影像 CRS，不能传 QgsRasterLayer。
+            reference = self._ai_image_crs
+        else:
+            reference = None
+        self._ai_tool.show_preview(preview_geometry, reference)
 
     def _mark_draft_layer_ai_preview(self):
+        """AI 预览只使用画布临时 RubberBand，不覆盖用户自定义图层名称。"""
         if not self._layer_is_usable(self._draft_layer):
             return
-        if self._draft_layer_original_name is None:
-            self._draft_layer_original_name = self._draft_layer.name()
-        self._draft_layer.setName("地物分类草稿 / AI mask 预览")
+        name = str(self._draft_layer.name() or "").strip().lower()
+        if "ai" in name and "mask" in name:
+            self._draft_layer.setName("地物分类草稿")
 
     def _restore_draft_layer_name(self):
         if (self._draft_layer_original_name is None
@@ -2341,13 +2717,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._draft_layer_original_name = None
 
     def _remove_legacy_ai_preview_layers(self):
-        project = QgsProject.instance()
-        layer_ids = [
-            layer.id()
-            for layer in project.mapLayersByName("AI mask 预览")
-        ]
-        if layer_ids:
-            project.removeMapLayers(layer_ids)
+        """清理旧版本留下的插件会话草稿，不触碰普通用户图层。"""
+        self._remove_stale_session_draft_layers(defer=True)
 
     def _preview_geometry_for_canvas(self, geometry):
         if geometry is None or geometry.isEmpty():

@@ -80,3 +80,9 @@ semantic_segmentation/
 ## 许可
 
 本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。统一运行环境中的第三方依赖遵循各自上游许可证。
+
+## 会话草稿工作流
+
+选择有效工作影像后，插件只加载并定位底图，不会立即创建草稿图层。首次点击 AI 追加有效 mask 或模型推理融合成功时，才在临时目录创建 GeoPackage 会话草稿。草稿固定使用 `background=0` 和 `landslide=1`：AI mask 与用户手工修改均保存为 `origin=user`，最新模型推理保存为 `origin=inference`，并按“用户区域 ∪ (最新推理区域 - 用户区域)”融合。SAM 负点只约束当前预览，不产生持久化排除区域。
+
+草稿只在当前插件会话中保留。切换影像或关闭插件前，未导出的草稿会提示将丢失。可直接走 AI-only、推理-only 或混合编辑流程；导出时 Raster 写出参考影像网格上的 0/1 tiled BigTIFF，Shapefile 和 DXF 只包含公开字段，不会泄露 `origin`、`run_id` 或 `feature_uuid`。

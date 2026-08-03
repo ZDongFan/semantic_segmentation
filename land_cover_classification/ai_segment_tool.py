@@ -13,7 +13,13 @@
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
-from qgis.core import QgsGeometry, QgsPointXY, QgsWkbTypes
+from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsGeometry,
+    QgsPointXY,
+    QgsVectorLayer,
+    QgsWkbTypes,
+)
 from qgis.gui import QgsMapTool, QgsRubberBand
 
 
@@ -51,6 +57,8 @@ class AiSegmentMapTool(QgsMapTool):
         super().deactivate()
 
     def canvasPressEvent(self, event):
+        if self._disposed:
+            return
         point = self.toMapCoordinates(event.pos())
         if event.button() == Qt.LeftButton:
             self._positive_points.append(point)
@@ -64,7 +72,9 @@ class AiSegmentMapTool(QgsMapTool):
             self._emit_points_changed()
 
     def undo_last_point(self):
-        # 按真实点击顺序撤销,避免用正负点数量猜测导致撤错点。
+        if self._disposed:
+            return
+        # 按真实点击顺序撤销，避免用正负点数量猜测导致撤错点。
         while self._point_history:
             point_type = self._point_history.pop()
             if point_type == 'positive' and self._positive_points:
@@ -77,6 +87,8 @@ class AiSegmentMapTool(QgsMapTool):
         self._emit_points_changed()
 
     def clear_points(self):
+        if self._disposed:
+            return
         if not self._positive_points and not self._negative_points:
             self._refresh_point_bands()
             return
@@ -95,12 +107,17 @@ class AiSegmentMapTool(QgsMapTool):
     def negative_points(self):
         return list(self._negative_points)
 
-    def show_preview(self, geometry, layer=None):
+    def show_preview(self, geometry, reference=None):
+        """显示预览几何，参考对象只能是矢量层或坐标系。"""
         if self._preview_band is None:
             return
         self._preview_band.reset(QgsWkbTypes.PolygonGeometry)
-        if geometry is not None and not geometry.isEmpty():
-            self._preview_band.setToGeometry(geometry, layer)
+        if geometry is None or geometry.isEmpty():
+            return
+        if not isinstance(
+                reference, (QgsVectorLayer, QgsCoordinateReferenceSystem)):
+            reference = self._canvas.mapSettings().destinationCrs()
+        self._preview_band.setToGeometry(geometry, reference)
 
     def clear_preview(self):
         if self._preview_band is None:
@@ -123,23 +140,44 @@ class AiSegmentMapTool(QgsMapTool):
             self._negative_band.addPoint(QgsPointXY(point))
 
     def _emit_points_changed(self):
-        if callable(self._on_points_changed):
-            self._on_points_changed(
+        if self._disposed:
+            return
+        callback = self._on_points_changed
+        if not callable(callback):
+            return
+        try:
+            callback(
                 list(self._positive_points),
                 list(self._negative_points),
             )
+        except RuntimeError as exc:
+            # 插件重载后旧对话框可能已被 Qt 销毁，不能继续保留其回调。
+            if "has been deleted" not in str(exc):
+                raise
+            self.dispose()
 
     def dispose(self):
         if self._disposed:
             return
         self._disposed = True
+        self._on_points_changed = None
+        canvas = self._canvas
+        try:
+            if canvas is not None and canvas.mapTool() is self:
+                canvas.unsetMapTool(self)
+        except RuntimeError:
+            pass
         for band in (self._preview_band, self._positive_band,
                      self._negative_band):
             if band is None:
                 continue
-            scene = band.scene()
-            if scene is not None:
-                scene.removeItem(band)
+            try:
+                scene = band.scene()
+                if scene is not None:
+                    scene.removeItem(band)
+            except RuntimeError:
+                continue
         self._preview_band = None
         self._positive_band = None
         self._negative_band = None
+        self._canvas = None
