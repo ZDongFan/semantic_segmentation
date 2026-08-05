@@ -281,6 +281,67 @@ class DraftComposer:
         return self.compose(session, candidate_path, replace_inference=True,
                             run_id=run_id)
 
+    def merge_inference_candidate_in_extent(
+            self, session, candidate_path, roi_geometry, run_id):
+        """只替换 ROI 内推理区域，并始终保留用户与 AI 区域。"""
+        if not session.is_active:
+            raise RuntimeError("当前没有可合成的草稿会话。")
+        if not candidate_path or not os.path.isfile(candidate_path):
+            raise IOError("推理候选不存在: {}".format(candidate_path))
+        if roi_geometry is None or roi_geometry.isEmpty():
+            raise ValueError("局部推理 ROI 不能为空。")
+
+        workspace = session.directory
+        roi_path = os.path.join(
+            workspace, "inference_roi_{}.gpkg".format(uuid.uuid4().hex))
+        self._create_geometry_source(
+            roi_geometry, roi_path, session.input_path)
+        user_current = self._extract_origin(
+            session.generation_path, ORIGIN_USER, workspace, "users_current")
+        inference_current = self._extract_origin(
+            session.generation_path, ORIGIN_INFERENCE, workspace,
+            "inference_current")
+
+        users = None
+        if user_current:
+            users = self._run("native:fixgeometries", {
+                "INPUT": user_current,
+            }, workspace, "users_fixed")
+        old_outside = None
+        if inference_current:
+            old_outside = self._run("native:difference", {
+                "INPUT": inference_current,
+                "OVERLAY": roi_path,
+            }, workspace, "inference_outside_roi")
+        new_inside = self._run("native:intersection", {
+            "INPUT": candidate_path,
+            "OVERLAY": roi_path,
+            "INPUT_FIELDS": [],
+            "OVERLAY_FIELDS": [],
+            "OVERLAY_FIELDS_PREFIX": "roi_",
+        }, workspace, "inference_inside_roi")
+        new_inside = self._prepare_source(
+            new_inside, workspace, "new_inference", ORIGIN_INFERENCE, run_id)
+
+        inference = self._merge_sources(
+            [path for path in (old_outside, new_inside) if path],
+            workspace, "local_inference")
+        if users and inference:
+            inference = self._run("native:difference", {
+                "INPUT": inference,
+                "OVERLAY": users,
+            }, workspace, "local_inference_without_users")
+        result = self._merge_sources(
+            [path for path in (users, inference) if path], workspace,
+            "local_composed")
+        destination = session.next_generation_path()
+        if result:
+            self._normalise_to_generation(result, destination, None)
+        else:
+            self.create_empty(destination, session.input_path)
+        self._assert_generation(destination)
+        return destination
+
     def merge_inference(self, session, label_path, label_class_id, run_id):
         """用最新推理替换旧 inference，同时保留 user 区域。"""
         candidate = self.build_inference_candidate(
@@ -436,6 +497,28 @@ class DraftComposer:
         parameters["OUTPUT"] = output
         result = processing.run(algorithm, parameters)
         return result["OUTPUT"]
+
+    def _create_geometry_source(self, geometry, path, reference_path):
+        """把范围几何写为带输入影像 CRS 的磁盘 GeoPackage。"""
+        from osgeo import ogr, osr
+
+        driver = ogr.GetDriverByName("GPKG")
+        if os.path.exists(path):
+            driver.DeleteDataSource(path)
+        dataset = driver.CreateDataSource(path)
+        spatial_ref = self._reference_spatial_ref(reference_path, osr)
+        layer = dataset.CreateLayer(
+            "roi", srs=spatial_ref, geom_type=ogr.wkbPolygon)
+        feature = ogr.Feature(layer.GetLayerDefn())
+        ogr_geometry = ogr.CreateGeometryFromWkb(bytes(geometry.asWkb()))
+        if ogr_geometry is None or ogr_geometry.IsEmpty():
+            dataset = None
+            raise ValueError("无法创建局部推理 ROI 几何。")
+        feature.SetGeometry(ogr_geometry)
+        if layer.CreateFeature(feature) != 0:
+            dataset = None
+            raise IOError("无法写入局部推理 ROI。")
+        dataset = None
 
     def _normalise_to_generation(self, source_path, destination, default_run_id):
         from osgeo import ogr

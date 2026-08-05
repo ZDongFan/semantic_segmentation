@@ -163,6 +163,67 @@ def _windows(width, height, block_size):
             yield Window(col, row, min(block_size, width - col), min(block_size, height - row))
 
 
+def _windows_in_window(bounds_window, block_size):
+    """在指定像素窗口内生成保持影像绝对偏移的核心窗口。"""
+    from rasterio.windows import Window
+
+    col_start = int(bounds_window.col_off)
+    row_start = int(bounds_window.row_off)
+    col_end = col_start + int(bounds_window.width)
+    row_end = row_start + int(bounds_window.height)
+    for row in range(row_start, row_end, block_size):
+        for col in range(col_start, col_end, block_size):
+            yield Window(
+                col, row,
+                min(block_size, col_end - col),
+                min(block_size, row_end - row),
+            )
+
+
+def _roi_pixel_window(image_src, roi):
+    """把输入影像 CRS 下的 ROI 转为裁剪后的整像素窗口。"""
+    if not roi:
+        return None
+    import numpy as np
+    from rasterio.windows import Window, from_bounds
+
+    if str(roi.get("mode", "")) != "canvas_intersection":
+        raise ValueError("不支持的 ROI 推理模式。")
+    bounds = roi.get("bounds")
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+        raise ValueError("ROI bounds 必须包含 xmin、ymin、xmax、ymax。")
+    values = [float(value) for value in bounds]
+    if not all(np.isfinite(values)):
+        raise ValueError("ROI bounds 包含非有限数值。")
+    xmin, ymin, xmax, ymax = values
+    if xmin >= xmax or ymin >= ymax:
+        raise ValueError("ROI bounds 不是有效矩形。")
+    fractional = from_bounds(
+        xmin, ymin, xmax, ymax, transform=image_src.transform)
+    col0 = max(0, int(math.floor(float(fractional.col_off))))
+    row0 = max(0, int(math.floor(float(fractional.row_off))))
+    col1 = min(
+        int(image_src.width),
+        int(math.ceil(float(fractional.col_off + fractional.width))))
+    row1 = min(
+        int(image_src.height),
+        int(math.ceil(float(fractional.row_off + fractional.height))))
+    if col0 >= col1 or row0 >= row1:
+        raise ValueError("ROI 与输入影像没有有效像素交集。")
+    return Window(col0, row0, col1 - col0, row1 - row0)
+
+
+def _window_audit(window):
+    if window is None:
+        return None
+    return {
+        "col_off": int(window.col_off),
+        "row_off": int(window.row_off),
+        "width": int(window.width),
+        "height": int(window.height),
+    }
+
+
 def _expand_window(window, halo, width, height):
     from rasterio.windows import Window
 
@@ -291,13 +352,28 @@ def _predict_probability(model, image, factors, bundle, device_cfg, tile_size):
     return probabilities[0, class_id, :original_height, :original_width].detach().cpu().numpy().astype("float32")
 
 
+def _initialize_roi_outputs(
+        probability_dst, dem_filled_dst, valid_data_dst, width, height):
+    """以有界磁盘块显式初始化 ROI 外的输出值。"""
+    import numpy as np
+
+    for window in _windows(width, height, DEFAULT_BLOCK_SIZE):
+        shape = (int(window.height), int(window.width))
+        probability_dst.write(
+            np.full(shape, np.nan, dtype="float32"), 1, window=window)
+        dem_filled_dst.write(
+            np.zeros(shape, dtype="uint8"), 1, window=window)
+        valid_data_dst.write(
+            np.zeros(shape, dtype="uint8"), 1, window=window)
+
+
 def _write_probability_raster(params, bundle, model, device_cfg, probability_path,
                               dem_filled_path, valid_data_path,
                               progress_callback=None):
     import numpy as np
     import rasterio
     import torch
-    from rasterio.windows import transform as window_transform
+    from rasterio.windows import Window, transform as window_transform
     from land_cover_classification.pytorch_inference_core import (
         _apply_array_preprocess,
         _crs_unit as core_crs_unit,
@@ -316,8 +392,12 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
             or bundle.manifest.get("input_size")
             or device_cfg["tile_size"])
         overlap = int(params.get("overlap") or max(32, tile_size // 8))
+        roi = params.get("roi")
+        roi_window = _roi_pixel_window(image_src, roi)
+        inference_window = roi_window or Window(
+            0, 0, image_src.width, image_src.height)
         plan = build_window_plan(
-            image_src.width, image_src.height,
+            int(inference_window.width), int(inference_window.height),
             tile_size,
             overlap,
             factor_radius,
@@ -327,10 +407,15 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
         with rasterio.open(probability_path, "w", **profile) as probability_dst, \
                 rasterio.open(dem_filled_path, "w", **mask_profile) as dem_filled_dst, \
                 rasterio.open(valid_data_path, "w", **mask_profile) as valid_data_dst:
+            if roi_window is not None:
+                _initialize_roi_outputs(
+                    probability_dst, dem_filled_dst, valid_data_dst,
+                    image_src.width, image_src.height)
             done = 0
             dem_stage_reported = False
             with torch.no_grad():
-                for core in _windows(image_src.width, image_src.height, plan.core_size):
+                for core in _windows_in_window(
+                        inference_window, plan.core_size):
                     expanded = _expand_window(core, plan.halo, image_src.width, image_src.height)
                     image_masked = image_src.read(window=expanded, masked=True)
                     valid = ~np.any(np.ma.getmaskarray(image_masked), axis=0)
@@ -364,7 +449,14 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
             if core_crs_unit(dem_src.crs) == "m" else None,
             "crs_unit": core_crs_unit(dem_src.crs),
         }
-        return image_src.profile.copy(), config, dem_info, plan
+        inference_audit = {
+            "mode": "canvas_intersection" if roi_window is not None else "full_image",
+            "bounds": list(roi.get("bounds") or []) if roi_window is not None else None,
+            "crs_wkt": roi.get("crs_wkt") if roi_window is not None else None,
+            "pixel_window": _window_audit(roi_window),
+            "halo": plan.halo,
+        }
+        return image_src.profile.copy(), config, dem_info, plan, inference_audit
 
 
 def _stream_binary_operation(source_path, output_path, operation, halo,
@@ -943,7 +1035,8 @@ def _component_decisions(counts, pixel_area, config, fill_fraction, observed,
 
 def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle, config,
                          temp_dir, probability_stats,
-                         stage_counts, runtime_metadata, progress=None):
+                         stage_counts, runtime_metadata, inference_audit,
+                         progress=None):
     import numpy as np
     import rasterio
 
@@ -1036,6 +1129,7 @@ def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle
         "training_data": config["training_data"],
         "runtime_resolution": runtime_metadata.get("runtime_resolution", {}),
         "resolution_warnings": runtime_metadata.get("resolution_warnings", []),
+        "inference": inference_audit,
         "rules": config.get("rules", {}),
         "rule_order": config.get("rule_order", list((config.get("rules") or {}).keys())),
         "threshold": float(config.get("threshold", 0.5)),
@@ -1083,7 +1177,7 @@ def run_streaming_inference(params, progress_callback=None):
         probability_path = os.path.join(temp_dir, "probability.tif")
         dem_filled_path = os.path.join(temp_dir, "dem_filled.tif")
         valid_data_path = os.path.join(temp_dir, "valid_data.tif")
-        image_profile, config, dem_info, plan = _write_probability_raster(
+        image_profile, config, dem_info, plan, inference_audit = _write_probability_raster(
             params, bundle, model, device_cfg, probability_path, dem_filled_path,
             valid_data_path,
             progress_callback)
@@ -1097,7 +1191,8 @@ def run_streaming_inference(params, progress_callback=None):
         summary = _finalize_components(
             mask_path, output_path, dem_filled_path, params, bundle, config,
             temp_dir, probability_stats,
-            stage_counts, runtime_metadata, postprocess_progress)
+            stage_counts, runtime_metadata, inference_audit,
+            postprocess_progress)
     if progress_callback is not None:
         progress_callback("write", 1, 1)
     return {
@@ -1110,4 +1205,5 @@ def run_streaming_inference(params, progress_callback=None):
         "tile_size": plan.tile_size,
         "core_size": plan.core_size,
         "halo": plan.halo,
+        "roi": inference_audit if params.get("roi") else None,
     }

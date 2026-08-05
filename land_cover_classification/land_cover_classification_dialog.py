@@ -34,6 +34,8 @@ from qgis.core import (
     QgsMessageLog,
     QgsPointXY,
     QgsProject,
+    QgsRasterLayer,
+    QgsRectangle,
     QgsRendererCategory,
     QgsVectorFileWriter,
     QgsVectorLayer,
@@ -364,6 +366,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self.progressBar, self.exportProgressBar)
         self.iface = iface
         self._process = None
+        self._active_inference_roi = None
         self._params_file = None
         self._launcher_file = None
         self._process_error_message = ""
@@ -421,6 +424,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.draftLayout.setContentsMargins(0, 0, 0, 0)
         self.exportLayout.removeWidget(self.aiEditGroup)
         self.draftLayout.addWidget(self.aiEditGroup)
+        self.canvasInferenceBtn = QtWidgets.QPushButton(
+            "按当前画布范围推理", self.draftTab)
+        self.draftLayout.addWidget(self.canvasInferenceBtn)
         self.undoFusionBtn = QtWidgets.QPushButton(
             "撤销上次模型推理", self.draftTab)
         self.undoFusionBtn.setEnabled(False)
@@ -491,6 +497,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.mDemFile.fileChanged.connect(self._on_dem_file_changed)
 
         self.runBtn.clicked.connect(self._on_run)
+        self.canvasInferenceBtn.clicked.connect(
+            self._on_run_canvas_extent)
         self.cancelBtn.clicked.connect(self._on_cancel)
         self.exportRasterBtn.clicked.connect(self._on_export_raster)
         self.closeBtn.clicked.connect(self.close)
@@ -1052,7 +1060,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception:
             return []
 
-    def _start_inference_process(self, model_path, input_path, dem_path, flags, georef):
+    def _start_inference_process(
+            self, model_path, input_path, dem_path, flags, georef, roi=None):
         self._process_error_message = ""
         self._process_error_details = []
         self._process_error_traceback = ""
@@ -1071,6 +1080,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "preprocess_flags": flags,
             "postprocess_overrides": {},
         }
+        if roi:
+            params["roi"] = roi
+        self._active_inference_roi = roi
         self._params_file = os.path.join(
             self._draft_session.directory,
             "pytorch_params_{}.json".format(uuid.uuid4().hex))
@@ -1087,11 +1099,14 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process.errorOccurred.connect(self._on_process_error)
 
         self.runBtn.setEnabled(False)
+        self.canvasInferenceBtn.setEnabled(False)
         self.cancelBtn.setEnabled(True)
         self.exportRasterBtn.setEnabled(False)
         self.progressBar.setValue(0)
-        self.statusLabel.setText("PyTorch 推理运行中({}模式)...".format(
-            "带地理坐标" if georef else "普通图像"))
+        mode_label = "当前画布范围" if roi else (
+            "带地理坐标" if georef else "普通图像")
+        self.statusLabel.setText(
+            "PyTorch 推理运行中({}模式)...".format(mode_label))
 
         runner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "pytorch_inference_runner.py")
@@ -1292,6 +1307,17 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         shutil.copy2(self._draft_session.generation_path, snapshot)
         self._draft_session.fusion_snapshot_path = snapshot
 
+    def _active_roi_geometry(self):
+        """根据启动时保存的 canonical ROI 构造融合矩形。"""
+        roi = self._active_inference_roi
+        if not roi:
+            return None
+        bounds = roi.get("bounds") or []
+        if len(bounds) != 4:
+            raise ValueError("局部推理上下文缺少有效 bounds。")
+        return QgsGeometry.fromRect(QgsRectangle(*[
+            float(value) for value in bounds]))
+
     def _finish_inference_fusion(self, candidate_path, run_id):
         """合成已保存的候选并在成功后切换可见草稿。"""
         self._merge_inference_candidate_with_retry(candidate_path, run_id)
@@ -1309,8 +1335,16 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         """在原草稿保持不变的前提下自动重试候选融合和发布。"""
         for attempt in range(1, FUSION_MAX_ATTEMPTS + 1):
             try:
-                generation = self._draft_composer.merge_inference_candidate(
-                    self._draft_session, candidate_path, run_id)
+                roi_geometry = self._active_roi_geometry()
+                if roi_geometry is None:
+                    generation = self._draft_composer.merge_inference_candidate(
+                        self._draft_session, candidate_path, run_id)
+                else:
+                    generation = (
+                        self._draft_composer
+                        .merge_inference_candidate_in_extent(
+                            self._draft_session, candidate_path,
+                            roi_geometry, run_id))
                 self._publish_draft_generation(generation)
                 return generation
             except Exception as exc:  # noqa: BLE001
@@ -1331,7 +1365,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._load_reference_input_layer()
             if not self._draft_session.is_active:
                 raise RuntimeError("当前工作影像的会话草稿已失效。")
-            self._create_fusion_snapshot()
             candidate = self._draft_composer.build_inference_candidate(
                 self._draft_session,
                 self._label_path,
@@ -1685,60 +1718,138 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self, "缺少插件统一运行环境", message)
         return False
 
-    def _on_run(self):
+    def _prepare_inference_context(self):
+        """校验并收集全图与局部推理共用参数。"""
         if self.modelCombo.count() == 0:
             self._warn("尚未选择模型。")
-            return
+            return None
         model_entry = self.modelCombo.currentData()
         model_path = self._model_path_from_entry(model_entry)
         if not model_path or not os.path.isdir(model_path):
             self._warn("所选模型路径无效。")
-            return
+            return None
         input_path = self._resolve_input_path()
         if not input_path or not os.path.isfile(input_path):
             self._warn("请选择有效的输入图层或影像文件。")
-            return
+            return None
         input_path = os.path.abspath(input_path)
         self._on_working_image_changed()
         if self._input_path != input_path:
             self._warn("当前工作影像未成功加载。")
-            return
+            return None
         dem_path = self._resolve_dem_path()
         if not dem_path:
-            return
+            return None
         try:
             manifest = get_model_info(model_path)
             self._inference_controller.prepare(manifest, uuid.uuid4().hex)
         except BundleContractError as exc:
             self._warn("模型不满足 landslide 草稿契约: {}".format(exc))
-            return
+            return None
         except Exception as exc:  # noqa: BLE001
             self._warn("读取模型 manifest 失败: {}".format(exc))
-            return
-        flags = {
-            "clahe": self.claheCheck.isChecked(),
-            "sharpen": self.sharpenCheck.isChecked(),
-            "median": self.medianCheck.isChecked(),
-            "gaussian": self.gaussianCheck.isChecked(),
-        }
-        context = {
+            return None
+        return {
             "model_path": model_path,
             "input_path": input_path,
             "dem_path": dem_path,
-            "flags": flags,
+            "flags": {
+                "clahe": self.claheCheck.isChecked(),
+                "sharpen": self.sharpenCheck.isChecked(),
+                "median": self.medianCheck.isChecked(),
+                "gaussian": self.gaussianCheck.isChecked(),
+            },
             "georef": is_georeferenced(input_path),
         }
-        if not self._ensure_pytorch_venv_available():
+
+    def _canvas_intersection_roi(self, input_path):
+        """把当前画布范围转换为输入影像 CRS 下的 canonical ROI。"""
+        if not is_georeferenced(input_path):
+            self._warn("输入影像没有有效地理参考，不能按当前画布范围推理。")
+            return None
+        image_layer = QgsRasterLayer(input_path, "roi_reference")
+        if (not image_layer.isValid() or not image_layer.crs().isValid()
+                or image_layer.extent().isEmpty()):
+            self._warn("无法读取输入影像的有效 CRS 或空间范围，局部推理不可用。")
+            return None
+        try:
+            canvas = self.iface.mapCanvas()
+            canvas_extent = QgsRectangle(canvas.extent())
+            canvas_crs = canvas.mapSettings().destinationCrs()
+            image_crs = image_layer.crs()
+            if canvas_crs != image_crs:
+                transform = QgsCoordinateTransform(
+                    canvas_crs, image_crs, QgsProject.instance())
+                canvas_extent = transform.transformBoundingBox(canvas_extent)
+        except Exception as exc:  # noqa: BLE001
+            self._warn("无法把当前画布范围转换到输入影像 CRS: {}".format(exc))
+            return None
+
+        image_extent = image_layer.extent()
+        if not canvas_extent.intersects(image_extent):
+            self._warn("当前画布范围与输入影像没有交集。")
+            return None
+        intersection = QgsRectangle(
+            max(canvas_extent.xMinimum(), image_extent.xMinimum()),
+            max(canvas_extent.yMinimum(), image_extent.yMinimum()),
+            min(canvas_extent.xMaximum(), image_extent.xMaximum()),
+            min(canvas_extent.yMaximum(), image_extent.yMaximum()),
+        )
+        if intersection.width() <= 0 or intersection.height() <= 0:
+            self._warn("当前画布范围与输入影像没有有效面积交集。")
+            return None
+        return {
+            "mode": "canvas_intersection",
+            "bounds": [
+                intersection.xMinimum(), intersection.yMinimum(),
+                intersection.xMaximum(), intersection.yMaximum(),
+            ],
+            "crs_wkt": image_layer.crs().toWkt(),
+        }
+
+    def _launch_inference_context(self, context, publish_empty=False):
+        """完成会话准备、快照和子进程启动。"""
+        if not context or not self._ensure_pytorch_venv_available():
             return
         if (self._layer_is_usable(self._draft_layer)
                 and not self._commit_layer_if_needed(self._draft_layer)):
             return
-        self._invalidate_fusion_undo()
-
         self._stop_ai_editing(silent=True)
-        if not self._ensure_draft_session(input_path):
+        if not self._ensure_draft_session(context["input_path"]):
             return
-        self._start_run_after_validation(context)
+        if publish_empty and not self._layer_is_usable(self._draft_layer):
+            try:
+                self._publish_draft_generation(
+                    self._draft_session.generation_path)
+            except Exception as exc:  # noqa: BLE001
+                self._warn("发布空会话草稿失败: {}".format(exc))
+                return
+        self._invalidate_fusion_undo()
+        try:
+            self._create_fusion_snapshot()
+            self._start_run_after_validation(context)
+        except Exception as exc:  # noqa: BLE001
+            self._warn("启动模型推理失败: {}".format(exc))
+
+    def _on_run(self):
+        context = self._prepare_inference_context()
+        if context:
+            self._launch_inference_context(context)
+
+    def _on_run_canvas_extent(self):
+        context = self._prepare_inference_context()
+        if not context:
+            return
+        if (self._layer_is_usable(self._draft_layer)
+                and not self._commit_layer_if_needed(self._draft_layer)):
+            return
+        self._stop_ai_editing(silent=True)
+        roi = self._canvas_intersection_roi(context["input_path"])
+        if not roi:
+            return
+        context["roi"] = roi
+        self._launch_inference_context(context, publish_empty=True)
+
     def _start_run_after_validation(self, context):
         if not context:
             self._warn("运行参数已丢失，请重新点击运行。")
@@ -1751,7 +1862,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._class_labels = self._read_class_labels(model_path)
         self._input_layer = self._resolve_input_layer()
         self._input_path = input_path
-        self._start_inference_process(model_path, input_path, dem_path, flags, georef)
+        self._start_inference_process(
+            model_path, input_path, dem_path, flags, georef,
+            context.get("roi"))
     def _on_export_raster(self):
         if not self._draft_session.is_active or not self._layer_is_usable(
                 self._draft_layer):
@@ -2187,6 +2300,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _cleanup_process(self):
         self.runBtn.setEnabled(True)
+        self.canvasInferenceBtn.setEnabled(True)
         self.cancelBtn.setEnabled(False)
         if self._params_file and os.path.exists(self._params_file):
             try:
@@ -2203,6 +2317,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if self._process is not None:
             self._process.deleteLater()
         self._process = None
+        self._active_inference_roi = None
 
     def _warn(self, message):
         self.statusLabel.setText(message)
