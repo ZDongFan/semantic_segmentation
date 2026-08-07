@@ -375,7 +375,6 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
     import torch
     from rasterio.windows import Window, transform as window_transform
     from land_cover_classification.pytorch_inference_core import (
-        _apply_array_preprocess,
         _crs_unit as core_crs_unit,
         _factor_config,
         _factors_to_dict,
@@ -420,7 +419,6 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
                     image_masked = image_src.read(window=expanded, masked=True)
                     valid = ~np.any(np.ma.getmaskarray(image_masked), axis=0)
                     image = np.asarray(image_masked.filled(0))
-                    image = _apply_array_preprocess(image, params.get("preprocess_flags") or {})
                     image = _normalize_image(image, bundle.preprocess)
                     transform = window_transform(expanded, image_src.transform)
                     dem, filled = _align_dem_window(

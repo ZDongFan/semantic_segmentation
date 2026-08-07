@@ -149,3 +149,5 @@ PyTorch 推理必须同时选择与输入影像覆盖范围相交的 DEM 文件�
 ## landslide 工作区契约
 
 会话草稿工作区固定映射为 `background=0`、`landslide=1`。启动推理前，插件会在 `manifest.json.class_names` 中以大小写不敏感的方式查找唯一的 `landslide`；若声明 `landslide_class_id`，它必须和该索引一致。缺失、重复或冲突会在启动子进程前明确失败，而不会把其他类别写入草稿。
+
+运行器还可接收由界面生成的 `roi` 参数，用于“按当前画布范围推理”。其 `mode` 必须为 `canvas_intersection`，`bounds` 必须是输入影像 CRS 下的 `[xmin, ymin, xmax, ymax]`，并同时记录 `crs_wkt`。ROI 先向外取整到影像像素并裁剪到影像边界；没有像素交集必须失败，不能退化为全图推理。核心窗口只在 ROI 内写入，halo 可以超出 ROI 读取上下文；审计 JSON 会记录模式、边界、像素窗口和 halo。

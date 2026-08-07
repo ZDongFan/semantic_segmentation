@@ -10,7 +10,9 @@
 
 - 扫描模型根目录下带 `manifest.json` 的 PyTorch 语义分割 bundle，并在模型下拉框中列出；bundle 子目录名由外部模型提供方决定，不作为兼容性判断条件。
 - 使用插件统一运行环境 `vendor/sam_runtime/venv/` 子进程执行 PyTorch 主推理和 SAM AI 编辑，QGIS 主进程不导入 `torch`；打开插件面板时不检查 / 加载 venv，点击“运行”后才检查 PyTorch 主推理环境。
+- 当前草稿工作流固定处理 `landslide` 类别：启动推理前会在 `manifest.json` 的类别列表中以大小写不敏感方式查找唯一的 `landslide`。如同时声明 `landslide_class_id`，其值必须与该类别索引一致；缺失、重复或冲突会在启动子进程前失败。
 - 生产推理采用“核心区 + halo”流式处理：输入影像通过有限 `rasterio.windows.Window` 读取，DEM 只重投影到当前局部格网，并调用 bundle 内 `dem_factors.py` 计算局部派生因子。
+- 除全图推理外，已地理配准的影像可在“草稿编辑”页签按当前画布范围推理。画布范围会转换到影像 CRS 并与影像求交；ROI 的核心计算只覆盖交集，halo 可为上下文越过 ROI 边界，未计算区域不会被当作有效推理数据。
 - 支持 GPU 推理，并在 CUDA 不可用时自动降级到 CPU；CPU 路径使用更小 tile 保护内存。
 - 概率、类别与中间结果直接按窗口写入 tiled GeoTIFF，不保留整幅 DEM、DEM 因子栈、概率图、标签图或连通域数组。
 - 对 landslide 概率执行 threshold、形态学、填洞、跨块连通域、最小面积过滤，以及 slope、relief、TPI 三条 DEM 规则后处理；全局组件通过磁盘中间栅格归并，避免在块边界截断对象。
@@ -31,11 +33,11 @@
 
 ## 使用流程
 
-1. 在 `推理` 页签中选择 PyTorch bundle、输入图层或本地影像、DEM 文件和可选预处理项。
-2. 在 `编辑与导出` 页签中选择导出格式和导出目录。
-3. 回到 `推理` 页签点击运行；插件会在基础参数校验通过后检查 PyTorch 统一运行环境，然后生成类别 GeoTIFF、后处理审计 JSON 和草稿矢量图层。
-4. 推理完成后插件自动切到 `编辑与导出` 页签，可手动编辑草稿层，也可启动 AI 辅助编辑追加对象。
-5. 编辑完成后点击“导出结果”，插件会从当前草稿层导出所选格式。
+1. 在 `模型推理` 页签中选择 PyTorch bundle、输入图层或本地影像和 DEM 文件。
+2. 点击“运行”执行全图推理；已地理配准的影像也可在 `草稿编辑` 页签点击“按当前画布范围推理”，仅刷新当前视图与输入影像相交的范围。
+3. 基础参数校验通过后，插件检查 PyTorch 统一运行环境，生成类别 GeoTIFF、后处理审计 JSON，并把结果融合到会话草稿。
+4. 推理完成后自动进入 `草稿编辑` 页签；可直接手动编辑，使用 AI 辅助编辑追加对象，或在未发生后续修改前撤销最近一次模型推理融合。
+5. 在 `导出` 页签中选择格式和目录，点击“导出结果”从当前草稿导出最终成果。
 
 插件不在正常运行前额外执行一遍用户侧“干跑”。点击运行后，生产流程直接按窗口读取和处理；开发验证应使用合成小栅格、伪超大元数据和 mock 断言，不应把真实超大影像完整推理作为定位问题的前置条件。
 
@@ -53,15 +55,19 @@ semantic_segmentation/
     |-- land_cover_classification.py
     |-- land_cover_classification_dialog.py
     |-- land_cover_classification_dialog_base.ui
+    |-- ai_edit_controller.py
+    |-- draft_session.py
+    |-- export_service.py
+    |-- inference_controller.py
     |-- pytorch_inference_core.py
     |-- pytorch_streaming.py
     |-- pytorch_inference_runner.py
     |-- pytorch_deps_check.py
-    |-- preprocess.py
     |-- model_scan.py
     |-- sam_deps_check.py
     |-- sam_worker.py
     |-- ai_segment_tool.py
+    |-- test/
     |-- vendor/
     |   `-- sam_runtime/      # 插件统一运行环境
     `-- models/
@@ -77,6 +83,14 @@ semantic_segmentation/
 - 插件对生产中间栅格、类别栅格和编辑后导出的 GeoTIFF 自动使用 BigTIFF；不提供文件大小上限开关，也不要求用户预估压缩后的文件大小。
 - 流式设计限制的是 Python 峰值内存，不保证大影像处理很快。高度碎片化的结果可能增加磁盘组件元数据、SQLite 临时空间和矢量化耗时。
 
+## 按当前画布范围推理
+
+“按当前画布范围推理”要求输入影像具有有效地理参考、CRS 和空间范围。插件会将当前画布范围转换到输入影像 CRS，与影像范围求交后向外取整为像素窗口；若没有有效交集，会提示错误，绝不会退化为全图推理。
+
+局部推理仍输出与参考影像同网格的临时栅格：ROI 外的概率与辅助有效性掩膜会显式标记为 NoData / 无效，核心窗口不会越出 ROI，只有为模型和 DEM 因子提供上下文的 halo 可以越界。审计 JSON 会记录推理模式、ROI 边界、CRS、像素窗口与 halo。
+
+融合时，插件仅用新的候选结果替换 ROI 内 `origin=inference` 的区域；ROI 外的既有模型结果，以及所有 `origin=user` 的 AI 和手工编辑区域都会保留。因此可连续在不同画布范围补推理，而不会抹掉已确认的草稿。
+
 ## 许可
 
 本项目以 Apache License 2.0 发布，详见 [`LICENSE`](LICENSE)。统一运行环境中的第三方依赖遵循各自上游许可证。
@@ -86,3 +100,5 @@ semantic_segmentation/
 选择有效工作影像后，插件只加载并定位底图，不会立即创建草稿图层。首次点击 AI 追加有效 mask 或模型推理融合成功时，才在临时目录创建 GeoPackage 会话草稿。草稿固定使用 `background=0` 和 `landslide=1`：AI mask 与用户手工修改均保存为 `origin=user`，最新模型推理保存为 `origin=inference`，并按“用户区域 ∪ (最新推理区域 - 用户区域)”融合。SAM 负点只约束当前预览，不产生持久化排除区域。
 
 草稿只在当前插件会话中保留。切换影像或关闭插件前，未导出的草稿会提示将丢失。可直接走 AI-only、推理-only 或混合编辑流程；导出时 Raster 写出参考影像网格上的 0/1 tiled BigTIFF，Shapefile 和 DXF 只包含公开字段，不会泄露 `origin`、`run_id` 或 `feature_uuid`。
+
+每次 AI 追加、原生编辑提交或模型融合都会先生成并校验新的 GeoPackage generation；只有成功后才复用同一个可见草稿图层切换数据源，失败或取消会保留上一版草稿。

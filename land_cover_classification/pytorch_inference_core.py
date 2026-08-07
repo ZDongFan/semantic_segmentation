@@ -346,38 +346,6 @@ def build_model(bundle, device_cfg):
     return model
 
 
-def _apply_array_preprocess(image, flags):
-    enabled = flags or {}
-    if not any(enabled.values()):
-        return image
-    import cv2
-    import numpy as np
-
-    arr = image
-    channels_first = arr.ndim == 3 and arr.shape[0] <= 16
-    if channels_first:
-        arr = np.moveaxis(arr, 0, -1)
-    arr = np.ascontiguousarray(arr)
-
-    if enabled.get("clahe"):
-        op = cv2.createCLAHE(clipLimit=2, tileGridSize=(8, 8))
-        if arr.ndim == 2:
-            arr = op.apply(arr.astype("uint8"))
-        else:
-            arr = cv2.merge([op.apply(c.astype("uint8")) for c in cv2.split(arr)])
-    if enabled.get("sharpen"):
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.int8)
-        arr = cv2.filter2D(arr, -1, kernel)
-    if enabled.get("median"):
-        arr = cv2.medianBlur(arr, 3)
-    if enabled.get("gaussian"):
-        arr = cv2.GaussianBlur(arr, (3, 3), 0, 0)
-
-    if channels_first and arr.ndim == 3:
-        arr = np.moveaxis(arr, -1, 0)
-    return arr
-
-
 def _normalize_image(image, preprocess):
     import numpy as np
 
@@ -399,7 +367,7 @@ def _normalize_image(image, preprocess):
     return arr
 
 
-def read_image(image_path, preprocess_flags=None, preprocess=None, window=None):
+def read_image(image_path, preprocess=None, window=None):
     """读取一个有限影像窗口，返回数组、局部 profile、transform 与 CRS。"""
     import rasterio
 
@@ -415,7 +383,6 @@ def read_image(image_path, preprocess_flags=None, preprocess=None, window=None):
         height=int(window.height),
         transform=transform,
     )
-    image = _apply_array_preprocess(image, preprocess_flags or {})
     image = _normalize_image(image, preprocess or {})
     return image, profile, transform, crs
 

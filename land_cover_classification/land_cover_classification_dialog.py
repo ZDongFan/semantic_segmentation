@@ -1061,7 +1061,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return []
 
     def _start_inference_process(
-            self, model_path, input_path, dem_path, flags, georef, roi=None):
+            self, model_path, input_path, dem_path, georef, roi=None):
         self._process_error_message = ""
         self._process_error_details = []
         self._process_error_traceback = ""
@@ -1077,7 +1077,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "input_path": input_path,
             "output_path": self._label_path,
             "dem_path": dem_path,
-            "preprocess_flags": flags,
             "postprocess_overrides": {},
         }
         if roi:
@@ -1753,12 +1752,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "model_path": model_path,
             "input_path": input_path,
             "dem_path": dem_path,
-            "flags": {
-                "clahe": self.claheCheck.isChecked(),
-                "sharpen": self.sharpenCheck.isChecked(),
-                "median": self.medianCheck.isChecked(),
-                "gaussian": self.gaussianCheck.isChecked(),
-            },
             "georef": is_georeferenced(input_path),
         }
 
@@ -1857,13 +1850,12 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         model_path = context["model_path"]
         input_path = context["input_path"]
         dem_path = context["dem_path"]
-        flags = context["flags"]
         georef = context["georef"]
         self._class_labels = self._read_class_labels(model_path)
         self._input_layer = self._resolve_input_layer()
         self._input_path = input_path
         self._start_inference_process(
-            model_path, input_path, dem_path, flags, georef,
+            model_path, input_path, dem_path, georef,
             context.get("roi"))
     def _on_export_raster(self):
         if not self._draft_session.is_active or not self._layer_is_usable(

@@ -124,56 +124,6 @@
         </widget>
        </item>
        <item>
-        <widget class="QGroupBox" name="preprocessGroup">
-         <property name="title">
-          <string>预处理(按顺序应用)</string>
-         </property>
-         <layout class="QHBoxLayout" name="preprocessLayout">
-          <item>
-           <widget class="QCheckBox" name="claheCheck">
-            <property name="text">
-             <string>CLAHE 直方图均衡</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QCheckBox" name="sharpenCheck">
-            <property name="text">
-             <string>锐化</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QCheckBox" name="medianCheck">
-            <property name="text">
-             <string>中值滤波</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QCheckBox" name="gaussianCheck">
-            <property name="text">
-             <string>高斯滤波</string>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <spacer name="preprocessSpacer">
-            <property name="orientation">
-             <enum>Qt::Horizontal</enum>
-            </property>
-            <property name="sizeHint" stdset="0">
-             <size>
-              <width>40</width>
-              <height>20</height>
-             </size>
-            </property>
-           </spacer>
-          </item>
-         </layout>
-        </widget>
-       </item>
-       <item>
         <widget class="QGroupBox" name="progressGroup">
          <property name="title">
           <string>推理进度</string>
