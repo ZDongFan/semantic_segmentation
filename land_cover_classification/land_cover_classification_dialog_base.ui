@@ -113,7 +113,7 @@
           <item row="4" column="0">
            <widget class="QLabel" name="demFileLabel">
             <property name="text">
-             <string>DEM 文件（必选）</string>
+             <string>DEM 文件（可选）</string>
             </property>
            </widget>
           </item>

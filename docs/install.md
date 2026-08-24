@@ -144,7 +144,7 @@ land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt
 
 1. 重启 QGIS。
 2. 启用 `LandCoverClassification` 插件。
-3. 在“模型推理”页签选择输入影像、对应 DEM 文件和 PyTorch bundle，再执行全图推理。
+3. 在“模型推理”页签选择输入影像和 PyTorch bundle；DEM 文件可不选，也可只覆盖目标范围的一部分，再执行全图推理。
 4. 如需仅处理当前视图，可在“草稿编辑”页签使用“按当前画布范围推理”；该功能要求输入影像具有有效地理参考，且当前画布与影像存在有效交集。
 
 ## 会话草稿说明

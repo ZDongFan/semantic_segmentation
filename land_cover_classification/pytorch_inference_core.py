@@ -596,6 +596,15 @@ def _use_dual_inputs(model, bundle):
     return _model_expects_dem(model)
 
 
+def _model_uses_dem(model, bundle):
+    """区分模型 DEM 输入能力与后处理 DEM 规则是否启用。"""
+    use_dual = _use_dual_inputs(model, bundle)
+    if "use_dem_factors" in bundle.manifest:
+        return bool(bundle.manifest.get("use_dem_factors")) or use_dual
+    model_cfg = _model_config(bundle)
+    return use_dual or int(model_cfg.get("dem_in_channels", 0) or 0) > 0
+
+
 def _dem_channel_names(bundle, factor_cfg):
     model_cfg = _model_config(bundle)
     dem_channels = int(model_cfg.get("dem_in_channels", 0) or 0)
@@ -605,6 +614,17 @@ def _dem_channel_names(bundle, factor_cfg):
     if dem_channels > 0:
         return names[:dem_channels]
     return names
+
+
+def _dem_channel_count(bundle, factor_cfg, use_dem=True):
+    """返回模型实际需要的 DEM 通道数；未使用 DEM 的单输入模型返回 0。"""
+    if not use_dem:
+        return 0
+    model_cfg = _model_config(bundle)
+    declared = int(model_cfg.get("dem_in_channels", 0) or 0)
+    if declared > 0:
+        return declared
+    return len(_dem_channel_names(bundle, factor_cfg))
 
 
 def _factor_arrays(factors, bundle, factor_cfg):
@@ -654,6 +674,39 @@ def _apply_active_dem_channels(dem_stack, names, preprocess):
     return arr
 
 
+def _prepare_dem_stack(factors, bundle, factor_cfg, shape, valid_mask=None,
+                       use_dem=True):
+    """构造归一化 DEM 输入；无效区域统一使用归一化后的零值。"""
+    import numpy as np
+
+    channel_count = _dem_channel_count(bundle, factor_cfg, use_dem=use_dem)
+    height, width = shape
+    if channel_count == 0:
+        return np.zeros((0, height, width), dtype="float32")
+    names = _dem_channel_names(bundle, factor_cfg)
+    if factors is None:
+        dem_stack = np.zeros((channel_count, height, width), dtype="float32")
+    else:
+        factor_dict = _factors_to_dict(factors, factor_cfg)
+        missing = [name for name in names[:channel_count] if name not in factor_dict]
+        if missing:
+            raise ValueError("DEM 因子缺少模型需要的通道: {}".format(", ".join(missing)))
+        dem_stack = np.stack([
+            np.asarray(factor_dict[name], dtype="float32")
+            for name in names[:channel_count]
+        ], axis=0)
+        dem_stack = _normalize_dem_stack(dem_stack, bundle.preprocess)
+        dem_stack = _apply_active_dem_channels(
+            dem_stack, names[:channel_count], bundle.preprocess)
+        dem_stack = np.nan_to_num(dem_stack, nan=0.0, posinf=0.0, neginf=0.0)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != (height, width):
+            raise ValueError("DEM 有效掩膜尺寸与影像不一致。")
+        dem_stack = np.where(valid[None, ...], dem_stack, 0.0)
+    return dem_stack.astype("float32", copy=False)
+
+
 def _build_model_inputs(image_tile, dem_tile, use_dual_inputs, device):
     import numpy as np
     import torch
@@ -683,24 +736,18 @@ def _amp_autocast(torch_module):
 
 
 def sliding_window_predict(model, image, factors, bundle, device_cfg,
-                           progress_callback=None):
+                           progress_callback=None, valid_mask=None):
     """单块输入适配回归；生产推理由 pytorch_streaming 直接写窗口。"""
     import numpy as np
     import torch
 
     factor_cfg = _factor_config(bundle)
     use_dual_inputs = _use_dual_inputs(model, bundle)
-    use_dem_factors = bool(bundle.manifest.get("use_dem_factors", True)) or use_dual_inputs
-    factor_arrays = _factor_arrays(factors, bundle, factor_cfg) if use_dem_factors else []
-    if not factor_arrays and not use_dual_inputs:
-        dem_stack = np.zeros((0, image.shape[1], image.shape[2]), dtype="float32")
-    elif factor_arrays:
-        dem_stack = np.stack(factor_arrays, axis=0).astype("float32")
-        dem_stack = _normalize_dem_stack(dem_stack, bundle.preprocess)
-        dem_stack = _apply_active_dem_channels(
-            dem_stack, _dem_channel_names(bundle, factor_cfg), bundle.preprocess)
-    else:
-        raise ValueError("当前模型需要 DEM 输入，但 bundle 没有提供 DEM 因子通道。")
+    use_dem_factors = _model_uses_dem(model, bundle)
+    dem_stack = _prepare_dem_stack(
+        factors if use_dem_factors else None,
+        bundle, factor_cfg, image.shape[1:], valid_mask=valid_mask,
+        use_dem=use_dem_factors or use_dual_inputs)
 
     image = image.astype("float32", copy=False)
     _, height, width = image.shape
@@ -928,8 +975,9 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
     import numpy as np
 
     config = dict(postprocess_config or {})
+    runtime_metadata = dict(runtime_metadata or {})
     validate_postprocess_contract(config)
-    factor_dict = _factors_to_dict(factors, config)
+    factor_dict = {} if factors is None else _factors_to_dict(factors, config)
     threshold = _postprocess_threshold(config)
     prob_arr = np.asarray(prob_map, dtype="float32")
     if prob_arr.size > 16 * 1024 * 1024:
@@ -1006,9 +1054,16 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
 
         if filled_mask is not None:
             fill_fraction = float(filled_mask[comp_mask].mean())
+            valid_fraction = 1.0 - fill_fraction
             component["dem_fill_fraction"] = fill_fraction
-            if fill_fraction > 0.5:
-                component["rules_skipped"] = "dem_fill_fraction_gt_0.5"
+            component["dem_valid_fraction"] = valid_fraction
+            if valid_fraction < 0.5 and any(
+                    rule_cfg["enabled"] for _, rule_cfg in ordered_rules):
+                usage_mode = (runtime_metadata or {}).get("dem_usage", {}).get("mode")
+                component["rules_skipped"] = {
+                    "not_provided": "dem_not_provided",
+                    "no_coverage": "dem_no_coverage",
+                }.get(usage_mode, "dem_valid_fraction_lt_0.5")
                 output[comp_mask] = 1
                 kept += 1
                 _record_decision(component, "keep")
@@ -1057,7 +1112,6 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
         components.append(component)
         LOG.info("KEEP comp_id=%s area_m2=%.3f", comp_id, area_m2)
 
-    runtime_metadata = dict(runtime_metadata or {})
     summary = {
         "schema_version": SUPPORTED_SCHEMA_VERSION,
         "contract": "explicit_dem_factors_v3",
@@ -1065,6 +1119,7 @@ def apply_postprocess(prob_map, factors, transform=None, filled_mask=None,
         "training_data": config["training_data"],
         "runtime_resolution": runtime_metadata.get("runtime_resolution", {}),
         "resolution_warnings": runtime_metadata.get("resolution_warnings", []),
+        "dem_usage": runtime_metadata.get("dem_usage", {}),
         "rules": _rules_contract_summary(config),
         "rule_order": [name for name, _rule_cfg in ordered_rules],
         "threshold": threshold,

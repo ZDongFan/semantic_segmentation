@@ -260,6 +260,10 @@ def _align_dem_window(dem_src, dst_crs, dst_transform, height, width):
     width = int(width)
     if height <= 0 or width <= 0 or height * width > 16 * 1024 * 1024:
         raise ValueError("DEM destination 必须是有限的局部窗口。")
+    if dem_src.crs is None:
+        raise ValueError("DEM 缺少 CRS，无法与输入影像对齐。")
+    if dst_crs is None:
+        raise ValueError("输入影像缺少 CRS，无法对齐 DEM。")
     destination = np.full((height, width), np.nan, dtype="float32")
     left = float(dst_transform.c)
     top = float(dst_transform.f)
@@ -281,13 +285,15 @@ def _align_dem_window(dem_src, dst_crs, dst_transform, height, width):
     try:
         source_window = source_window.intersection(
             Window(0, 0, dem_src.width, dem_src.height))
-    except Exception as exc:
-        raise ValueError("当前推理块与 DEM 没有空间重叠。") from exc
+    except Exception:
+        return destination, np.ones((height, width), dtype=bool)
+    if source_window.width <= 0 or source_window.height <= 0:
+        return destination, np.ones((height, width), dtype=bool)
+
     source_masked = dem_src.read(1, window=source_window, masked=True)
-    # rasterio.warp.reproject 对 MaskedArray 的处理会随 rasterio/GDAL 版本变化；
-    # 某些版本会把本来有效的局部 DEM 窗口重投影成全 NoData。统一转换为
-    # 带 NaN NoData 的普通 float32 数组，保持局部内存边界且避免版本差异。
     source = source_masked.astype("float32").filled(np.nan)
+    if not np.isfinite(source).any():
+        return destination, np.ones((height, width), dtype=bool)
     reproject(
         source=source,
         destination=destination,
@@ -301,45 +307,45 @@ def _align_dem_window(dem_src, dst_crs, dst_transform, height, width):
     )
     filled = ~np.isfinite(destination)
     if filled.all():
-        raise ValueError(
-            "当前推理块范围内未获得有效 DEM 高程；空间范围可能相交，"
-            "但交叠区域可能全为 NoData，或 DEM 重投影失败。")
+        return destination, filled
     if filled.any():
         from scipy import ndimage
-        nearest = ndimage.distance_transform_edt(filled, return_distances=False, return_indices=True)
+        nearest = ndimage.distance_transform_edt(
+            filled, return_distances=False, return_indices=True)
         destination = destination[tuple(nearest)]
     return destination.astype("float32", copy=False), filled
 
 
-def _predict_probability(model, image, factors, bundle, device_cfg, tile_size):
-    import numpy as np
+def _use_dual_inputs_for_runtime(model, bundle):
+    from land_cover_classification.pytorch_inference_core import _use_dual_inputs
+    return _use_dual_inputs(model, bundle)
+
+
+def _predict_probability(model, image, factors, bundle, device_cfg, tile_size,
+                         dem_valid_mask=None):
     import torch
     from land_cover_classification.pytorch_inference_core import (
-        _apply_active_dem_channels,
         _amp_autocast,
         _build_model_inputs,
-        _dem_channel_names,
         _extract_logits,
         _factor_config,
-        _factors_to_dict,
         _forward_model,
-        _normalize_dem_stack,
         _pad_tile,
-        _use_dual_inputs,
+        _prepare_dem_stack,
+        _model_uses_dem,
     )
 
     factor_cfg = _factor_config(bundle)
-    factor_dict = _factors_to_dict(factors, factor_cfg)
-    names = _dem_channel_names(bundle, factor_cfg)
-    dem_stack = np.stack([factor_dict[name] for name in names]).astype("float32")
-    dem_stack = _normalize_dem_stack(dem_stack, bundle.preprocess)
-    dem_stack = _apply_active_dem_channels(dem_stack, names, bundle.preprocess)
+    use_dual_inputs = _use_dual_inputs(model, bundle)
+    use_dem = _model_uses_dem(model, bundle)
+    dem_stack = _prepare_dem_stack(
+        factors, bundle, factor_cfg, image.shape[1:],
+        valid_mask=dem_valid_mask, use_dem=use_dem)
     original_height, original_width = image.shape[1:]
     image = _pad_tile(image.astype("float32", copy=False), tile_size)
     dem_stack = _pad_tile(dem_stack, tile_size)
     inputs = _build_model_inputs(
-        image, dem_stack,
-        _use_dual_inputs(model, bundle), device_cfg["device"])
+        image, dem_stack, use_dual_inputs, device_cfg["device"])
     if device_cfg["use_amp"]:
         with _amp_autocast(torch):
             logits = _forward_model(model, inputs)
@@ -349,7 +355,9 @@ def _predict_probability(model, image, factors, bundle, device_cfg, tile_size):
     class_id = int(bundle.landslide_class_id)
     if class_id >= probabilities.shape[1]:
         raise ValueError("landslide_class_id 超出模型输出通道数。")
-    return probabilities[0, class_id, :original_height, :original_width].detach().cpu().numpy().astype("float32")
+    return probabilities[
+        0, class_id, :original_height, :original_width
+    ].detach().cpu().numpy().astype("float32")
 
 
 def _initialize_roi_outputs(
@@ -370,6 +378,7 @@ def _initialize_roi_outputs(
 def _write_probability_raster(params, bundle, model, device_cfg, probability_path,
                               dem_filled_path, valid_data_path,
                               progress_callback=None):
+    import contextlib
     import numpy as np
     import rasterio
     import torch
@@ -384,8 +393,14 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
     )
 
     config = _merge_postprocess_config(bundle, params.get("postprocess_overrides") or {})
-    with rasterio.open(params["input_path"]) as image_src, rasterio.open(params["dem_path"]) as dem_src:
-        factor_radius = _factor_radius(config, image_src.transform, core_crs_unit(image_src.crs))
+    dem_path = params.get("dem_path") or None
+    with contextlib.ExitStack() as stack:
+        image_src = stack.enter_context(rasterio.open(params["input_path"]))
+        dem_src = stack.enter_context(rasterio.open(dem_path)) if dem_path else None
+        factor_radius = (
+            _factor_radius(config, image_src.transform, core_crs_unit(image_src.crs))
+            if dem_src else 0
+        )
         tile_size = int(
             params.get("tile_size")
             or bundle.manifest.get("input_size")
@@ -397,12 +412,12 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
             0, 0, image_src.width, image_src.height)
         plan = build_window_plan(
             int(inference_window.width), int(inference_window.height),
-            tile_size,
-            overlap,
-            factor_radius,
-        )
+            tile_size, overlap, factor_radius)
         profile = _output_profile(image_src.profile, "float32", nodata=np.nan)
         mask_profile = _output_profile(image_src.profile, "uint8", nodata=0)
+        valid_pixel_count = 0
+        dem_valid_pixel_count = 0
+        fallback_pixel_count = 0
         with rasterio.open(probability_path, "w", **profile) as probability_dst, \
                 rasterio.open(dem_filled_path, "w", **mask_profile) as dem_filled_dst, \
                 rasterio.open(valid_data_path, "w", **mask_profile) as valid_data_dst:
@@ -421,31 +436,79 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
                     image = np.asarray(image_masked.filled(0))
                     image = _normalize_image(image, bundle.preprocess)
                     transform = window_transform(expanded, image_src.transform)
-                    dem, filled = _align_dem_window(
-                        dem_src, image_src.crs, transform,
-                        int(expanded.height), int(expanded.width))
+                    if dem_src is not None:
+                        dem, filled = _align_dem_window(
+                            dem_src, image_src.crs, transform,
+                            int(expanded.height), int(expanded.width))
+                        dem_valid = ~filled
+                    else:
+                        dem = None
+                        filled = np.ones(
+                            (int(expanded.height), int(expanded.width)), dtype=bool)
+                        dem_valid = np.zeros_like(filled, dtype=bool)
                     if not dem_stage_reported and progress_callback is not None:
-                        progress_callback("dem", 1, 1)
+                        progress_callback(
+                            "dem", 1, 1,
+                            status=("未选择 DEM，使用中性输入"
+                                    if dem_src is None else "正在对齐 DEM"))
                         dem_stage_reported = True
-                    raw_factors = compute_dem_factors(
-                        bundle, dem, transform, config, core_crs_unit(image_src.crs))
-                    factors = _factors_to_dict(raw_factors, _factor_config(bundle, config))
+                    factors = None
+                    model_uses_dem = (
+                        _model_uses_dem(model, bundle))
+                    rules_use_dem = any(
+                        rule_cfg.get("enabled")
+                        for rule_cfg in (config.get("rules") or {}).values())
+                    if dem_valid.any() and (model_uses_dem or rules_use_dem):
+                        raw_factors = compute_dem_factors(
+                            bundle, dem, transform, config,
+                            core_crs_unit(image_src.crs))
+                        factors = _factors_to_dict(
+                            raw_factors, _factor_config(bundle, config))
                     probability = _predict_probability(
-                        model, image, factors, bundle, device_cfg, plan.tile_size)
+                        model, image, factors, bundle, device_cfg, plan.tile_size,
+                        dem_valid_mask=dem_valid)
                     core_probability = _crop_to_core(probability, expanded, core)
                     core_valid = _crop_to_core(valid, expanded, core)
                     core_filled = _crop_to_core(filled, expanded, core)
-                    core_probability = np.where(core_valid, core_probability, np.nan).astype("float32")
+                    core_dem_valid = _crop_to_core(dem_valid, expanded, core)
+                    core_probability = np.where(
+                        core_valid, core_probability, np.nan).astype("float32")
+                    core_filled = np.asarray(core_filled, dtype=bool)
+                    core_dem_valid &= core_valid
                     probability_dst.write(core_probability, 1, window=core)
                     dem_filled_dst.write(core_filled.astype("uint8"), 1, window=core)
                     valid_data_dst.write(core_valid.astype("uint8"), 1, window=core)
+                    valid_pixel_count += int(core_valid.sum())
+                    dem_valid_pixel_count += int(core_dem_valid.sum())
+                    fallback_pixel_count += int((core_valid & ~core_dem_valid).sum())
                     done += 1
                     if progress_callback is not None:
                         progress_callback("predict", done, plan.block_count)
-        dem_info = {
-            "resolution": float(sum(abs(value) for value in dem_src.res) / 2.0)
-            if core_crs_unit(dem_src.crs) == "m" else None,
-            "crs_unit": core_crs_unit(dem_src.crs),
+        if dem_src is None:
+            dem_info = None
+            mode = "not_provided"
+        elif dem_valid_pixel_count == 0:
+            dem_info = {
+                "resolution": None,
+                "crs_unit": core_crs_unit(dem_src.crs),
+            }
+            mode = "no_coverage"
+        else:
+            dem_info = {
+                "resolution": float(sum(abs(value) for value in dem_src.res) / 2.0)
+                if core_crs_unit(dem_src.crs) == "m" else None,
+                "crs_unit": core_crs_unit(dem_src.crs),
+            }
+            mode = "partial_coverage" if fallback_pixel_count else "full_coverage"
+        dem_usage = {
+            "mode": mode,
+            "fallback": "normalized_zero",
+            "valid_pixel_count": int(dem_valid_pixel_count),
+            "fallback_pixel_count": int(fallback_pixel_count),
+            "valid_fraction": (
+                float(dem_valid_pixel_count) / float(valid_pixel_count)
+                if valid_pixel_count else 0.0),
+            "component_rule_min_valid_fraction": 0.5,
         }
         inference_audit = {
             "mode": "canvas_intersection" if roi_window is not None else "full_image",
@@ -454,7 +517,7 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
             "pixel_window": _window_audit(roi_window),
             "halo": plan.halo,
         }
-        return image_src.profile.copy(), config, dem_info, plan, inference_audit
+        return image_src.profile.copy(), config, dem_info, plan, inference_audit, dem_usage
 
 
 def _stream_binary_operation(source_path, output_path, operation, halo,
@@ -863,6 +926,7 @@ def _component_rule_statistics(labels_path, roots, dem_filled_path, params, bund
     ordered_rules = _ordered_rule_items(config)
     enabled_rules = [(name, rule) for name, rule in ordered_rules if rule["enabled"]]
     fill_counts = {}
+    valid_counts = {}
     pixel_counts = {}
     aggregates = {}
     median_rules = [(name, rule) for name, rule in enabled_rules if rule["stat"] == "median"]
@@ -872,110 +936,132 @@ def _component_rule_statistics(labels_path, roots, dem_filled_path, params, bund
         database.execute("PRAGMA journal_mode=OFF")
         database.execute("PRAGMA synchronous=OFF")
         database.execute("CREATE TABLE values_table (root INTEGER, rule TEXT, value REAL)")
-
-    with rasterio.open(labels_path) as labels_src, \
-            rasterio.open(dem_filled_path) as filled_src, \
-            rasterio.open(params["input_path"]) as image_src, \
-            rasterio.open(params["dem_path"]) as dem_src:
-        factor_radius = _factor_radius(config, image_src.transform, _crs_unit(image_src.crs))
-        total_windows = _window_count(
-            labels_src.width, labels_src.height, DEFAULT_BLOCK_SIZE)
-        stats_pass_count = 2 if median_rules else 1
-        for done, core in enumerate(
-                _windows(labels_src.width, labels_src.height, DEFAULT_BLOCK_SIZE), 1):
-            labels = _map_roots(labels_src.read(1, window=core), roots)
-            component_roots = np.unique(labels[labels > 0])
-            if not component_roots.size:
-                if progress_callback is not None:
-                    progress_callback(done, total_windows, 0, stats_pass_count)
-                continue
-            filled = filled_src.read(1, window=core).astype(bool)
-            for root in component_roots:
-                component_mask = labels == root
-                root = int(root)
-                count = int(component_mask.sum())
-                pixel_counts[root] = pixel_counts.get(root, 0) + count
-                fill_counts[root] = fill_counts.get(root, 0) + int(filled[component_mask].sum())
-            if not enabled_rules:
-                if progress_callback is not None:
-                    progress_callback(done, total_windows, 0, stats_pass_count)
-                continue
-            expanded = _expand_window(core, factor_radius, image_src.width, image_src.height)
-            transform = window_transform(expanded, image_src.transform)
-            dem, _unused_filled = _align_dem_window(
-                dem_src, image_src.crs, transform,
-                int(expanded.height), int(expanded.width))
-            raw_factors = compute_dem_factors(
-                bundle, dem, transform, config, _crs_unit(image_src.crs))
-            factors = _factors_to_dict(raw_factors, _factor_config(bundle, config))
-            core_factors = {
-                name: _crop_to_core(array, expanded, core)
-                for name, array in factors.items()
-            }
-            for root_value in component_roots:
-                root = int(root_value)
-                component_mask = labels == root
-                for rule_name, rule in enabled_rules:
-                    values = np.asarray(core_factors[str(rule["factor"])][component_mask])
-                    values = values[np.isfinite(values)]
-                    if not values.size:
-                        continue
-                    stat = str(rule["stat"])
-                    key = (root, rule_name)
-                    if stat == "mean":
-                        item = aggregates.setdefault(key, {"sum": 0.0, "count": 0})
-                        item["sum"] += float(values.sum(dtype="float64"))
-                        item["count"] += int(values.size)
-                    elif stat == "min":
-                        value = float(values.min())
-                        aggregates[key] = value if key not in aggregates else min(aggregates[key], value)
-                    elif stat == "max":
-                        value = float(values.max())
-                        aggregates[key] = value if key not in aggregates else max(aggregates[key], value)
-                    elif stat == "median":
-                        database.executemany(
-                            "INSERT INTO values_table(root, rule, value) VALUES (?, ?, ?)",
-                            ((root, rule_name, float(value)) for value in values),
-                        )
-            if progress_callback is not None:
-                progress_callback(done, total_windows, 0, stats_pass_count)
-    observed = {}
-    for key, aggregate in aggregates.items():
-        if isinstance(aggregate, dict):
-            observed[key] = aggregate["sum"] / aggregate["count"] if aggregate["count"] else None
-        else:
-            observed[key] = aggregate
-    if database is not None:
-        database.execute("CREATE INDEX values_lookup ON values_table(root, rule, value)")
-        total_roots = max(1, len(pixel_counts))
-        for done, root in enumerate(pixel_counts, 1):
-            for rule_name, _rule in median_rules:
-                count = database.execute(
-                    "SELECT COUNT(*) FROM values_table WHERE root=? AND rule=?",
-                    (root, rule_name)).fetchone()[0]
-                if not count:
-                    observed[(root, rule_name)] = None
+    dem_path = params.get("dem_path") or None
+    with rasterio.open(labels_path) as labels_src,             rasterio.open(dem_filled_path) as filled_src,             rasterio.open(params["input_path"]) as image_src:
+        dem_src = rasterio.open(dem_path) if dem_path and enabled_rules else None
+        try:
+            factor_radius = (
+                _factor_radius(config, image_src.transform, _crs_unit(image_src.crs))
+                if dem_src else 0)
+            total_windows = _window_count(
+                labels_src.width, labels_src.height, DEFAULT_BLOCK_SIZE)
+            stats_pass_count = 2 if median_rules else 1
+            for done, core in enumerate(
+                    _windows(labels_src.width, labels_src.height, DEFAULT_BLOCK_SIZE), 1):
+                labels = _map_roots(labels_src.read(1, window=core), roots)
+                component_roots = np.unique(labels[labels > 0])
+                if not component_roots.size:
+                    if progress_callback is not None:
+                        progress_callback(done, total_windows, 0, stats_pass_count)
                     continue
-                offset = (count - 1) // 2
-                limit = 2 if count % 2 == 0 else 1
-                rows = database.execute(
-                    "SELECT value FROM values_table WHERE root=? AND rule=? "
-                    "ORDER BY value LIMIT ? OFFSET ?",
-                    (root, rule_name, limit, offset)).fetchall()
-                observed[(root, rule_name)] = sum(row[0] for row in rows) / len(rows)
-            if progress_callback is not None:
-                progress_callback(done, total_roots, 1, 2)
-        if progress_callback is not None and not pixel_counts:
-            progress_callback(1, 1, 1, 2)
-        database.close()
+                filled = filled_src.read(1, window=core).astype(bool)
+                dem_valid = ~filled
+                for root in component_roots:
+                    component_mask = labels == root
+                    root = int(root)
+                    count = int(component_mask.sum())
+                    pixel_counts[root] = pixel_counts.get(root, 0) + count
+                    fill_counts[root] = fill_counts.get(root, 0) + int(
+                        filled[component_mask].sum())
+                    valid_counts[root] = valid_counts.get(root, 0) + int(
+                        dem_valid[component_mask].sum())
+                if not enabled_rules or dem_src is None:
+                    if progress_callback is not None:
+                        progress_callback(done, total_windows, 0, stats_pass_count)
+                    continue
+                expanded = _expand_window(core, factor_radius,
+                                          image_src.width, image_src.height)
+                transform = window_transform(expanded, image_src.transform)
+                dem, aligned_filled = _align_dem_window(
+                    dem_src, image_src.crs, transform,
+                    int(expanded.height), int(expanded.width))
+                aligned_valid = ~aligned_filled
+                if not aligned_valid.any():
+                    if progress_callback is not None:
+                        progress_callback(done, total_windows, 0, stats_pass_count)
+                    continue
+                raw_factors = compute_dem_factors(
+                    bundle, dem, transform, config, _crs_unit(image_src.crs))
+                factors = _factors_to_dict(raw_factors, _factor_config(bundle, config))
+                core_factors = {
+                    name: _crop_to_core(array, expanded, core)
+                    for name, array in factors.items()
+                }
+                core_dem_valid = _crop_to_core(aligned_valid, expanded, core)
+                for root_value in component_roots:
+                    root = int(root_value)
+                    component_mask = labels == root
+                    for rule_name, rule in enabled_rules:
+                        values = np.asarray(
+                            core_factors[str(rule["factor"])][
+                                component_mask & core_dem_valid])
+                        values = values[np.isfinite(values)]
+                        if not values.size:
+                            continue
+                        stat = str(rule["stat"])
+                        key = (root, rule_name)
+                        if stat == "mean":
+                            item = aggregates.setdefault(key, {"sum": 0.0, "count": 0})
+                            item["sum"] += float(values.sum(dtype="float64"))
+                            item["count"] += int(values.size)
+                        elif stat == "min":
+                            value = float(values.min())
+                            aggregates[key] = value if key not in aggregates else min(aggregates[key], value)
+                        elif stat == "max":
+                            value = float(values.max())
+                            aggregates[key] = value if key not in aggregates else max(aggregates[key], value)
+                        elif stat == "median":
+                            database.executemany(
+                                "INSERT INTO values_table(root, rule, value) VALUES (?, ?, ?)",
+                                ((root, rule_name, float(value)) for value in values),
+                            )
+                if progress_callback is not None:
+                    progress_callback(done, total_windows, 0, stats_pass_count)
+            observed = {}
+            for key, aggregate in aggregates.items():
+                if isinstance(aggregate, dict):
+                    observed[key] = aggregate["sum"] / aggregate["count"] if aggregate["count"] else None
+                else:
+                    observed[key] = aggregate
+            if database is not None:
+                database.execute("CREATE INDEX values_lookup ON values_table(root, rule, value)")
+                total_roots = max(1, len(pixel_counts))
+                for done, root in enumerate(pixel_counts, 1):
+                    for rule_name, _rule in median_rules:
+                        count = database.execute(
+                            "SELECT COUNT(*) FROM values_table WHERE root=? AND rule=?",
+                            (root, rule_name)).fetchone()[0]
+                        if not count:
+                            observed[(root, rule_name)] = None
+                            continue
+                        offset = (count - 1) // 2
+                        limit = 2 if count % 2 == 0 else 1
+                        rows = database.execute(
+                            "SELECT value FROM values_table WHERE root=? AND rule=? "
+                            "ORDER BY value LIMIT ? OFFSET ?",
+                            (root, rule_name, limit, offset)).fetchall()
+                        observed[(root, rule_name)] = sum(row[0] for row in rows) / len(rows)
+                    if progress_callback is not None:
+                        progress_callback(done, total_roots, 1, 2)
+                if progress_callback is not None and not pixel_counts:
+                    progress_callback(1, 1, 1, 2)
+                database.close()
+        finally:
+            if dem_src is not None:
+                dem_src.close()
     fill_fraction = {
         root: float(fill_counts.get(root, 0)) / max(1, count)
         for root, count in pixel_counts.items()
     }
-    return fill_fraction, observed
+    valid_fraction = {
+        root: float(valid_counts.get(root, 0)) / max(1, count)
+        for root, count in pixel_counts.items()
+    }
+    return fill_fraction, valid_fraction, observed
 
 
-def _component_decisions(counts, pixel_area, config, fill_fraction, observed,
+def _component_decisions(counts, pixel_area, config, fill_fraction,
+                         valid_fraction, observed, dem_usage=None,
                          progress_callback=None):
     from land_cover_classification.pytorch_inference_core import (
         _compare_rule,
@@ -987,16 +1073,26 @@ def _component_decisions(counts, pixel_area, config, fill_fraction, observed,
     decisions = {}
     records = {}
     ordered_rules = _ordered_rule_items(config)
+    enabled_rules = any(rule["enabled"] for _, rule in ordered_rules)
     total_components = max(1, len(counts))
+    usage_mode = (dem_usage or {}).get("mode")
     for done, (root, count) in enumerate(counts.items(), 1):
         area = float(count * pixel_area)
         evaluations = []
         keep = True
         decision_rule = None
+        rules_skipped = None
         if area < min_area:
             keep = False
             decision_rule = "min_area"
-        elif fill_fraction.get(root, 0.0) <= 0.5:
+        elif enabled_rules and valid_fraction.get(root, 0.0) < 0.5:
+            if usage_mode == "not_provided":
+                rules_skipped = "dem_not_provided"
+            elif usage_mode == "no_coverage":
+                rules_skipped = "dem_no_coverage"
+            else:
+                rules_skipped = "dem_valid_fraction_lt_0.5"
+        else:
             for rule_name, rule in ordered_rules:
                 if not rule["enabled"]:
                     continue
@@ -1021,8 +1117,10 @@ def _component_decisions(counts, pixel_area, config, fill_fraction, observed,
         records[root] = {
             "area_m2": area,
             "fill_fraction": fill_fraction.get(root, 0.0),
+            "valid_fraction": valid_fraction.get(root, 0.0),
             "rule_evaluations": evaluations,
             "rule": decision_rule,
+            "rules_skipped": rules_skipped,
         }
         if progress_callback is not None:
             progress_callback(done, total_components)
@@ -1034,7 +1132,7 @@ def _component_decisions(counts, pixel_area, config, fill_fraction, observed,
 def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle, config,
                          temp_dir, probability_stats,
                          stage_counts, runtime_metadata, inference_audit,
-                         progress=None):
+                         dem_usage, progress=None):
     import numpy as np
     import rasterio
 
@@ -1058,7 +1156,7 @@ def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle
         profile = _output_profile(src.profile, "uint8", nodata=0)
     if progress is not None:
         progress.update("dem_rules", 0, 1)
-    fill_fraction, observed = _component_rule_statistics(
+    fill_fraction, valid_fraction, observed = _component_rule_statistics(
         labels_path, roots, dem_filled_path, params, bundle, config, temp_dir,
         progress_callback=(
             (lambda done, total, pass_index, pass_count: progress.update(
@@ -1067,8 +1165,8 @@ def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle
     if progress is not None:
         progress.update("component_decisions", 0, 1, 0, 2)
     decisions, records, min_area = _component_decisions(
-        counts, pixel_area, config, fill_fraction, observed,
-        progress_callback=(
+        counts, pixel_area, config, fill_fraction, valid_fraction, observed,
+        dem_usage=dem_usage, progress_callback=(
             (lambda done, total: progress.update(
                 "component_decisions", done, total, 0, 2))
             if progress is not None else None))
@@ -1086,6 +1184,7 @@ def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle
                 "threshold": float(config.get("threshold", 0.5)),
                 "rule_evaluations": records[root]["rule_evaluations"],
                 "dem_fill_fraction": records[root]["fill_fraction"],
+                "dem_valid_fraction": records[root]["valid_fraction"],
                 "decision": "keep" if decisions[root] else "drop",
             }
             if not decisions[root]:
@@ -1095,8 +1194,8 @@ def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle
                     component["threshold"] = min_area
                 elif records[root]["rule_evaluations"]:
                     component.update(records[root]["rule_evaluations"][-1])
-            elif records[root]["fill_fraction"] > 0.5:
-                component["rules_skipped"] = "dem_fill_fraction_gt_0.5"
+            elif records[root]["rules_skipped"]:
+                component["rules_skipped"] = records[root]["rules_skipped"]
             handle.write(json.dumps(component, ensure_ascii=False) + "\n")
             if progress is not None:
                 progress.update(
@@ -1128,6 +1227,7 @@ def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle
         "runtime_resolution": runtime_metadata.get("runtime_resolution", {}),
         "resolution_warnings": runtime_metadata.get("resolution_warnings", []),
         "inference": inference_audit,
+        "dem_usage": dem_usage,
         "rules": config.get("rules", {}),
         "rule_order": config.get("rule_order", list((config.get("rules") or {}).keys())),
         "threshold": float(config.get("threshold", 0.5)),
@@ -1175,13 +1275,14 @@ def run_streaming_inference(params, progress_callback=None):
         probability_path = os.path.join(temp_dir, "probability.tif")
         dem_filled_path = os.path.join(temp_dir, "dem_filled.tif")
         valid_data_path = os.path.join(temp_dir, "valid_data.tif")
-        image_profile, config, dem_info, plan, inference_audit = _write_probability_raster(
+        image_profile, config, dem_info, plan, inference_audit, dem_usage = _write_probability_raster(
             params, bundle, model, device_cfg, probability_path, dem_filled_path,
             valid_data_path,
             progress_callback)
         with rasterio.open(params["input_path"]) as image_src:
             runtime_metadata = _runtime_metadata(
                 config, image_src.transform, _crs_unit(image_src.crs), dem_info)
+            runtime_metadata["dem_usage"] = dem_usage
         postprocess_progress = _PostprocessProgress(progress_callback, config)
         mask_path, stage_counts, probability_stats = _morphology_pipeline(
             probability_path, config, temp_dir, valid_data_path,
@@ -1189,7 +1290,7 @@ def run_streaming_inference(params, progress_callback=None):
         summary = _finalize_components(
             mask_path, output_path, dem_filled_path, params, bundle, config,
             temp_dir, probability_stats,
-            stage_counts, runtime_metadata, inference_audit,
+            stage_counts, runtime_metadata, inference_audit, dem_usage,
             postprocess_progress)
     if progress_callback is not None:
         progress_callback("write", 1, 1)
@@ -1204,4 +1305,5 @@ def run_streaming_inference(params, progress_callback=None):
         "core_size": plan.core_size,
         "halo": plan.halo,
         "roi": inference_audit if params.get("roi") else None,
+        "dem_usage": dem_usage,
     }

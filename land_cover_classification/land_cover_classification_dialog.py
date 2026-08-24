@@ -486,7 +486,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.mDemFile.setStorageMode(QgsFileWidget.GetFile)
         self.mDemFile.setFilter("DEM 文件 (*.tif *.tiff *.vrt)")
         self.mDemFile.setDialogTitle("选择 DEM 文件")
-        self.mDemFile.setToolTip("请选择与输入影像覆盖范围相交的 DEM 文件。")
+        self.mDemFile.setToolTip("可不选择 DEM；允许只覆盖输入影像或当前画布范围的一部分。")
         last_dem_dir = settings.value("{}/last_dem_dir".format(SETTINGS_GROUP), "")
         if last_dem_dir:
             try:
@@ -549,10 +549,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _resolve_dem_path(self):
         path = self._normalize_input_path(self.mDemFile.filePath().strip())
-        if not path or not os.path.exists(path):
-            QtWidgets.QMessageBox.warning(
-                self, "缺少 DEM", "请选择对应的 DEM 文件。")
+        if not path:
             return None
+        if not os.path.isfile(path) or not os.access(path, os.R_OK):
+            self._warn("DEM 文件不存在或不可读: {}".format(path))
+            return False
         QSettings().setValue(
             "{}/last_dem_dir".format(SETTINGS_GROUP), os.path.dirname(path))
         return path
@@ -1087,6 +1088,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process_error_traceback = ""
         self._process_output_buffer = b""
         self._process_diagnostics = BoundedDiagnostics()
+        self._dem_usage = None
         if not self._draft_session.is_active:
             raise RuntimeError("推理会话尚未初始化。")
         self._label_path = os.path.join(
@@ -1124,8 +1126,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.progressBar.setValue(0)
         mode_label = "当前画布范围" if roi else (
             "带地理坐标" if georef else "普通图像")
+        dem_status = (
+            "未选择 DEM，使用中性输入" if not dem_path
+            else "已选择 DEM，按实际覆盖范围使用")
         self.statusLabel.setText(
-            "PyTorch 推理运行中({}模式)...".format(mode_label))
+            "PyTorch 推理运行中({}模式)：{}...".format(mode_label, dem_status))
 
         runner = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "pytorch_inference_runner.py")
@@ -1277,6 +1282,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._process_error_traceback = payload.get("traceback", "")
         elif event == "done":
             self._label_path = payload.get("label_path", self._label_path)
+            self._dem_usage = payload.get("dem_usage") or None
 
     def _inference_error_text(self, exit_code):
         message = self._process_error_message
@@ -1346,9 +1352,21 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.exportRasterBtn.setEnabled(True)
         self.undoFusionBtn.setEnabled(True)
         self._switch_to_draft_tab()
-        self.statusLabel.setText("推理结果已融合到会话草稿，可继续 AI 或原生编辑。")
+        usage = self._dem_usage or {}
+        mode = usage.get("mode")
+        if mode == "not_provided":
+            dem_text = "未选择 DEM，已使用中性输入"
+        elif mode == "no_coverage":
+            dem_text = "DEM 无有效覆盖，已使用中性输入"
+        elif mode in ("partial_coverage", "full_coverage"):
+            dem_text = "DEM 有效覆盖 {:.1%}".format(
+                float(usage.get("valid_fraction", 0.0)))
+        else:
+            dem_text = "DEM 使用情况未知"
+        message = "推理结果已融合到会话草稿；{}。".format(dem_text)
+        self.statusLabel.setText(message)
         self.iface.messageBar().pushSuccess(
-            "地物分类", "最新推理已融合，人工和 AI 草稿区域保持优先。")
+            "地物分类", "{} 人工和 AI 草稿区域保持优先。".format(message))
 
     def _merge_inference_candidate_with_retry(self, candidate_path, run_id):
         """在原草稿保持不变的前提下自动重试候选融合和发布。"""
@@ -1757,7 +1775,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._warn("当前工作影像未成功加载。")
             return None
         dem_path = self._resolve_dem_path()
-        if not dem_path:
+        if dem_path is False:
             return None
         try:
             manifest = get_model_info(model_path)

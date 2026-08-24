@@ -80,7 +80,7 @@ def compute_factors(dem_array, transform, dem_factors, crs_unit):
 当 `postprocess.json.dem_factors.*.scale_mode` 为 `meters` 时，输入影像 CRS 单位必须为米制，`dem_factors.py` 应按 `window_m / 像素大小` 换算窗口像素数，而不是写死固定像素窗口。
 ## DEM 后处理规则
 
-PyTorch 推理必须同时选择与输入影像覆盖范围相交的 DEM 文件。插件按窗口把 DEM 重投影到输入影像的局部格网，调用 bundle 内的 `dem_factors.py` 计算派生因子，然后执行规则后处理。错误“当前推理块范围内未获得有效 DEM 高程”表示局部输出全为 NoData；空间范围可能仍然相交，应继续检查交叠区 NoData、CRS 和重投影是否正常。
+PyTorch 推理中的 DEM 文件为可选项。未选择 DEM 时，模型 DEM 分支接收归一化后的全零中性输入；DEM 只覆盖目标范围的一部分时，覆盖区使用真实因子，缺失区使用中性输入。插件按窗口把有效 DEM 重投影到输入影像局部格网，调用 bundle 内的 `dem_factors.py` 计算派生因子，然后执行形态学和最小面积后处理。DEM 规则仅在组件真实有效覆盖率达到 50% 时执行；无覆盖、全 NoData 或低覆盖组件会记录跳过原因，但不会跳过阈值化和形态学处理。损坏文件、缺少 CRS、非法变换或真正的重投影错误仍会终止推理。
 
 `postprocess.json` 必须显式声明 DEM 因子契约、训练数据分辨率和规则结构：
 
