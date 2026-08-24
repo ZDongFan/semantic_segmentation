@@ -316,11 +316,6 @@ def _align_dem_window(dem_src, dst_crs, dst_transform, height, width):
     return destination.astype("float32", copy=False), filled
 
 
-def _use_dual_inputs_for_runtime(model, bundle):
-    from land_cover_classification.pytorch_inference_core import _use_dual_inputs
-    return _use_dual_inputs(model, bundle)
-
-
 def _predict_probability(model, image, factors, bundle, device_cfg, tile_size,
                          dem_valid_mask=None):
     import torch
@@ -333,6 +328,7 @@ def _predict_probability(model, image, factors, bundle, device_cfg, tile_size,
         _pad_tile,
         _prepare_dem_stack,
         _model_uses_dem,
+        _use_dual_inputs,
     )
 
     factor_cfg = _factor_config(bundle)
@@ -387,6 +383,7 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
         _crs_unit as core_crs_unit,
         _factor_config,
         _factors_to_dict,
+        _model_uses_dem,
         _merge_postprocess_config,
         _normalize_image,
         compute_dem_factors,
