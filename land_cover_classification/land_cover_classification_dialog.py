@@ -3139,22 +3139,59 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         return QgsGeometry.fromMultiPolygonXY(polygon_parts)
 
     def _polygon_parts_xy(self, geometry):
-        if geometry is None or geometry.isEmpty():
+        """以有界迭代方式提取 Polygon 部件，避免集合几何递归失控。"""
+        if geometry is None:
             return []
-        if QgsWkbTypes.geometryType(geometry.wkbType()) == \
-                QgsWkbTypes.PolygonGeometry:
-            if QgsWkbTypes.isMultiType(geometry.wkbType()):
-                return geometry.asMultiPolygon()
-            polygon = geometry.asPolygon()
-            return [polygon] if polygon else []
 
         parts = []
-        try:
-            children = geometry.asGeometryCollection()
-        except Exception:
-            children = []
-        for child in children:
-            parts.extend(self._polygon_parts_xy(child))
+        pending = [(geometry, set())]
+        visited = 0
+        max_nodes = 10000
+
+        while pending and visited < max_nodes:
+            current, ancestor_keys = pending.pop()
+            visited += 1
+            if current is None:
+                continue
+            try:
+                if current.isEmpty():
+                    continue
+            except Exception:
+                continue
+
+            # 只沿当前路径检测重复，避免异常集合自引用，也保留合法的重复面。
+            try:
+                key = bytes(current.asWkb())
+            except Exception:
+                key = None
+            if key is not None:
+                if key in ancestor_keys:
+                    continue
+                current_ancestor_keys = ancestor_keys | {key}
+            else:
+                current_ancestor_keys = ancestor_keys
+
+            try:
+                if QgsWkbTypes.geometryType(current.wkbType()) == \
+                        QgsWkbTypes.PolygonGeometry:
+                    if QgsWkbTypes.isMultiType(current.wkbType()):
+                        parts.extend(current.asMultiPolygon())
+                    else:
+                        polygon = current.asPolygon()
+                        if polygon:
+                            parts.append(polygon)
+                    continue
+            except Exception:
+                continue
+
+            try:
+                children = current.asGeometryCollection()
+            except Exception:
+                children = []
+            if children:
+                pending.extend(
+                    (child, current_ancestor_keys) for child in children)
+
         return parts
 
     def _coerce_ai_geometry_for_layer(self, geometry, layer, make_valid=True):
