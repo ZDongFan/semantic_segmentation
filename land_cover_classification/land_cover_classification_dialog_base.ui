@@ -29,40 +29,136 @@
          <property name="title">
           <string>模型</string>
          </property>
-         <layout class="QGridLayout" name="modelLayout">
-          <item row="0" column="0">
-           <widget class="QLabel" name="modelRootLabel">
-            <property name="text">
-             <string>模型根目录</string>
+         <layout class="QVBoxLayout" name="modelLayout">
+          <item>
+           <layout class="QHBoxLayout" name="modelRootRowLayout">
+            <property name="spacing">
+             <number>8</number>
             </property>
-           </widget>
+            <item>
+             <widget class="QLabel" name="modelRootLabel">
+              <property name="text">
+               <string>模型根目录</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QLineEdit" name="modelRootEdit"/>
+            </item>
+            <item>
+             <widget class="QToolButton" name="browseModelRootBtn">
+              <property name="text">
+               <string>...</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
           </item>
-          <item row="0" column="1" colspan="2">
-           <widget class="QLineEdit" name="modelRootEdit"/>
-          </item>
-          <item row="0" column="3">
-           <widget class="QToolButton" name="browseModelRootBtn">
-            <property name="text">
-             <string>...</string>
+          <item>
+           <layout class="QHBoxLayout" name="modelRowLayout">
+            <property name="spacing">
+             <number>8</number>
             </property>
-           </widget>
+            <item>
+             <widget class="QLabel" name="modelLabel">
+              <property name="text">
+               <string>模型</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QComboBox" name="modelCombo"/>
+            </item>
+            <item>
+             <widget class="QToolButton" name="refreshModelsBtn">
+              <property name="text">
+               <string/>
+              </property>
+             </widget>
+            </item>
+           </layout>
           </item>
-          <item row="1" column="0">
-           <widget class="QLabel" name="modelLabel">
-            <property name="text">
-             <string>模型</string>
+          <item>
+           <layout class="QHBoxLayout" name="thresholdRowLayout">
+            <property name="spacing">
+             <number>8</number>
             </property>
-           </widget>
+            <item>
+             <widget class="QLabel" name="thresholdLabel">
+              <property name="text">
+               <string>概率阈值（值越大越严格）</string>
+              </property>
+              <property name="toolTip">
+               <string>概率阈值范围为 0–1，值越大越严格。</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QSlider" name="thresholdSlider">
+              <property name="toolTip">
+               <string>概率阈值范围为 0–1，值越大越严格。</string>
+              </property>
+              <property name="maximum">
+               <number>10</number>
+              </property>
+              <property name="singleStep">
+               <number>1</number>
+              </property>
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QLabel" name="thresholdValueLabel">
+              <property name="minimumSize">
+               <size>
+                <width>30</width>
+                <height>0</height>
+               </size>
+              </property>
+              <property name="text">
+               <string>0.5</string>
+              </property>
+              <property name="alignment">
+               <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+              </property>
+             </widget>
+            </item>
+           </layout>
           </item>
-          <item row="1" column="1" colspan="2">
-           <widget class="QComboBox" name="modelCombo"/>
-          </item>
-          <item row="1" column="3">
-           <widget class="QToolButton" name="refreshModelsBtn">
-            <property name="text">
-             <string/>
+          <item>
+           <layout class="QHBoxLayout" name="minAreaRowLayout">
+            <property name="spacing">
+             <number>8</number>
             </property>
-           </widget>
+            <item>
+             <widget class="QLabel" name="minAreaLabel">
+              <property name="text">
+               <string>滑坡最小保留面积（m²）</string>
+              </property>
+              <property name="toolTip">
+               <string>面积小于该值的滑坡斑块会被过滤。</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QDoubleSpinBox" name="minAreaSpinBox">
+              <property name="toolTip">
+               <string>面积小于该值的滑坡斑块会被过滤。</string>
+              </property>
+              <property name="decimals">
+               <number>1</number>
+              </property>
+              <property name="maximum">
+               <double>1000000000000.000000000000000</double>
+              </property>
+              <property name="singleStep">
+               <double>100.000000000000000</double>
+              </property>
+             </widget>
+            </item>
+           </layout>
           </item>
          </layout>
         </widget>

@@ -12,6 +12,7 @@
  ***************************************************************************/
 """
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
+from qgis.PyQt import sip
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QDockWidget
 
@@ -164,13 +165,26 @@ class LandCoverClassification:
                 action)
             self.iface.removeToolBarIcon(action)
 
-        if self.dock is not None:
-            if self.dlg is not None:
-                self.dlg.close()
-            self.iface.mainWindow().removeDockWidget(self.dock)
-            self.dock.deleteLater()
-            self.dock = None
-            self.dlg = None
+        # QGIS 可能已先销毁关闭的 dock/对话框，卸载时只操作仍存活的 Qt 对象。
+        try:
+            dock = self.dock
+            dlg = self.dlg
+        except RuntimeError:
+            dock = None
+            dlg = None
+        self.dock = None
+        self.dlg = None
+        try:
+            dock_deleted = dock is None or sip.isdeleted(dock)
+            dlg_deleted = dlg is None or sip.isdeleted(dlg)
+        except RuntimeError:
+            dock_deleted = True
+            dlg_deleted = True
+        if not dock_deleted:
+            if not dlg_deleted:
+                dlg.close()
+            self.iface.mainWindow().removeDockWidget(dock)
+            dock.deleteLater()
 
     def _create_dock(self):
         """创建默认停靠在 QGIS 右侧的插件面板。"""
@@ -203,7 +217,14 @@ class LandCoverClassification:
         """打开插件主对话框。"""
 
         # 延迟构造对话框,只在首次使用时创建一次。
-        if self.first_start or self.dock is None:
+        try:
+            dock_deleted = self.dock is None or sip.isdeleted(self.dock)
+            dlg_deleted = self.dlg is None or sip.isdeleted(self.dlg)
+        except RuntimeError:
+            dock_deleted = True
+            dlg_deleted = True
+        if (self.first_start or self.dock is None or dock_deleted
+                or self.dlg is None or dlg_deleted):
             self.first_start = False
             self._create_dock()
 

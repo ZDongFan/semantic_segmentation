@@ -2,6 +2,7 @@
 """LandCoverClassification 对话框。"""
 
 import json
+import math
 import os
 import shutil
 import sys
@@ -337,13 +338,36 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         preferred = QtWidgets.QSizePolicy.Preferred
         fixed = QtWidgets.QSizePolicy.Fixed
         compact_widgets = (
-            self.modelRootEdit, self.modelCombo, self.layerCombo,
+            self.layerCombo,
             self.inputFileWidget, self.mDemFile, self.outputDirWidget,
             self.outputFileWidget, self.rasterFileWidget,
+            self.minAreaSpinBox,
         )
         for widget in compact_widgets:
             widget.setMinimumWidth(0)
             widget.setSizePolicy(ignored, fixed)
+
+        for widget in (self.modelRootEdit, self.modelCombo):
+            widget.setMinimumWidth(0)
+            widget.setSizePolicy(QtWidgets.QSizePolicy.Expanding, fixed)
+        self.thresholdSlider.setMinimumWidth(80)
+        self.thresholdSlider.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, fixed)
+        self.thresholdValueLabel.setFixedWidth(30)
+
+        model_label_width = max(
+            self.modelRootLabel.sizeHint().width(),
+            self.modelLabel.sizeHint().width(),
+        )
+        for label in (self.modelRootLabel, self.modelLabel):
+            label.setFixedWidth(model_label_width)
+
+        postprocess_label_width = max(
+            self.thresholdLabel.sizeHint().width(),
+            self.minAreaLabel.sizeHint().width(),
+        )
+        for label in (self.thresholdLabel, self.minAreaLabel):
+            label.setFixedWidth(postprocess_label_width)
 
         status_labels = (
             self.statusLabel, self.exportStatusLabel, self.draftStatusLabel,
@@ -472,9 +496,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.refreshModelsBtn.setToolTip("刷新模型列表")
         for button in (self.browseModelRootBtn, self.refreshModelsBtn):
             button.setFixedSize(32, 22)
-        self.modelLayout.setColumnStretch(1, 1)
-        self.modelLayout.setColumnStretch(2, 0)
-        self.modelLayout.setColumnStretch(3, 0)
+
         try:
             self.refreshModelsBtn.setAutoRaise(True)
         except AttributeError:
@@ -499,6 +521,14 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.outputFormatCombo.setItemData(2, OUTPUT_FORMAT_DXF)
         self.rasterFileWidget.setFilter("GeoTIFF 影像 (*.tif *.tiff)")
 
+        self.thresholdSlider.setRange(0, 10)
+        self.thresholdSlider.setSingleStep(1)
+        self.thresholdSlider.valueChanged.connect(
+            self._on_threshold_slider_changed)
+        self.minAreaSpinBox.setRange(0.0, 1000000000000.0)
+        self.minAreaSpinBox.setDecimals(1)
+        self.minAreaSpinBox.setSingleStep(100.0)
+
         self.layerRadio.setChecked(True)
         self.exportRasterBtn.setEnabled(False)
         self._on_input_source_changed()
@@ -507,6 +537,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.browseModelRootBtn.clicked.connect(self._on_browse_model_root)
         self.refreshModelsBtn.clicked.connect(self._refresh_models)
         self.modelRootEdit.editingFinished.connect(self._on_model_root_edited)
+        self.modelCombo.currentIndexChanged.connect(self._on_model_changed)
 
         self.layerRadio.toggled.connect(self._on_input_source_changed)
         self.fileRadio.toggled.connect(self._on_input_source_changed)
@@ -569,18 +600,99 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             env.insert(key, value)
         return env
     def _refresh_models(self):
+        self.modelCombo.blockSignals(True)
         self.modelCombo.clear()
         root = self.modelRootEdit.text().strip()
         if not root or not os.path.isdir(root):
+            self.modelCombo.blockSignals(False)
+            self._set_postprocess_parameter_defaults(0.5, 500.0)
             self.statusLabel.setText("模型根目录不存在:{}".format(root))
             return
         models = scan_models(root)
         if not models:
+            self.modelCombo.blockSignals(False)
+            self._set_postprocess_parameter_defaults(0.5, 500.0)
             self.statusLabel.setText("目录 {} 下未发现可用的分割模型".format(root))
             return
         for entry in models:
             self.modelCombo.addItem(entry["name"], entry)
+        self.modelCombo.blockSignals(False)
+        self._on_model_changed()
         self.statusLabel.setText("已发现 {} 个模型".format(len(models)))
+
+    @staticmethod
+    def _finite_float(value, fallback):
+        """把模型配置值转换为有限浮点数，异常值使用回退值。"""
+        number = LandCoverClassificationDialog._configured_float(value)
+        return float(fallback) if number is None else number
+
+    @staticmethod
+    def _configured_float(value):
+        """读取配置中的有限浮点数，无法读取时返回空值。"""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    def _set_postprocess_parameter_defaults(self, threshold, min_area_m2):
+        """更新界面参数默认值，不保存到模型或跨会话持久化。"""
+        threshold = min(max(self._finite_float(threshold, 0.5), 0.0), 1.0)
+        min_area_m2 = max(self._finite_float(min_area_m2, 500.0), 0.0)
+        self.thresholdSlider.setValue(int(round(threshold * 10)))
+        self._on_threshold_slider_changed(self.thresholdSlider.value())
+        self.minAreaSpinBox.setValue(min_area_m2)
+
+    def _model_postprocess_defaults(self, entry):
+        """按 postprocess.json、manifest.json 的优先级读取界面默认值。"""
+        manifest = entry.get("manifest", {}) if isinstance(entry, dict) else {}
+        model_path = self._model_path_from_entry(entry)
+        postprocess = {}
+        if model_path:
+            postprocess_name = manifest.get("postprocess", "postprocess.json")
+            if not isinstance(postprocess_name, str) or not postprocess_name:
+                postprocess_name = "postprocess.json"
+            try:
+                postprocess_path = os.path.join(model_path, postprocess_name)
+                with open(postprocess_path, "r", encoding="utf-8-sig") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    postprocess = loaded
+            except (OSError, TypeError, ValueError):
+                postprocess = {}
+
+        threshold = self._configured_float(postprocess.get("threshold"))
+        if threshold is None:
+            threshold = self._configured_float(manifest.get("threshold"))
+        min_area_m2 = self._configured_float(postprocess.get("min_area_m2"))
+        return (0.5 if threshold is None else threshold), (500.0 if
+                min_area_m2 is None else min_area_m2)
+
+    def _on_model_changed(self, *args):
+        """模型切换或刷新后恢复该 bundle 的默认后处理参数。"""
+        entry = self.modelCombo.currentData()
+        if not entry:
+            self._set_postprocess_parameter_defaults(0.5, 500.0)
+            return
+        self._set_postprocess_parameter_defaults(*self._model_postprocess_defaults(entry))
+
+    def _on_threshold_slider_changed(self, value):
+        """同步显示概率阈值滑块的一位小数值。"""
+        self.thresholdValueLabel.setText("{:.1f}".format(float(value) / 10.0))
+    def _postprocess_overrides(self):
+        """校验并返回当前会话的后处理参数覆盖字典。"""
+        threshold = self.thresholdSlider.value() / 10.0
+        min_area_m2 = self._finite_float(self.minAreaSpinBox.value(), float("nan"))
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            self._warn("概率阈值必须在 0 到 1 之间。")
+            return None
+        if not math.isfinite(min_area_m2) or min_area_m2 < 0.0:
+            self._warn("滑坡最小保留面积必须是非负数。")
+            return None
+        return {
+            "threshold": float(threshold),
+            "min_area_m2": float(min_area_m2),
+        }
 
     def _on_browse_model_root(self):
         current = self.modelRootEdit.text().strip() or _default_model_root()
@@ -1082,7 +1194,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return []
 
     def _start_inference_process(
-            self, model_path, input_path, dem_path, georef, roi=None):
+            self, model_path, input_path, dem_path, georef, roi=None,
+            postprocess_overrides=None):
         self._process_error_message = ""
         self._process_error_details = []
         self._process_error_traceback = ""
@@ -1099,7 +1212,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "input_path": input_path,
             "output_path": self._label_path,
             "dem_path": dem_path,
-            "postprocess_overrides": {},
+            "postprocess_overrides": dict(postprocess_overrides or {}),
         }
         if roi:
             params["roi"] = roi
@@ -1777,6 +1890,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         dem_path = self._resolve_dem_path()
         if dem_path is False:
             return None
+        postprocess_overrides = self._postprocess_overrides()
+        if postprocess_overrides is None:
+            return None
         try:
             manifest = get_model_info(model_path)
             self._inference_controller.prepare(manifest, uuid.uuid4().hex)
@@ -1791,6 +1907,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "input_path": input_path,
             "dem_path": dem_path,
             "georef": is_georeferenced(input_path),
+            "postprocess_overrides": postprocess_overrides,
         }
 
     def _canvas_intersection_roi(self, input_path):
@@ -1894,7 +2011,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._input_path = input_path
         self._start_inference_process(
             model_path, input_path, dem_path, georef,
-            context.get("roi"))
+            context.get("roi"), context.get("postprocess_overrides"))
     def _on_export_raster(self):
         if not self._draft_session.is_active or not self._layer_is_usable(
                 self._draft_layer):
