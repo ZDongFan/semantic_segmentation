@@ -2554,7 +2554,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def _class_color(self, class_id):
         colors = [
             QColor(230, 25, 75),
-            QColor(255, 102, 0),
+            QColor(255, 255, 0),
             QColor(0, 130, 200),
             QColor(245, 130, 48),
             QColor(145, 30, 180),
