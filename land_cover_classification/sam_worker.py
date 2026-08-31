@@ -913,8 +913,9 @@ class BaseSamBackend(object):
             )
         if crop_data.size == 0:
             raise ValueError("裁剪影像为空。")
+        # 先转换为浮点类型，再填充 NaN，避免 uint8 无法表示 NaN。
         crop = np.moveaxis(
-            np.asarray(crop_data.filled(np.nan), dtype="float32"), 0, 2)
+            np.asarray(crop_data.astype("float32").filled(np.nan)), 0, 2)
         crop = _ensure_uint8_image(crop)
         self._crop_bounds = (float(x0), float(y0), float(x1), float(y1))
         self._crop_shape = (SAM_CROP_SIZE, SAM_CROP_SIZE)

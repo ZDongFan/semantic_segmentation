@@ -459,15 +459,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.exportLayout.removeWidget(self.aiEditGroup)
         self.draftLayout.addWidget(self.aiEditGroup)
 
-        self.draftInferenceButtonsLayout = QtWidgets.QVBoxLayout()
-        self.draftInferenceButtonsLayout.setContentsMargins(0, 0, 0, 0)
         self.canvasInferenceBtn = QtWidgets.QPushButton(
-            "按当前画布范围推理", self.draftTab)
-        self.draftInferenceButtonsLayout.addWidget(self.canvasInferenceBtn)
+            "按当前画布范围推理", self.inferenceTab)
         self.undoFusionBtn = QtWidgets.QPushButton(
-            "撤销上次模型推理", self.draftTab)
+            "撤销上次模型推理", self.inferenceTab)
         self.undoFusionBtn.setEnabled(False)
-        self.draftInferenceButtonsLayout.addWidget(self.undoFusionBtn)
+        self.inferenceButtonsLayout.insertWidget(2, self.canvasInferenceBtn)
+        self.inferenceButtonsLayout.insertWidget(3, self.undoFusionBtn)
 
         self.draftProgressGroup = QtWidgets.QGroupBox(
             "推理进度", self.draftTab)
@@ -483,7 +481,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self.statusLabel.text(), self.draftProgressGroup)
         self.draftProgressLayout.addWidget(self.draftStatusLabel)
         self.draftLayout.addWidget(self.draftProgressGroup)
-        self.draftLayout.addLayout(self.draftInferenceButtonsLayout)
         self.draftLayout.addStretch(1)
         self.mainTabWidget.insertTab(0, self.draftTab, "草稿编辑")
         self.mainTabWidget.setTabText(
