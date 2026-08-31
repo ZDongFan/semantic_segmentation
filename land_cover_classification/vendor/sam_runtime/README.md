@@ -92,3 +92,5 @@ land_cover_classification/vendor/sam_runtime/venv/bin/python land_cover_classifi
 ```
 
 检查逻辑会通过 `venv` 内的 Python 子进程导入依赖，不会在当前 Python 进程中导入 SAM/PyTorch。
+
+主推理与 SAM 启动时都会用此环境中的 `rasterio` 对输入执行有限窗口探测。ENVI/HFA 源文件若不能直接读取，会由 QGIS GDAL 转换为临时 tiled BigTIFF 后再次探测；SAM 只读取当前活动 crop，不在 `set_image` 时解码整幅影像。

@@ -7,7 +7,7 @@ JSON line 协议和本脚本通信，不在主进程内导入 torch 或 sam2。
 
 支持的 op:
 - init      : 加载模型，参数 model_path、config_path、model_type、device
-- set_image : 设置当前推理影像，参数 image_path
+- set_image : 设置当前推理影像，参数 image_path、可选 rgb_bands
 - predict   : 输入正负点，返回 score 与 polygons
 - reset     : 清空当前影像缓存
 - quit      : 优雅退出
@@ -189,6 +189,7 @@ def _ensure_uint8_image(image):
             stretched.append(np.zeros(channel.shape, dtype=np.uint8))
             continue
         scaled = (channel - low) * (255.0 / (high - low))
+        scaled = np.where(np.isfinite(scaled), scaled, 0.0)
         stretched.append(np.clip(scaled, 0, 255).astype(np.uint8))
 
     if array.ndim == 2:
@@ -211,6 +212,44 @@ def _image_to_rgb(image):
     if image.shape[2] == 3:
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     raise ValueError("不支持的影像通道数: {}".format(image.shape[2]))
+
+
+def _resolve_rgb_bands(dataset, configured):
+    """按显式配置、颜色解释、灰度和前三波段顺序选择 RGB。"""
+    if configured is not None:
+        if (not isinstance(configured, (list, tuple))
+                or len(configured) != 3):
+            raise ValueError("rgb_bands 必须恰好包含三个波段编号。")
+        if any(isinstance(item, bool) or not isinstance(item, int)
+               for item in configured):
+            raise ValueError("rgb_bands 只能包含正整数波段编号。")
+        bands = [int(item) for item in configured]
+        if any(item <= 0 or item > dataset.count for item in bands):
+            raise ValueError(
+                "rgb_bands 包含越界波段，输入影像仅有 {} 个波段。".format(
+                    dataset.count))
+        if len(set(bands)) != len(bands):
+            raise ValueError("显式 rgb_bands 不能包含重复波段编号。")
+        return bands
+    names = [
+        getattr(value, "name", str(value)).strip().lower().replace("_", "")
+        for value in dataset.colorinterp
+    ]
+    rgb = []
+    for target in ("red", "green", "blue"):
+        matches = [
+            index + 1 for index, name in enumerate(names)
+            if name in (target, target + "band")
+        ]
+        if matches:
+            rgb.append(matches[0])
+    if len(rgb) == 3:
+        return rgb
+    if dataset.count == 1:
+        return [1, 1, 1]
+    if dataset.count >= 3:
+        return [1, 2, 3]
+    raise ValueError("双波段影像无法自动构造 RGB，请在 bundle 中声明 sam_rgb_bands。")
 
 
 def _points_to_arrays(positive_points, negative_points):
@@ -573,6 +612,9 @@ class BaseSamBackend(object):
         self._image_path = None
         self._image_shape = None
         self._image_rgb = None
+        self._rgb_bands = None
+        self._image_driver = None
+        self._image_band_count = None
         self._device = None
         self._model_type = None
         self._crop_bounds = None
@@ -587,32 +629,51 @@ class BaseSamBackend(object):
              device=None):
         raise NotImplementedError
 
-    def set_image(self, image_path):
+    def set_image(self, image_path, rgb_bands=None):
         if self._predictor is None:
             raise RuntimeError("SAM 模型尚未初始化。")
         if not image_path or not os.path.isfile(image_path):
             raise IOError("影像文件不存在: {}".format(image_path))
 
-        image = _read_image(image_path)
-        if image is None:
-            raise IOError("无法读取影像: {}".format(image_path))
-        image_rgb = _image_to_rgb(image)
+        import rasterio
+        from rasterio.windows import Window
+
+        with rasterio.open(image_path) as dataset:
+            bands = _resolve_rgb_bands(dataset, rgb_bands)
+            sample = dataset.read(
+                indexes=bands,
+                window=Window(0, 0, min(8, dataset.width),
+                              min(8, dataset.height)),
+                masked=True,
+            )
+            if sample.size == 0:
+                raise IOError("无法读取影像有限窗口: {}".format(image_path))
+            height = int(dataset.height)
+            width = int(dataset.width)
+            driver = dataset.driver or ""
+            band_count = int(dataset.count)
 
         self._image_path = image_path
-        self._image_shape = (image_rgb.shape[0], image_rgb.shape[1])
-        self._image_rgb = image_rgb
+        self._image_shape = (height, width)
+        self._image_rgb = None
+        self._rgb_bands = bands
+        self._image_driver = driver
+        self._image_band_count = band_count
         self._reset_prompt_context(reset_crop=True)
         return {
             "image_path": image_path,
-            "height": int(image_rgb.shape[0]),
-            "width": int(image_rgb.shape[1]),
+            "height": height,
+            "width": width,
+            "driver": driver,
+            "band_count": band_count,
+            "rgb_bands": list(bands),
         }
 
     def predict(self, positive_points, negative_points,
                 multimask_output=False, scale_factor=1.0):
         if self._predictor is None:
             raise RuntimeError("SAM 模型尚未初始化。")
-        if self._image_shape is None or self._image_rgb is None:
+        if self._image_shape is None or self._image_path is None:
             raise RuntimeError("尚未设置推理影像。")
 
         image_coords, point_labels = _points_to_arrays(
@@ -804,6 +865,9 @@ class BaseSamBackend(object):
     def _extract_crop(self, image_coords, scale_factor=1.0):
         import math
         import numpy as np
+        import rasterio
+        from rasterio.enums import Resampling
+        from rasterio.windows import Window
 
         height, width = self._image_shape
         xs = [float(point[0]) for point in image_coords]
@@ -839,10 +903,19 @@ class BaseSamBackend(object):
         if x1 <= x0 or y1 <= y0:
             raise ValueError("无法根据提示点裁剪有效影像。")
 
-        crop = self._image_rgb[y0:y1, x0:x1]
-        if crop.size == 0:
+        with rasterio.open(self._image_path) as dataset:
+            crop_data = dataset.read(
+                indexes=self._rgb_bands,
+                window=Window(x0, y0, x1 - x0, y1 - y0),
+                out_shape=(3, SAM_CROP_SIZE, SAM_CROP_SIZE),
+                masked=True,
+                resampling=Resampling.bilinear,
+            )
+        if crop_data.size == 0:
             raise ValueError("裁剪影像为空。")
-        crop = _resize_nearest(crop, SAM_CROP_SIZE, SAM_CROP_SIZE)
+        crop = np.moveaxis(
+            np.asarray(crop_data.filled(np.nan), dtype="float32"), 0, 2)
+        crop = _ensure_uint8_image(crop)
         self._crop_bounds = (float(x0), float(y0), float(x1), float(y1))
         self._crop_shape = (SAM_CROP_SIZE, SAM_CROP_SIZE)
         self._crop_key = tuple(round(value, 3) for value in self._crop_bounds)
@@ -893,6 +966,9 @@ class BaseSamBackend(object):
         self._image_path = None
         self._image_shape = None
         self._image_rgb = None
+        self._rgb_bands = None
+        self._image_driver = None
+        self._image_band_count = None
         self._reset_prompt_context(reset_crop=True)
         if self._predictor is not None:
             try:
@@ -983,8 +1059,8 @@ class SamSession(object):
             raise RuntimeError("SAM 后端尚未初始化。")
         return self._backend
 
-    def set_image(self, image_path):
-        return self._require_backend().set_image(image_path)
+    def set_image(self, image_path, rgb_bands=None):
+        return self._require_backend().set_image(image_path, rgb_bands)
 
     def predict(self, positive_points, negative_points,
                 multimask_output=False, scale_factor=1.0):
@@ -1009,7 +1085,8 @@ def _dispatch(session, message):
             device=message.get("device"),
         )
     elif op == "set_image":
-        result = session.set_image(message.get("image_path"))
+        result = session.set_image(
+            message.get("image_path"), message.get("rgb_bands"))
     elif op == "predict":
         result = session.predict(
             positive_points=message.get("positive_points") or [],

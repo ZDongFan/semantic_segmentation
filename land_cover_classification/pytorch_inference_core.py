@@ -304,6 +304,84 @@ def _model_config(bundle):
     )
 
 
+def _validated_band_list(value, name, band_count, exact_count=None):
+    """校验 1-based 波段列表并返回整数副本。"""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("{} 必须是非空波段编号数组。".format(name))
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in value):
+        raise ValueError("{} 只能包含正整数波段编号。".format(name))
+    bands = [int(item) for item in value]
+    if any(item <= 0 for item in bands):
+        raise ValueError("{} 只能包含正整数波段编号。".format(name))
+    if len(set(bands)) != len(bands):
+        raise ValueError("{} 不能包含重复波段编号。".format(name))
+    if any(item > int(band_count) for item in bands):
+        raise ValueError(
+            "{} 包含越界波段，输入影像仅有 {} 个波段: {}".format(
+                name, band_count, bands))
+    if exact_count is not None and len(bands) != int(exact_count):
+        raise ValueError(
+            "{} 必须恰好包含 {} 个波段。".format(name, exact_count))
+    return bands
+
+
+def resolve_image_bands(bundle, band_count):
+    """解析模型影像波段，并校验显式通道与归一化契约。"""
+    configured = bundle.preprocess.get("image_bands")
+    bands = (
+        _validated_band_list(
+            configured, "preprocess.image_bands", band_count)
+        if configured is not None
+        else list(range(1, int(band_count) + 1))
+    )
+    model_cfg = _model_config(bundle)
+    declared = None
+    for key in ("image_in_channels", "image_channels"):
+        if model_cfg.get(key) is not None:
+            declared = int(model_cfg[key])
+            break
+    if declared is not None and declared != len(bands):
+        raise ValueError(
+            "模型显式声明 {} 个影像通道，但 image_bands 选择了 {} 个。".format(
+                declared, len(bands)))
+    for key in ("mean", "image_mean", "std", "image_std"):
+        value = bundle.preprocess.get(key)
+        if value is not None and len(value) != len(bands):
+            raise ValueError(
+                "preprocess.{} 长度 {} 必须与模型影像波段数 {} 一致。".format(
+                    key, len(value), len(bands)))
+    return bands
+
+
+def resolve_sam_rgb_bands(preprocess, band_count, color_interpretations=None):
+    """按显式配置、颜色解释、灰度和前三波段顺序选择 SAM RGB。"""
+    configured = (preprocess or {}).get("sam_rgb_bands")
+    if configured is not None:
+        return _validated_band_list(
+            configured, "preprocess.sam_rgb_bands", band_count,
+            exact_count=3)
+    names = [
+        str(value).strip().lower().replace("_", "")
+        for value in (color_interpretations or [])
+    ]
+    rgb = []
+    for target in ("red", "green", "blue"):
+        matches = [
+            index + 1 for index, name in enumerate(names)
+            if name in (target, target + "band")
+        ]
+        if matches:
+            rgb.append(matches[0])
+    if len(rgb) == 3:
+        return rgb
+    if int(band_count) == 1:
+        return [1, 1, 1]
+    if int(band_count) >= 3:
+        return [1, 2, 3]
+    raise ValueError(
+        "双波段影像无法自动构造 RGB，请在 preprocess.json 声明 sam_rgb_bands。")
+
+
 def _weights_path(bundle):
     value = bundle.manifest.get("weights") or "weights.pt"
     return value if os.path.isabs(value) else os.path.join(bundle.path, value)
@@ -367,14 +445,15 @@ def _normalize_image(image, preprocess):
     return arr
 
 
-def read_image(image_path, preprocess=None, window=None):
+def read_image(image_path, preprocess=None, window=None, bands=None):
     """读取一个有限影像窗口，返回数组、局部 profile、transform 与 CRS。"""
     import rasterio
 
     if window is None:
         raise ValueError("read_image 必须显式传入有限大小的 rasterio Window。")
     with rasterio.open(image_path) as src:
-        image = src.read(window=window)
+        indexes = bands or list(range(1, src.count + 1))
+        image = src.read(indexes=indexes, window=window)
         profile = src.profile.copy()
         transform = src.window_transform(window)
         crs = src.crs

@@ -61,6 +61,14 @@ from .export_service import ExportService
 from .inference_controller import BundleContractError, InferenceController
 from .pytorch_inference_core import GEOTIFF_CREATION_OPTIONS, is_georeferenced
 from .pytorch_inference_runner import BoundedDiagnostics, decode_process_line
+from .raster_input_adapter import (
+    RasterInputError,
+    RasterInputSession,
+    create_conversion_task,
+    inspect_with_qgis_gdal,
+    probe_runtime,
+    resolve_source_path,
+)
 from .model_scan import get_model_info
 from .model_scan import scan as scan_models
 
@@ -404,6 +412,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._inference_controller = InferenceController()
         self._ai_controller = AiEditController()
         self._export_service = ExportService()
+        self._input_adapter = RasterInputSession()
+        self._input_adapter_request_id = 0
         self._draft_commit_completed = False
         self._working_image_change_in_progress = False
         self._stale_cleanup_scheduled = False
@@ -503,7 +513,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             pass
 
         self.inputFileWidget.setStorageMode(QgsFileWidget.GetFile)
-        self.inputFileWidget.setFilter("影像文件 (*.tif *.tiff *.png *.jpg *.jpeg)")
+        self.inputFileWidget.setFilter(
+            "影像文件 (*.tif *.tiff *.png *.jpg *.jpeg *.dat *.img *.ige)")
         self.outputDirWidget.setStorageMode(QgsFileWidget.GetDirectory)
         self.mDemFile.setStorageMode(QgsFileWidget.GetFile)
         self.mDemFile.setFilter("DEM 文件 (*.tif *.tiff *.vrt)")
@@ -849,7 +860,12 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         input_path = self._resolve_input_path()
         if not input_path or not os.path.isfile(input_path):
             return
-        input_path = os.path.abspath(input_path)
+        try:
+            input_metadata = inspect_with_qgis_gdal(input_path)
+            input_path = input_metadata["source_path"]
+        except RasterInputError as exc:
+            self._warn(str(exc))
+            return
         self._remove_stale_session_draft_layers(defer=True)
 
         if self._draft_session.is_active and (
@@ -876,6 +892,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self._stop_ai_editing(silent=True)
         self._discard_draft_session()
+        self._input_adapter.clear()
+        self._input_adapter_request_id += 1
         try:
             self._input_path = input_path
             self._input_layer = self._resolve_input_layer()
@@ -1173,12 +1191,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def _normalize_input_path(self, path):
         if not path:
             return None
-        if os.path.exists(path):
-            return path
         candidate = path.split("|", 1)[0]
-        if candidate and os.path.exists(candidate):
-            return candidate
-        return path
+        try:
+            return resolve_source_path(candidate)
+        except RasterInputError:
+            return candidate or path
 
     def _resolve_input_layer(self):
         if self.layerRadio.isChecked():
@@ -1193,9 +1210,111 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception:
             return []
 
+    @staticmethod
+    def _input_adapter_audit(source_metadata, runtime_metadata, mode):
+        """生成不包含临时文件绝对路径的输入适配审计信息。"""
+        return {
+            "source_driver": source_metadata.get("driver") or "",
+            "mode": mode,
+            "source_band_count": int(source_metadata.get("band_count") or 0),
+            "color_interpretations": list(
+                runtime_metadata.get("color_interpretations") or []),
+            "runtime_driver": runtime_metadata.get("driver") or "",
+            "qgis_gdal_version": source_metadata.get("gdal_version") or "",
+            "runtime_gdal_version": runtime_metadata.get("gdal_version") or "",
+            "runtime_rasterio_version": (
+                runtime_metadata.get("rasterio_version") or ""),
+        }
+
+    def _set_adapter_busy(self, busy, message=None):
+        """同步输入转换期间的按钮和状态。"""
+        self.runBtn.setEnabled(not busy)
+        self.canvasInferenceBtn.setEnabled(not busy)
+        self.cancelBtn.setEnabled(bool(busy))
+        if message:
+            self.statusLabel.setText(message)
+
+    def _prepare_runtime_input(self, source_path, on_ready):
+        """探测统一 runtime；必要时异步转换为会话级 BigTIFF。"""
+        try:
+            source_metadata = inspect_with_qgis_gdal(source_path)
+        except RasterInputError as exc:
+            self._warn(str(exc))
+            return
+        source_path = source_metadata["source_path"]
+        python_executable = pytorch_deps_check.default_python_executable()
+        environment = pytorch_deps_check.runtime_environment()
+        direct = probe_runtime(
+            python_executable, source_path, environment=environment)
+        if direct.get("ok"):
+            on_ready(
+                source_path,
+                self._input_adapter_audit(
+                    source_metadata, direct, "direct"))
+            return
+
+        cached = self._input_adapter.cached_path(source_path)
+        if cached:
+            cached_probe = probe_runtime(
+                python_executable, cached, environment=environment)
+            if cached_probe.get("ok"):
+                on_ready(
+                    cached,
+                    self._input_adapter_audit(
+                        source_metadata, cached_probe, "converted"))
+                return
+
+        request_id = self._input_adapter_request_id = (
+            self._input_adapter_request_id + 1)
+        direct_error = direct.get("error") or "runtime 未返回失败原因。"
+        self._set_adapter_busy(
+            True, "统一 runtime 无法直接读取，正在转换为临时 BigTIFF...")
+
+        def _conversion_finished(converted_path, error):
+            if request_id != self._input_adapter_request_id or sip.isdeleted(self):
+                return
+            if error or not converted_path:
+                self._set_adapter_busy(False)
+                self._warn(
+                    "输入适配失败。源驱动: {}，QGIS GDAL: {}，runtime GDAL: {}；"
+                    "直接读取错误: {}；转换错误: {}".format(
+                        source_metadata.get("driver") or "未知",
+                        source_metadata.get("gdal_version") or "未知",
+                        direct.get("gdal_version") or "未知",
+                        direct_error,
+                        error or "未知错误"))
+                return
+            converted_probe = probe_runtime(
+                python_executable, converted_path, environment=environment)
+            if not converted_probe.get("ok"):
+                self._set_adapter_busy(False)
+                self._warn(
+                    "临时 BigTIFF 转换完成，但统一 runtime 仍无法读取。"
+                    "源驱动: {}，QGIS GDAL: {}，runtime 错误: {}".format(
+                        source_metadata.get("driver") or "未知",
+                        source_metadata.get("gdal_version") or "未知",
+                        converted_probe.get("error") or "未知错误"))
+                return
+            self._set_adapter_busy(False)
+            on_ready(
+                converted_path,
+                self._input_adapter_audit(
+                    source_metadata, converted_probe, "converted"))
+
+        task = create_conversion_task(
+            self._input_adapter, source_path, source_metadata,
+            _conversion_finished)
+        task.progressChanged.connect(
+            lambda value: (
+                self.progressBar.setValue(int(value)),
+                self.draftProgressBar.setValue(int(value)),
+            ))
+        QgsApplication.taskManager().addTask(task)
+
     def _start_inference_process(
             self, model_path, input_path, dem_path, georef, roi=None,
-            postprocess_overrides=None):
+            postprocess_overrides=None, runtime_input_path=None,
+            input_adapter=None):
         self._process_error_message = ""
         self._process_error_details = []
         self._process_error_traceback = ""
@@ -1209,10 +1328,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "latest_label_{}.tif".format(uuid.uuid4().hex))
         params = {
             "model_path": model_path,
-            "input_path": input_path,
+            "input_path": runtime_input_path or input_path,
             "output_path": self._label_path,
             "dem_path": dem_path,
             "postprocess_overrides": dict(postprocess_overrides or {}),
+            "input_adapter": dict(input_adapter or {}),
         }
         if roi:
             params["roi"] = roi
@@ -1345,6 +1465,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         return self._launcher_file
 
     def _on_cancel(self):
+        if self._input_adapter.active_task is not None:
+            self._input_adapter.cancel()
+            self.statusLabel.setText("正在取消输入影像转换...")
         if self._process is not None:
             self._process.kill()
             self.statusLabel.setText("正在取消...")
@@ -1956,9 +2079,19 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         }
 
     def _launch_inference_context(self, context, publish_empty=False):
-        """完成会话准备、快照和子进程启动。"""
+        """完成 runtime 能力探测，并继续会话准备与子进程启动。"""
         if not context or not self._ensure_pytorch_venv_available():
             return
+        self._prepare_runtime_input(
+            context["input_path"],
+            lambda runtime_path, adapter_info: (
+                self._launch_prepared_inference_context(
+                    context, publish_empty, runtime_path, adapter_info)),
+        )
+
+    def _launch_prepared_inference_context(
+            self, context, publish_empty, runtime_path, adapter_info):
+        """在输入已适配后创建会话快照并启动推理。"""
         if (self._layer_is_usable(self._draft_layer)
                 and not self._commit_layer_if_needed(self._draft_layer)):
             return
@@ -1975,7 +2108,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._invalidate_fusion_undo()
         try:
             self._create_fusion_snapshot()
-            self._start_run_after_validation(context)
+            self._start_run_after_validation(
+                context, runtime_path, adapter_info)
         except Exception as exc:  # noqa: BLE001
             self._warn("启动模型推理失败: {}".format(exc))
 
@@ -1998,7 +2132,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         context["roi"] = roi
         self._launch_inference_context(context, publish_empty=True)
 
-    def _start_run_after_validation(self, context):
+    def _start_run_after_validation(
+            self, context, runtime_path=None, adapter_info=None):
         if not context:
             self._warn("运行参数已丢失，请重新点击运行。")
             return
@@ -2011,7 +2146,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._input_path = input_path
         self._start_inference_process(
             model_path, input_path, dem_path, georef,
-            context.get("roi"), context.get("postprocess_overrides"))
+            context.get("roi"), context.get("postprocess_overrides"),
+            runtime_input_path=runtime_path,
+            input_adapter=adapter_info)
     def _on_export_raster(self):
         if not self._draft_session.is_active or not self._layer_is_usable(
                 self._draft_layer):
@@ -2484,6 +2621,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._process.kill()
         self._stop_ai_editing(silent=True)
         self._discard_draft_session()
+        self._input_adapter_request_id += 1
+        self._input_adapter.close()
         super().closeEvent(event)
 
     # AI 辅助编辑相关
@@ -2545,17 +2684,60 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if not ok:
             QtWidgets.QMessageBox.warning(self, "SAM 环境未就绪", message)
             return
+        self._prepare_runtime_input(
+            image_path,
+            lambda runtime_path, adapter_info: self._start_ai_with_runtime_input(
+                image_path, runtime_path, adapter_info),
+        )
+
+    def _selected_sam_rgb_bands(self):
+        """读取当前 bundle 的可选 SAM RGB 波段声明。"""
+        entry = self.modelCombo.currentData()
+        model_path = self._model_path_from_entry(entry)
+        if not model_path:
+            return None
+        try:
+            with open(
+                    os.path.join(model_path, "preprocess.json"),
+                    "r", encoding="utf-8-sig") as handle:
+                preprocess = json.load(handle)
+        except (OSError, ValueError):
+            return None
+        return preprocess.get("sam_rgb_bands")
+
+    def _start_ai_with_runtime_input(
+            self, source_path, runtime_path, _adapter_info):
+        """使用已探测或转换的 runtime 输入启动 SAM worker。"""
         if not self._start_ai_worker():
             return
-        self._ai_image_path = image_path
+        self._ai_image_path = source_path
         self._ai_image_loaded = False
         try:
-            self._load_ai_image_metadata(image_path)
+            self._load_ai_image_metadata(source_path)
         except Exception as exc:  # noqa: BLE001
             self._warn("无法读取工作影像元数据: {}".format(exc))
             self._stop_ai_editing(silent=True)
             return
-        if not self._send_ai_command({"op": "set_image", "image_path": image_path}):
+        set_image = {
+            "op": "set_image",
+            "image_path": runtime_path,
+        }
+        rgb_bands = self._selected_sam_rgb_bands()
+        try:
+            from .pytorch_inference_core import resolve_sam_rgb_bands
+            metadata = inspect_with_qgis_gdal(source_path)
+            rgb_bands = resolve_sam_rgb_bands(
+                {"sam_rgb_bands": rgb_bands}
+                if rgb_bands is not None else {},
+                metadata["band_count"],
+                metadata.get("color_interpretations"),
+            )
+        except Exception as exc:  # noqa: BLE001 - AI 启动时给出可操作提示。
+            self._warn("SAM 无法为当前影像构造 RGB 波段: {}".format(exc))
+            self._stop_ai_editing(silent=True)
+            return
+        set_image["rgb_bands"] = rgb_bands
+        if not self._send_ai_command(set_image):
             self._stop_ai_editing(silent=True)
             return
         self._ai_image_loaded = True

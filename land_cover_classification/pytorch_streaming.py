@@ -387,6 +387,8 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
         _merge_postprocess_config,
         _normalize_image,
         compute_dem_factors,
+        resolve_image_bands,
+        resolve_sam_rgb_bands,
     )
 
     config = _merge_postprocess_config(bundle, params.get("postprocess_overrides") or {})
@@ -394,6 +396,22 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
     with contextlib.ExitStack() as stack:
         image_src = stack.enter_context(rasterio.open(params["input_path"]))
         dem_src = stack.enter_context(rasterio.open(dem_path)) if dem_path else None
+        image_bands = resolve_image_bands(bundle, image_src.count)
+        try:
+            sam_rgb_bands = resolve_sam_rgb_bands(
+                bundle.preprocess, image_src.count, image_src.colorinterp)
+        except ValueError:
+            # 主推理不依赖 SAM RGB；双波段影像在 AI 启动时再给出明确提示。
+            sam_rgb_bands = None
+        input_adapter = dict(params.get("input_adapter") or {})
+        input_adapter.update({
+            "source_band_count": int(
+                input_adapter.get("source_band_count") or image_src.count),
+            "model_bands": list(image_bands),
+            "sam_rgb_bands": (
+                list(sam_rgb_bands) if sam_rgb_bands is not None else None),
+        })
+        params["input_adapter"] = input_adapter
         factor_radius = (
             _factor_radius(config, image_src.transform, core_crs_unit(image_src.crs))
             if dem_src else 0
@@ -428,7 +446,8 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
                 for core in _windows_in_window(
                         inference_window, plan.core_size):
                     expanded = _expand_window(core, plan.halo, image_src.width, image_src.height)
-                    image_masked = image_src.read(window=expanded, masked=True)
+                    image_masked = image_src.read(
+                        indexes=image_bands, window=expanded, masked=True)
                     valid = ~np.any(np.ma.getmaskarray(image_masked), axis=0)
                     image = np.asarray(image_masked.filled(0))
                     image = _normalize_image(image, bundle.preprocess)
@@ -1224,6 +1243,7 @@ def _finalize_components(mask_path, output_path, dem_filled_path, params, bundle
         "runtime_resolution": runtime_metadata.get("runtime_resolution", {}),
         "resolution_warnings": runtime_metadata.get("resolution_warnings", []),
         "inference": inference_audit,
+        "input_adapter": dict(params.get("input_adapter") or {}),
         "dem_usage": dem_usage,
         "rules": config.get("rules", {}),
         "rule_order": config.get("rule_order", list((config.get("rules") or {}).keys())),

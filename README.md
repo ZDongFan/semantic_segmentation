@@ -10,6 +10,7 @@
 
 - 扫描模型根目录下带 `manifest.json` 的 PyTorch 语义分割 bundle，并在模型下拉框中列出；bundle 子目录名由外部模型提供方决定，不作为兼容性判断条件。
 - 使用插件统一运行环境 `vendor/sam_runtime/venv/` 子进程执行 PyTorch 主推理和 SAM AI 编辑，QGIS 主进程不导入 `torch`；打开插件面板时不检查 / 加载 venv，点击“运行”后才检查 PyTorch 主推理环境。
+- 输入支持 JPEG、PNG、GeoTIFF、ENVI `.dat/.img` 与 ERDAS Imagine `.img`；`.ige` 作为同名 `.img` 的伴随入口。插件按 GDAL 实际驱动识别 `ENVI`/`HFA`，统一 runtime 不能直读时会以可取消任务转换为会话级 tiled BigTIFF。
 - 当前草稿工作流固定处理 `landslide` 类别：启动推理前会在 `manifest.json` 的类别列表中以大小写不敏感方式查找唯一的 `landslide`。如同时声明 `landslide_class_id`，其值必须与该类别索引一致；缺失、重复或冲突会在启动子进程前失败。
 - 生产推理采用“核心区 + halo”流式处理：输入影像通过有限 `rasterio.windows.Window` 读取，DEM 只重投影到当前局部格网，并调用 bundle 内 `dem_factors.py` 计算局部派生因子。
 - 除全图推理外，已地理配准的影像可在“草稿编辑”页签按当前画布范围推理。画布范围会转换到影像 CRS 并与影像求交；ROI 的核心计算只覆盖交集，halo 可为上下文越过 ROI 边界，未计算区域不会被当作有效推理数据。
@@ -63,6 +64,7 @@ semantic_segmentation/
     |-- pytorch_streaming.py
     |-- pytorch_inference_runner.py
     |-- pytorch_deps_check.py
+    |-- raster_input_adapter.py
     |-- model_scan.py
     |-- sam_deps_check.py
     |-- sam_worker.py
@@ -77,6 +79,7 @@ semantic_segmentation/
 
 ## 大影像与 DEM 注意事项
 
+- 原始输入始终是 QGIS 图层、草稿和导出参考；fallback BigTIFF 只传给 PyTorch/SAM 子进程，切换影像或关闭插件时删除。转换缓存按主文件及 `.hdr/.ige` 等伴随文件的大小和修改时间失效。
 - 输入影像和 DEM 可以使用不同 CRS，但必须具有有效地理参考并存在空间交集；米制 DEM 因子还要求输入影像 CRS 单位为米。
 - DEM 的 NoData 会在每个局部窗口内处理。运行时会先把 rasterio 返回的 `MaskedArray` 转换为带 NaN NoData 的普通 `float32` 数组，再执行局部重投影，避免不同 rasterio/GDAL 版本把有效窗口误判为全 NoData。
 - 如果提示“当前推理块范围内未获得有效 DEM 高程”，不等同于两幅栅格一定没有空间交集；还应检查交叠区域是否全为 NoData、CRS 是否正确，以及 DEM 是否能被正常重投影。

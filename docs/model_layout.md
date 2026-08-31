@@ -63,6 +63,21 @@ def build_model(cfg):
 
 DEM 局部读取使用 `masked=True` 保留数据集 NoData 语义，但传入 `rasterio.warp.reproject()` 前必须转换为带 NaN NoData 的普通 `float32 ndarray`。不要把 `MaskedArray` 直接交给重投影函数，因为不同 rasterio/GDAL 组合可能把实际有效的局部 DEM 误处理为全 NoData。
 
+### preprocess.json 影像波段
+
+`preprocess.json` 可声明 1-based 的模型影像波段和 SAM RGB 波段：
+
+```json
+{
+  "image_bands": [1, 2, 3],
+  "sam_rgb_bands": [1, 2, 3],
+  "image_mean": [0.485, 0.456, 0.406],
+  "image_std": [0.229, 0.224, 0.225]
+}
+```
+
+`image_bands` 未声明时保持旧行为，模型读取全部波段；声明后必须为正整数、无重复且不越界，其数量必须与显式模型影像通道及 `image_mean/image_std` 长度一致。`sam_rgb_bands` 必须恰好包含三个不同的有效波段；未声明时依次采用 GDAL RGB 颜色解释、单波段复制或前三波段。双波段数据无法自动构造 RGB，必须显式声明。
+
 ### dem_factors.py
 
 `dem_factors.py` 必须声明固定通道顺序并提供显式契约调用入口：

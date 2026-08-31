@@ -25,6 +25,7 @@ SAM_REQUIREMENTS = [
     ("sam2", "sam2"),
     ("opencv-contrib-python", "cv2"),
     ("numpy", "numpy"),
+    ("rasterio", "rasterio"),
 ]
 
 
