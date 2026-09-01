@@ -187,7 +187,7 @@ def _roi_pixel_window(image_src, roi):
     import numpy as np
     from rasterio.windows import Window, from_bounds
 
-    if str(roi.get("mode", "")) != "canvas_intersection":
+    if str(roi.get("mode", "")) not in {"canvas_intersection", "drawn_polygon"}:
         raise ValueError("不支持的 ROI 推理模式。")
     bounds = roi.get("bounds")
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
@@ -211,6 +211,46 @@ def _roi_pixel_window(image_src, roi):
     if col0 >= col1 or row0 >= row1:
         raise ValueError("ROI 与输入影像没有有效像素交集。")
     return Window(col0, row0, col1 - col0, row1 - row0)
+
+
+def _validate_polygon_roi(roi):
+    """校验绘制范围协议并返回规范化 Polygon。"""
+    import numpy as np
+    geometry = roi.get("geometry")
+    if not isinstance(geometry, dict) or geometry.get("type") != "Polygon":
+        raise ValueError("绘制范围 geometry 必须是 Polygon。")
+    rings = geometry.get("coordinates")
+    if not isinstance(rings, (list, tuple)) or len(rings) != 1:
+        raise ValueError("绘制范围只能包含一个无孔洞外环。")
+    ring = rings[0]
+    if not isinstance(ring, (list, tuple)) or len(ring) < 4:
+        raise ValueError("绘制范围外环至少需要三个顶点并首尾闭合。")
+    coordinates = []
+    for point in ring:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError("绘制范围坐标必须是 [x, y]。")
+        try:
+            coordinate = [float(point[0]), float(point[1])]
+        except (TypeError, ValueError):
+            raise ValueError("绘制范围包含非数值坐标。")
+        if not np.isfinite(coordinate).all():
+            raise ValueError("绘制范围包含非有限数值。")
+        coordinates.append(coordinate)
+    if coordinates[0] != coordinates[-1]:
+        raise ValueError("绘制范围外环必须首尾闭合。")
+    if len({tuple(point) for point in coordinates[:-1]}) < 3:
+        raise ValueError("绘制范围至少需要三个不同顶点。")
+    area_twice = sum(start[0] * end[1] - end[0] * start[1] for start, end in zip(coordinates, coordinates[1:]))
+    if abs(area_twice) <= np.finfo("float64").eps:
+        raise ValueError("绘制范围面积必须大于零。")
+    geometry_bounds = [min(point[0] for point in coordinates[:-1]), min(point[1] for point in coordinates[:-1]), max(point[0] for point in coordinates[:-1]), max(point[1] for point in coordinates[:-1])]
+    supplied_bounds = [float(value) for value in roi.get("bounds") or []]
+    if len(supplied_bounds) != 4:
+        raise ValueError("ROI bounds 必须包含 xmin、ymin、xmax、ymax。")
+    tolerance = 1e-9 * max(1.0, *(abs(value) for value in geometry_bounds))
+    if any(abs(actual - supplied) > tolerance for actual, supplied in zip(geometry_bounds, supplied_bounds)):
+        raise ValueError("绘制范围 bounds 与 geometry 不一致。")
+    return {"type": "Polygon", "coordinates": [coordinates]}
 
 
 def _window_audit(window):
@@ -423,6 +463,8 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
         overlap = int(params.get("overlap") or max(32, tile_size // 8))
         roi = params.get("roi")
         roi_window = _roi_pixel_window(image_src, roi)
+        roi_mode = str((roi or {}).get("mode") or "")
+        polygon_geometry = (_validate_polygon_roi(roi) if roi_mode == "drawn_polygon" else None)
         inference_window = roi_window or Window(
             0, 0, image_src.width, image_src.height)
         plan = build_window_plan(
@@ -433,6 +475,8 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
         valid_pixel_count = 0
         dem_valid_pixel_count = 0
         fallback_pixel_count = 0
+        roi_valid_pixel_count = 0
+        skipped_core_count = 0
         with rasterio.open(probability_path, "w", **profile) as probability_dst, \
                 rasterio.open(dem_filled_path, "w", **mask_profile) as dem_filled_dst, \
                 rasterio.open(valid_data_path, "w", **mask_profile) as valid_data_dst:
@@ -445,6 +489,17 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
             with torch.no_grad():
                 for core in _windows_in_window(
                         inference_window, plan.core_size):
+                    core_polygon_mask = None
+                    if polygon_geometry:
+                        from rasterio.features import geometry_mask
+                        core_polygon_mask = geometry_mask([polygon_geometry], out_shape=(int(core.height), int(core.width)), transform=window_transform(core, image_src.transform), invert=True, all_touched=False)
+                        roi_valid_pixel_count += int(core_polygon_mask.sum())
+                        if not core_polygon_mask.any():
+                            skipped_core_count += 1
+                            done += 1
+                            if progress_callback is not None:
+                                progress_callback("predict", done, plan.block_count)
+                            continue
                     expanded = _expand_window(core, plan.halo, image_src.width, image_src.height)
                     image_masked = image_src.read(
                         indexes=image_bands, window=expanded, masked=True)
@@ -485,11 +540,14 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
                         dem_valid_mask=dem_valid)
                     core_probability = _crop_to_core(probability, expanded, core)
                     core_valid = _crop_to_core(valid, expanded, core)
+                    if core_polygon_mask is not None:
+                        core_valid &= core_polygon_mask
                     core_filled = _crop_to_core(filled, expanded, core)
                     core_dem_valid = _crop_to_core(dem_valid, expanded, core)
                     core_probability = np.where(
                         core_valid, core_probability, np.nan).astype("float32")
                     core_filled = np.asarray(core_filled, dtype=bool)
+                    core_filled &= core_valid
                     core_dem_valid &= core_valid
                     probability_dst.write(core_probability, 1, window=core)
                     dem_filled_dst.write(core_filled.astype("uint8"), 1, window=core)
@@ -526,12 +584,18 @@ def _write_probability_raster(params, bundle, model, device_cfg, probability_pat
                 if valid_pixel_count else 0.0),
             "component_rule_min_valid_fraction": 0.5,
         }
+        if polygon_geometry and roi_valid_pixel_count == 0:
+            raise ValueError("绘制范围栅格化后没有有效像素。")
         inference_audit = {
-            "mode": "canvas_intersection" if roi_window is not None else "full_image",
+            "mode": roi_mode if roi_window is not None else "full_image",
             "bounds": list(roi.get("bounds") or []) if roi_window is not None else None,
             "crs_wkt": roi.get("crs_wkt") if roi_window is not None else None,
+            "geometry": polygon_geometry,
             "pixel_window": _window_audit(roi_window),
             "halo": plan.halo,
+            "mask_rule": "pixel_center",
+            "roi_valid_pixel_count": int(roi_valid_pixel_count if polygon_geometry else valid_pixel_count),
+            "skipped_core_count": int(skipped_core_count),
         }
         return image_src.profile.copy(), config, dem_info, plan, inference_audit, dem_usage
 

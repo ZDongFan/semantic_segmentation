@@ -13,6 +13,7 @@ from rasterio.windows import Window
 from land_cover_classification.pytorch_streaming import (
     _expand_window,
     _initialize_roi_outputs,
+    _validate_polygon_roi,
     _roi_pixel_window,
     _windows_in_window,
 )
@@ -71,6 +72,64 @@ class RoiWindowTest(unittest.TestCase):
 
         expanded = _expand_window(cores[0], 5, 100, 80)
         self.assertEqual(expanded, Window(15, 5, 26, 26))
+
+
+class DrawnPolygonProtocolTest(unittest.TestCase):
+    """验证绘制范围协议和像素中心栅格化规则。"""
+
+    def _roi(self, ring, bounds=(0, 0, 10, 10)):
+        return {
+            "mode": "drawn_polygon",
+            "bounds": list(bounds),
+            "crs_wkt": "test",
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+        }
+
+    def test_valid_polygon_is_normalized(self):
+        """合法单外环 Polygon 应规范化为浮点坐标。"""
+        geometry = _validate_polygon_roi(self._roi([
+            [0, 0], [10, 0], [10, 10], [0, 10], [0, 0],
+        ]))
+        self.assertEqual(geometry["type"], "Polygon")
+        self.assertEqual(geometry["coordinates"][0][0], [0.0, 0.0])
+
+    def test_bounds_mismatch_is_rejected(self):
+        """runner 不得盲目信任 UI 提供的 bounds。"""
+        with self.assertRaisesRegex(ValueError, "bounds"):
+            _validate_polygon_roi(self._roi([
+                [0, 0], [10, 0], [10, 10], [0, 10], [0, 0],
+            ], bounds=(0, 0, 9, 10)))
+
+    def test_hole_and_open_ring_are_rejected(self):
+        """孔洞和未闭合外环都必须明确失败。"""
+        roi = self._roi([
+            [0, 0], [10, 0], [10, 10], [0, 10], [0, 0],
+        ])
+        roi["geometry"]["coordinates"].append([
+            [2, 2], [8, 2], [8, 8], [2, 8], [2, 2],
+        ])
+        with self.assertRaisesRegex(ValueError, "无孔洞"):
+            _validate_polygon_roi(roi)
+        with self.assertRaisesRegex(ValueError, "首尾闭合"):
+            _validate_polygon_roi(self._roi([
+                [0, 0], [10, 0], [10, 10], [0, 10],
+            ]))
+
+    def test_triangle_mask_uses_pixel_centers(self):
+        """三角形外包矩形角落应无效，边界只按像素中心判断。"""
+        from rasterio.features import geometry_mask
+
+        geometry = _validate_polygon_roi(self._roi([
+            [0, 0], [10, 0], [0, 10], [0, 0],
+        ]))
+        mask = geometry_mask(
+            [geometry], out_shape=(10, 10),
+            transform=from_origin(0, 10, 1, 1),
+            invert=True, all_touched=False)
+        self.assertTrue(mask[9, 0])
+        self.assertFalse(mask[0, 9])
+        self.assertFalse(mask[0, 0])
+        self.assertEqual(int(mask.sum()), 45)
 
 
 class RoiOutputInitializationTest(unittest.TestCase):

@@ -43,12 +43,13 @@ from qgis.core import (
     QgsWkbTypes,
     Qgis,
 )
-from qgis.gui import QgsFileWidget
+from qgis.gui import QgsFileWidget, QgsRubberBand
 
 from . import pytorch_deps_check
 from . import sam_deps_check
 from .ai_edit_controller import AiEditController
 from .ai_segment_tool import AiSegmentMapTool
+from .inference_roi_tool import InferenceRoiMapTool
 from .draft_session import (
     FIELD_FEATURE_UUID,
     FIELD_ORIGIN,
@@ -399,6 +400,12 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.iface = iface
         self._process = None
         self._active_inference_roi = None
+        self._drawn_roi_geometry = None
+        self._drawn_roi_input_path = None
+        self._drawn_roi = None
+        self._roi_tool = None
+        self._roi_previous_tool = None
+        self._roi_preview_band = None
         self._params_file = None
         self._launcher_file = None
         self._process_error_message = ""
@@ -459,6 +466,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.exportLayout.removeWidget(self.aiEditGroup)
         self.draftLayout.addWidget(self.aiEditGroup)
 
+        self.drawRoiBtn = QtWidgets.QPushButton("绘制推理范围", self.inferenceTab)
+        self.clearRoiBtn = QtWidgets.QPushButton("清除范围", self.inferenceTab)
+        self.runDrawnRoiBtn = QtWidgets.QPushButton("按绘制范围推理", self.inferenceTab)
+        self.clearRoiBtn.setEnabled(False)
+        self.runDrawnRoiBtn.setEnabled(False)
         self.canvasInferenceBtn = QtWidgets.QPushButton(
             "按当前画布范围推理", self.inferenceTab)
         self.undoFusionBtn = QtWidgets.QPushButton(
@@ -466,6 +478,24 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.undoFusionBtn.setEnabled(False)
         self.inferenceButtonsLayout.insertWidget(2, self.canvasInferenceBtn)
         self.inferenceButtonsLayout.insertWidget(3, self.undoFusionBtn)
+
+        self.roiButtonsLayout = QtWidgets.QHBoxLayout()
+        self.roiButtonsLayout.setContentsMargins(0, 0, 0, 0)
+        expanding = QtWidgets.QSizePolicy.Expanding
+        roi_widgets = (
+            (self.drawRoiBtn, 6),
+            (self.clearRoiBtn, 4),
+            (self.runDrawnRoiBtn, 7),
+        )
+        for widget, stretch in roi_widgets:
+            widget.setMinimumWidth(0)
+            widget.setSizePolicy(
+                expanding, QtWidgets.QSizePolicy.Preferred)
+            self.roiButtonsLayout.addWidget(widget, stretch)
+        buttons_index = self.inferenceLayout.indexOf(
+            self.inferenceButtonsLayout)
+        self.inferenceLayout.insertLayout(
+            max(0, buttons_index), self.roiButtonsLayout)
 
         self.draftProgressGroup = QtWidgets.QGroupBox(
             "推理进度", self.draftTab)
@@ -558,6 +588,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.runBtn.clicked.connect(self._on_run)
         self.canvasInferenceBtn.clicked.connect(
             self._on_run_canvas_extent)
+        self.drawRoiBtn.clicked.connect(self._on_draw_inference_roi)
+        self.clearRoiBtn.clicked.connect(self._clear_drawn_roi)
+        self.runDrawnRoiBtn.clicked.connect(self._on_run_drawn_roi)
         self.cancelBtn.clicked.connect(self._on_cancel)
         self.exportRasterBtn.clicked.connect(self._on_export_raster)
         self.closeBtn.clicked.connect(self.close)
@@ -888,6 +921,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 return
 
         self._stop_ai_editing(silent=True)
+        self._clear_drawn_roi()
         self._discard_draft_session()
         self._input_adapter.clear()
         self._input_adapter_request_id += 1
@@ -1227,6 +1261,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         """同步输入转换期间的按钮和状态。"""
         self.runBtn.setEnabled(not busy)
         self.canvasInferenceBtn.setEnabled(not busy)
+        self.drawRoiBtn.setEnabled(not busy)
+        has_roi = self._drawn_roi_geometry is not None
+        self.clearRoiBtn.setEnabled(not busy and has_roi)
+        self.runDrawnRoiBtn.setEnabled(not busy and has_roi)
         self.cancelBtn.setEnabled(bool(busy))
         if message:
             self.statusLabel.setText(message)
@@ -1351,6 +1389,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         self.runBtn.setEnabled(False)
         self.canvasInferenceBtn.setEnabled(False)
+        self.drawRoiBtn.setEnabled(False)
+        self.clearRoiBtn.setEnabled(False)
+        self.runDrawnRoiBtn.setEnabled(False)
         self.cancelBtn.setEnabled(True)
         self.exportRasterBtn.setEnabled(False)
         self.progressBar.setValue(0)
@@ -1566,16 +1607,28 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._draft_session.fusion_snapshot_path = snapshot
 
     def _active_roi_geometry(self):
-        """根据启动时保存的 canonical ROI 构造融合矩形。"""
+        """根据启动时保存的 canonical ROI 构造真实融合范围。"""
         roi = self._active_inference_roi
         if not roi:
             return None
+        if roi.get("mode") == "drawn_polygon":
+            geometry = roi.get("geometry") or {}
+            rings = geometry.get("coordinates") or []
+            if geometry.get("type") != "Polygon" or len(rings) != 1:
+                raise ValueError("绘制范围缺少有效的单面 geometry。")
+            try:
+                ring = [QgsPointXY(float(x), float(y)) for x, y in rings[0]]
+            except (TypeError, ValueError) as exc:
+                raise ValueError("绘制范围坐标无效。") from exc
+            polygon = QgsGeometry.fromPolygonXY([ring])
+            if polygon.isEmpty() or not polygon.isGeosValid():
+                raise ValueError("绘制范围 geometry 无效。")
+            return polygon
         bounds = roi.get("bounds") or []
         if len(bounds) != 4:
             raise ValueError("局部推理上下文缺少有效 bounds。")
         return QgsGeometry.fromRect(QgsRectangle(*[
             float(value) for value in bounds]))
-
     def _finish_inference_fusion(self, candidate_path, run_id):
         """合成已保存的候选并在成功后切换可见草稿。"""
         self._merge_inference_candidate_with_retry(candidate_path, run_id)
@@ -2075,6 +2128,139 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "crs_wkt": image_layer.crs().toWkt(),
         }
 
+    def _remove_roi_preview(self):
+        band = self._roi_preview_band
+        self._roi_preview_band = None
+        if band is None:
+            return
+        try:
+            if band.scene() is not None:
+                band.scene().removeItem(band)
+        except RuntimeError:
+            pass
+
+    def _show_roi_preview(self, geometry, crs):
+        self._remove_roi_preview()
+        canvas = self.iface.mapCanvas()
+        band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
+        band.setColor(QColor(30, 100, 220, 230))
+        band.setFillColor(QColor(30, 100, 220, 70))
+        band.setWidth(2)
+        band.setToGeometry(geometry, crs)
+        self._roi_preview_band = band
+    def _clear_drawn_roi(self, restore_tool=True):
+        tool, previous = self._roi_tool, self._roi_previous_tool
+        self._roi_tool = self._roi_previous_tool = None
+        if tool is not None:
+            try:
+                tool.dispose()
+            except Exception:
+                pass
+        if restore_tool and previous is not None and self.iface is not None:
+            try:
+                self.iface.mapCanvas().setMapTool(previous)
+            except Exception:
+                pass
+        self._drawn_roi_geometry = None
+        self._drawn_roi_input_path = None
+        self._drawn_roi = None
+        self._remove_roi_preview()
+        self.drawRoiBtn.setText("绘制推理范围")
+        self.clearRoiBtn.setEnabled(False)
+        self.runDrawnRoiBtn.setEnabled(False)
+
+    def _finish_roi_tool(self, restore=True):
+        tool, previous = self._roi_tool, self._roi_previous_tool
+        self._roi_tool = self._roi_previous_tool = None
+        if tool is not None:
+            try:
+                tool.dispose()
+            except Exception:
+                pass
+        if restore and previous is not None:
+            try:
+                self.iface.mapCanvas().setMapTool(previous)
+            except Exception:
+                pass
+
+    def _on_draw_inference_roi(self):
+        input_path = self._resolve_input_path()
+        if not input_path or not os.path.isfile(input_path):
+            self._warn("请先选择有效的输入影像。")
+            return
+        input_path = os.path.abspath(input_path)
+        if not is_georeferenced(input_path):
+            self._warn("输入影像没有有效地理参考，不能绘制推理范围。")
+            return
+        self._stop_ai_editing(silent=True)
+        self._finish_roi_tool()
+        canvas = self.iface.mapCanvas()
+        self._roi_previous_tool = canvas.mapTool()
+        self._roi_tool = InferenceRoiMapTool(
+            canvas, self._on_drawn_roi_finished,
+            self._on_drawn_roi_cancelled)
+        canvas.setMapTool(self._roi_tool)
+        self.statusLabel.setText("正在绘制推理范围，Esc 可取消并保留原范围。")
+
+    def _on_drawn_roi_cancelled(self):
+        self._finish_roi_tool()
+        self.statusLabel.setText(
+            "已取消重画。" if self._drawn_roi_geometry else "已取消绘制范围。")
+
+    def _on_drawn_roi_finished(self, canvas_geometry):
+        input_path = os.path.abspath(self._resolve_input_path() or "")
+        layer = QgsRasterLayer(input_path, "drawn_roi_reference")
+        try:
+            geometry = QgsGeometry(canvas_geometry)
+            canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+            if canvas_crs != layer.crs():
+                geometry.transform(QgsCoordinateTransform(
+                    canvas_crs, layer.crs(), QgsProject.instance()))
+            geometry = geometry.intersection(QgsGeometry.fromRect(layer.extent()))
+            if geometry.isEmpty() or not geometry.isGeosValid():
+                raise ValueError("范围为空或存在自相交。")
+            if QgsWkbTypes.isMultiType(geometry.wkbType()):
+                raise ValueError("裁剪后形成多个面。")
+            polygon = geometry.asPolygon()
+            if len(polygon) != 1 or len(polygon[0]) < 4:
+                raise ValueError("范围必须是无孔洞简单面。")
+            if len(polygon[0]) > 10001 or geometry.area() <= 0:
+                raise ValueError("范围顶点过多或面积无效。")
+            coordinates = [[[float(p.x()), float(p.y())] for p in polygon[0]]]
+            bounds = geometry.boundingBox()
+            self._drawn_roi_geometry = geometry
+            self._drawn_roi_input_path = input_path
+            self._drawn_roi = {
+                "mode": "drawn_polygon",
+                "bounds": [bounds.xMinimum(), bounds.yMinimum(),
+                           bounds.xMaximum(), bounds.yMaximum()],
+                "crs_wkt": layer.crs().toWkt(),
+                "geometry": {"type": "Polygon", "coordinates": coordinates},
+            }
+            self.drawRoiBtn.setText("重新绘制")
+            self.clearRoiBtn.setEnabled(True)
+            self.runDrawnRoiBtn.setEnabled(True)
+            self._show_roi_preview(geometry, layer.crs())
+            self.statusLabel.setText("绘制范围已就绪。")
+            self._finish_roi_tool()
+            return True
+        except Exception as exc:
+            self._warn("绘制范围无效，已保留上一个有效范围: {}".format(exc))
+            QTimer.singleShot(500, self._finish_roi_tool)
+            return False
+
+
+    def _on_run_drawn_roi(self):
+        context = self._prepare_inference_context()
+        if not context:
+            return
+        if (not self._drawn_roi_geometry
+                or self._drawn_roi_input_path != context["input_path"]):
+            self._clear_drawn_roi()
+            self._warn("绘制范围不属于当前输入影像，请重新绘制。")
+            return
+        context["roi"] = dict(self._drawn_roi)
+        self._launch_inference_context(context, publish_empty=True)
     def _launch_inference_context(self, context, publish_empty=False):
         """完成 runtime 能力探测，并继续会话准备与子进程启动。"""
         if not context or not self._ensure_pytorch_venv_available():
@@ -2582,6 +2768,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def _cleanup_process(self):
         self.runBtn.setEnabled(True)
         self.canvasInferenceBtn.setEnabled(True)
+        self.drawRoiBtn.setEnabled(True)
+        has_roi = self._drawn_roi_geometry is not None
+        self.clearRoiBtn.setEnabled(has_roi)
+        self.runDrawnRoiBtn.setEnabled(has_roi)
         self.cancelBtn.setEnabled(False)
         if self._params_file and os.path.exists(self._params_file):
             try:
@@ -2617,6 +2807,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if self._process is not None:
             self._process.kill()
         self._stop_ai_editing(silent=True)
+        self._clear_drawn_roi()
         self._discard_draft_session()
         self._input_adapter_request_id += 1
         self._input_adapter.close()

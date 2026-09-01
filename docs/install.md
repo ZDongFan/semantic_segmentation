@@ -146,6 +146,7 @@ land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt
 2. 启用 `LandCoverClassification` 插件。
 3. 在“模型推理”页签选择输入影像和 PyTorch bundle；DEM 文件可不选，也可只覆盖目标范围的一部分，再执行全图推理。
 4. 如需仅处理当前视图，可在“草稿编辑”页签使用“按当前画布范围推理”；该功能要求输入影像具有有效地理参考，且当前画布与影像存在有效交集。
+5. 如需处理任意闭合范围，可在“模型推理”页签逐点绘制多边形，确认蓝色预览后点击“按绘制范围推理”。范围只在当前插件会话中保留，且同样要求输入影像具有有效地理参考。
 
 输入文件可使用 JPEG、PNG、GeoTIFF、ENVI `.dat/.img` 或 ERDAS Imagine `.img`。`.ige` 只能作为同目录同名 `.img` 的入口。点击运行或启动 AI 编辑后，插件会分别验证 QGIS GDAL 与统一 runtime 的实际读取能力；runtime 缺少 ENVI/HFA 驱动时，QGIS 会以可取消任务转换为会话级 tiled BigTIFF。转换前会检查临时目录空间，原始文件不会被覆盖。
 

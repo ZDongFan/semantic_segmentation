@@ -13,7 +13,7 @@
 - 输入支持 JPEG、PNG、GeoTIFF、ENVI `.dat/.img` 与 ERDAS Imagine `.img`；`.ige` 作为同名 `.img` 的伴随入口。插件按 GDAL 实际驱动识别 `ENVI`/`HFA`，统一 runtime 不能直读时会以可取消任务转换为会话级 tiled BigTIFF。
 - 当前草稿工作流固定处理 `landslide` 类别：启动推理前会在 `manifest.json` 的类别列表中以大小写不敏感方式查找唯一的 `landslide`。如同时声明 `landslide_class_id`，其值必须与该类别索引一致；缺失、重复或冲突会在启动子进程前失败。
 - 生产推理采用“核心区 + halo”流式处理：输入影像通过有限 `rasterio.windows.Window` 读取，DEM 只重投影到当前局部格网，并调用 bundle 内 `dem_factors.py` 计算局部派生因子。
-- 除全图推理外，已地理配准的影像可在“草稿编辑”页签按当前画布范围推理。画布范围会转换到影像 CRS 并与影像求交；ROI 的核心计算只覆盖交集，halo 可为上下文越过 ROI 边界，未计算区域不会被当作有效推理数据。
+- 除全图推理外，已地理配准的影像可按当前画布范围或绘制的闭合范围推理。画布范围会转换到影像 CRS 并与影像求交；ROI 的核心计算只覆盖交集，halo 可为上下文越过 ROI 边界，未计算区域不会被当作有效推理数据。
 - 支持 GPU 推理，并在 CUDA 不可用时自动降级到 CPU；CPU 路径使用更小 tile 保护内存。
 - 概率、类别与中间结果直接按窗口写入 tiled GeoTIFF，不保留整幅 DEM、DEM 因子栈、概率图、标签图或连通域数组。
 - 对 landslide 概率执行 threshold、形态学、填洞、跨块连通域、最小面积过滤，以及 slope、relief、TPI 三条 DEM 规则后处理；全局组件通过磁盘中间栅格归并，避免在块边界截断对象。
