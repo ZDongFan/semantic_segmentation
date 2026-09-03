@@ -379,7 +379,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             label.setFixedWidth(postprocess_label_width)
 
         status_labels = (
-            self.statusLabel, self.exportStatusLabel, self.draftStatusLabel,
+            self.statusLabel, self.exportStatusLabel,
             self.aiStatusLabel, self.workflowHintLabel, self.aiHintLabel,
         )
         for label in status_labels:
@@ -394,9 +394,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._configure_workflow_tabs()
         self._configure_layout_constraints()
         self.statusLabel = _MirroredLabel(
-            self.statusLabel, self.exportStatusLabel, self.draftStatusLabel)
+            self.statusLabel, self.exportStatusLabel)
         self.progressBar = _MirroredProgressBar(
-            self.progressBar, self.exportProgressBar, self.draftProgressBar)
+            self.progressBar, self.exportProgressBar)
         self.iface = iface
         self._process = None
         self._active_inference_roi = None
@@ -497,20 +497,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.inferenceLayout.insertLayout(
             max(0, buttons_index), self.roiButtonsLayout)
 
-        self.draftProgressGroup = QtWidgets.QGroupBox(
-            "推理进度", self.draftTab)
-        self.draftProgressLayout = QtWidgets.QVBoxLayout(
-            self.draftProgressGroup)
-        self.draftProgressBar = QtWidgets.QProgressBar(
-            self.draftProgressGroup)
-        self.draftProgressBar.setRange(
-            self.progressBar.minimum(), self.progressBar.maximum())
-        self.draftProgressBar.setValue(self.progressBar.value())
-        self.draftProgressLayout.addWidget(self.draftProgressBar)
-        self.draftStatusLabel = QtWidgets.QLabel(
-            self.statusLabel.text(), self.draftProgressGroup)
-        self.draftProgressLayout.addWidget(self.draftStatusLabel)
-        self.draftLayout.addWidget(self.draftProgressGroup)
         self.draftLayout.addStretch(1)
         self.mainTabWidget.insertTab(0, self.draftTab, "草稿编辑")
         self.mainTabWidget.setTabText(
@@ -1340,10 +1326,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._input_adapter, source_path, source_metadata,
             _conversion_finished)
         task.progressChanged.connect(
-            lambda value: (
-                self.progressBar.setValue(int(value)),
-                self.draftProgressBar.setValue(int(value)),
-            ))
+            lambda value: self.progressBar.setValue(int(value)))
         QgsApplication.taskManager().addTask(task)
 
     def _start_inference_process(
