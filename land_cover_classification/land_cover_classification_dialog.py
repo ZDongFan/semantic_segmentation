@@ -448,6 +448,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._draft_layer_original_name = None
         self._ai_buffer = ""
         self._ai_predicting = False
+        self._ai_appending = False
         self._ai_queued_points = None
         self._ai_prompt_layer_points = {"positive": [], "negative": []}
 
@@ -2914,7 +2915,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._ai_image_loaded = True
         canvas = self.iface.mapCanvas()
         self._ai_previous_tool = canvas.mapTool()
-        self._ai_tool = AiSegmentMapTool(canvas, self._on_ai_points_changed)
+        self._ai_tool = AiSegmentMapTool(
+            canvas, self._on_ai_points_changed, self._on_ai_append_draft)
         canvas.setMapTool(self._ai_tool)
         self._mark_draft_layer_ai_preview()
         self._remove_legacy_ai_preview_layers()
@@ -2925,7 +2927,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.aiUndoPointBtn.setEnabled(True)
         self.aiClearPointsBtn.setEnabled(True)
         self.aiAppendDraftBtn.setEnabled(False)
-        self.aiStatusLabel.setText("AI 编辑已启动。左键添加正点，右键添加负点。")
+        self.aiStatusLabel.setText("AI 编辑已启动。左键添加正点，右键添加负点，按 E 确认追加。")
         self.iface.messageBar().pushInfo(
             "地物分类", "AI 编辑已启动，请在画布中标注正负样本点。")
     def _on_ai_stop(self):
@@ -2942,7 +2944,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._ai_previous_tool = current_tool
             canvas.setMapTool(self._ai_tool)
         self.aiStatusLabel.setText(
-            "已回到 AI 点选模式。左键添加正点,右键添加负点。")
+            "已回到 AI 点选模式。左键添加正点，右键添加负点，按 E 确认追加。")
     def _stop_ai_editing(self, silent=False):
         canvas = self.iface.mapCanvas() if self.iface else None
         self._clear_ai_preview()
@@ -2990,6 +2992,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._ai_preview_geometry = None
         self._ai_buffer = ""
         self._ai_predicting = False
+        self._ai_appending = False
         self._ai_queued_points = None
 
         self.aiStartBtn.setEnabled(True)
@@ -3015,10 +3018,22 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.aiStatusLabel.setText("已清空提示点。")
 
     def _on_ai_append_draft(self):
-        if self._ai_preview_geometry is None:
+        if self._ai_predicting:
+            self.aiStatusLabel.setText("正在生成预览，请稍候。")
             return
-        class_id = self._ai_landslide_class_id()
-        self._write_ai_geometry_to_draft(self._ai_preview_geometry, class_id)
+        if self._ai_appending:
+            self.aiStatusLabel.setText("正在追加 landslide 草稿对象，请稍候。")
+            return
+        geometry = self._ai_preview_geometry
+        if geometry is None or geometry.isEmpty():
+            self.aiStatusLabel.setText("当前没有有效的 landslide 预览。")
+            return
+        self._ai_appending = True
+        try:
+            class_id = self._ai_landslide_class_id()
+            self._write_ai_geometry_to_draft(geometry, class_id)
+        finally:
+            self._ai_appending = False
 
     def _ai_landslide_class_id(self):
         """工作区类别固定为 background=0、landslide=1。"""

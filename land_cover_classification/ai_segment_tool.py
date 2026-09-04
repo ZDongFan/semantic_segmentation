@@ -26,10 +26,11 @@ from qgis.gui import QgsMapTool, QgsRubberBand
 class AiSegmentMapTool(QgsMapTool):
     """采集正负点提示并维护 mask 预览的 map tool。"""
 
-    def __init__(self, canvas, on_points_changed):
+    def __init__(self, canvas, on_points_changed, on_append_draft=None):
         super().__init__(canvas)
         self._canvas = canvas
         self._on_points_changed = on_points_changed
+        self._on_append_draft = on_append_draft
         self._positive_points = []
         self._negative_points = []
         self._point_history = []
@@ -70,6 +71,24 @@ class AiSegmentMapTool(QgsMapTool):
             self._point_history.append('negative')
             self._refresh_point_bands()
             self._emit_points_changed()
+
+    def keyPressEvent(self, event):
+        if self._disposed:
+            return
+        if event.key() == Qt.Key_E and event.modifiers() == Qt.NoModifier:
+            try:
+                callback = self._on_append_draft
+                if callable(callback):
+                    callback()
+            except RuntimeError as exc:
+                # 插件重载后旧对话框可能已被 Qt 销毁，及时释放失效工具。
+                if "has been deleted" not in str(exc):
+                    raise
+                self.dispose()
+            finally:
+                event.accept()
+            return
+        super().keyPressEvent(event)
 
     def undo_last_point(self):
         if self._disposed:
@@ -161,6 +180,7 @@ class AiSegmentMapTool(QgsMapTool):
             return
         self._disposed = True
         self._on_points_changed = None
+        self._on_append_draft = None
         canvas = self._canvas
         try:
             if canvas is not None and canvas.mapTool() is self:
