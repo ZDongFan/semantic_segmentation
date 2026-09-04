@@ -1,15 +1,28 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal EnableExtensions EnableDelayedExpansion
 
 set "SCRIPT_DIR=%~dp0"
-set "VENV_DIR=%SCRIPT_DIR%venv"
+set "VENV_LINK=%SCRIPT_DIR%venv"
+if "%SAM_VENV_DIR%"=="" set "SAM_VENV_DIR=%LOCALAPPDATA%\LCCRuntime\venv"
+for %%D in ("%SAM_VENV_DIR%") do set "VENV_DIR=%%~fD"
+for %%D in ("%VENV_LINK%") do set "VENV_LINK=%%~fD"
+set "VENV_EXTERNAL=1"
+if /i "%VENV_DIR%"=="%VENV_LINK%" set "VENV_EXTERNAL=0"
 
 if "%SAM_PYTHON%"=="" (
-    if exist "C:\Python312\python.exe" (
+    rem 按常见安装位置依次查找 Python 3.12；当前用户安装不一定注册 py.exe。
+    if exist "%LOCALAPPDATA%\Programs\Python\Python312\python.exe" (
+        set "SAM_PYTHON=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+    ) else if exist "C:\Python312\python.exe" (
         set "SAM_PYTHON=C:\Python312\python.exe"
     ) else (
         for /f "usebackq delims=" %%P in (`py -3.12 -c "import sys; print(sys.executable)" 2^>nul`) do (
             set "SAM_PYTHON=%%P"
+        )
+        if "!SAM_PYTHON!"=="" (
+            for /f "delims=" %%P in ('where python3.12 2^>nul') do (
+                set "SAM_PYTHON=%%P"
+            )
         )
         if "!SAM_PYTHON!"=="" set "SAM_PYTHON=python"
     )
@@ -19,17 +32,37 @@ echo Using Python: %SAM_PYTHON%
 "%SAM_PYTHON%" --version
 if errorlevel 1 (
     echo Failed to run the selected Python interpreter.
-    echo Install Python 3.12 first, or set SAM_PYTHON to a valid Python 3.12 path.
+    echo Install Python 3.12 first, or set SAM_PYTHON to a valid Python path.
     exit /b 1
 )
+"%SAM_PYTHON%" -c "import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)" >nul 2>nul
+if errorlevel 1 (
+    echo Warning: the selected interpreter is not Python 3.12.
+    echo Set SAM_PYTHON to Python 3.12 if dependency installation fails.
+)
 
-if exist "%VENV_DIR%" (
+echo Runtime physical path: %VENV_DIR%
+if "%VENV_EXTERNAL%"=="1" echo Plugin runtime link: %VENV_LINK%
+
+if exist "%VENV_LINK%" (
     if "%SAM_RECREATE%"=="1" (
-        echo Recreating existing unified plugin venv: %VENV_DIR%
+        echo Recreating existing unified plugin venv: %VENV_LINK%
+        rmdir "%VENV_LINK%" 2>nul
+        if exist "%VENV_LINK%" rmdir /s /q "%VENV_LINK%"
+    ) else (
+        echo Existing unified plugin venv found: %VENV_LINK%
+        echo Delete it manually, or set SAM_RECREATE=1 and run again.
+        exit /b 1
+    )
+)
+
+if "%VENV_EXTERNAL%"=="1" if exist "%VENV_DIR%" (
+    if "%SAM_RECREATE%"=="1" (
+        echo Removing existing physical runtime: %VENV_DIR%
         rmdir /s /q "%VENV_DIR%"
     ) else (
-        echo Existing unified plugin venv found: %VENV_DIR%
-        echo Delete it manually, or set SAM_RECREATE=1 and run again.
+        echo Existing physical runtime found: %VENV_DIR%
+        echo Set SAM_RECREATE=1 to rebuild it, or remove it manually.
         exit /b 1
     )
 )
@@ -46,7 +79,6 @@ if not exist "%VENV_PY%" (
     echo python.exe was not created inside the venv: %VENV_PY%
     exit /b 1
 )
-
 echo Upgrading pip, setuptools, and wheel...
 "%VENV_PY%" -m pip install --upgrade pip setuptools wheel
 if errorlevel 1 exit /b 1
@@ -137,5 +169,13 @@ if "!TORCH_INSTALL_MODE!"=="cuda" (
     )
 )
 
-echo Unified plugin venv created successfully: %VENV_DIR%
+if "%VENV_EXTERNAL%"=="1" (
+    mklink /J "%VENV_LINK%" "%VENV_DIR%" >nul
+    if errorlevel 1 (
+        echo Failed to create the plugin runtime junction.
+        echo Run this command manually: mklink /J "%VENV_LINK%" "%VENV_DIR%"
+        exit /b 1
+    )
+)
+echo Unified plugin venv created successfully: %VENV_LINK%
 endlocal

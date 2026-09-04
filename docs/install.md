@@ -11,6 +11,8 @@ land_cover_classification/vendor/sam_runtime/venv/
 - PyTorch bundle 主推理
 - SAM2 AI 辅助编辑
 
+Windows 下脚本默认将 venv 实体放在 `%LOCALAPPDATA%\LCCRuntime\venv`，并在插件目录的 `vendor\sam_runtime\venv` 创建目录联接。这样可以避免 QGIS 默认插件路径过长导致 wheel 安装失败；插件代码和验证命令仍使用原有入口路径。
+
 不要把 PyTorch、SAM2、rasterio、segmentation-models-pytorch 等重依赖安装到 QGIS 主进程 Python 中。QGIS 主进程只负责界面、图层、矢量化与导出。
 
 ## 一、部署插件目录
@@ -50,6 +52,26 @@ Windows 命令提示符：
 ```bat
 set "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple"
 land_cover_classification\vendor\sam_runtime\create_sam_venv.bat
+```
+
+如果 Python 3.12 是按当前用户安装的，脚本会自动探测：
+
+```text
+%LOCALAPPDATA%\Programs\Python\Python312\python.exe
+```
+
+如需指定解释器或短路径，可在运行前设置：
+
+```bat
+set "SAM_PYTHON=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+set "SAM_VENV_DIR=D:\qgis_runtime\lcc_venv"
+land_cover_classification\vendor\sam_runtime\create_sam_venv.bat
+```
+
+通常不需要手工执行 `mklink`；脚本会自动创建：
+
+```bat
+mklink /J "<插件目录>\vendor\sam_runtime\venv" "<venv 实体目录>"
 ```
 
 Windows PowerShell：

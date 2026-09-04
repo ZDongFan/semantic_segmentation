@@ -1,10 +1,12 @@
 # 插件统一运行环境
 
-本目录用于创建插件唯一的独立 Python 虚拟环境。虚拟环境固定放在：
+本目录用于创建插件唯一的独立 Python 虚拟环境。插件固定通过以下路径访问环境：
 
 ```text
 land_cover_classification/vendor/sam_runtime/venv
 ```
+
+Windows 下为规避 QGIS 插件深层目录触发的传统 `MAX_PATH` 限制，脚本默认将 venv 实体创建在 `%LOCALAPPDATA%\LCCRuntime\venv`，再自动用目录联接接入上述插件路径。无需管理员权限，也不需要手工移动整个插件。
 
 这套环境同时服务：
 
@@ -34,12 +36,27 @@ Linux/macOS:
 ./create_sam_venv.sh
 ```
 
-脚本默认在线安装依赖。Windows 下会优先使用 `C:\Python312\python.exe`，然后尝试 `py -3.12`，最后才使用 `python`。如需指定解释器，可设置 `SAM_PYTHON`:
+脚本默认在线安装依赖。Windows 下会依次尝试当前用户默认安装位置 `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`、`C:\Python312\python.exe`、`py -3.12`、PATH 中的 `python3.12`，最后才使用 `python`。最后的回退解释器不是 Python 3.12 时，脚本会提示警告但仍继续执行。需要明确指定解释器时可设置 `SAM_PYTHON`:
 
 ```bat
-set SAM_PYTHON=C:\Python312\python.exe
+set "SAM_PYTHON=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
 create_sam_venv.bat
 ```
+
+如需把 venv 实体放到其他短路径，可设置 `SAM_VENV_DIR`；脚本仍会自动创建插件目录联接：
+
+```bat
+set "SAM_VENV_DIR=D:\qgis_runtime\lcc_venv"
+create_sam_venv.bat
+```
+
+对应的通用联接命令为：
+
+```bat
+mklink /J "<插件目录>\vendor\sam_runtime\venv" "<venv 实体目录>"
+```
+
+正常情况下无需手工执行该命令。
 
 已有 `venv/` 时脚本会停止，避免覆盖本机环境。如需重建，可先手动删除 `venv/`，或设置:
 
