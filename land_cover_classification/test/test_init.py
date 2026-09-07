@@ -49,10 +49,12 @@ class TestInit(unittest.TestCase):
         metadata = []
         parser = configparser.ConfigParser()
         parser.optionxform = str
-        parser.read(file_path)
+        parser.read(file_path, encoding='utf-8')
         message = 'Cannot find a section named "general" in %s' % file_path
         assert parser.has_section('general'), message
         metadata.extend(parser.items('general'))
+        self.assertEqual(parser.get('general', 'qgisMinimumVersion'), '3.44')
+        self.assertEqual(parser.get('general', 'qgisMaximumVersion'), '3.99')
 
         for expectation in required_metadata:
             message = ('Cannot find metadata "%s" in metadata source (%s).' % (

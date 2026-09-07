@@ -1,6 +1,6 @@
 # LandCoverClassification 地物分类 QGIS 插件
 
-这是一个面向 QGIS 3.28+ 的语义分割插件，可对当前栅格图层或本地影像执行基于 PyTorch bundle 的遥感滑坡 / 地物语义分割，并将结果组织为“类别栅格 -> 草稿矢量 -> 最终成果”的人工编辑流程。推理生成草稿层后，插件支持基于 SAM2.1 Base+ 的 AI 辅助编辑，用正负点提示生成 mask 预览，并将结果追加到现有草稿图层。
+这是一个面向 QGIS 3.44+ 的语义分割插件，可对当前栅格图层或本地影像执行基于 PyTorch bundle 的遥感滑坡 / 地物语义分割，并将结果组织为“类别栅格 -> 草稿矢量 -> 最终成果”的人工编辑流程。推理生成草稿层后，插件支持基于 SAM2.1 Base+ 的 AI 辅助编辑，用正负点提示生成 mask 预览，并将结果追加到现有草稿图层。
 
 插件主体位于 `land_cover_classification/` 目录下。可用 PyTorch bundle 默认放在 `land_cover_classification/models/semantic_segmentation/`；SAM2 权重默认放在 `land_cover_classification/models/sam2/`。
 
@@ -23,12 +23,14 @@
 
 ## 安装
 
-1. 安装 QGIS 3.28+。
+1. 安装 QGIS 3.44+。
 2. 将 `land_cover_classification/` 目录部署到 QGIS 插件目录。
 3. 运行 `land_cover_classification/vendor/sam_runtime/create_sam_venv.bat` 或 `create_sam_venv.sh` 创建插件统一运行环境。
 4. 将训练仓导出的 PyTorch bundle 子目录放入 `land_cover_classification/models/semantic_segmentation/`。
 5. 如需使用 AI 辅助编辑，准备 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`。
 6. 重启 QGIS，并在插件管理器中启用 `LandCoverClassification`。
+
+创建脚本优先使用 QGIS 自带或实际使用的 Python，通常无需额外安装独立 Python；不固定 Python 版本，可用 `SAM_PYTHON` 显式覆盖。所有依赖仅安装到独立 venv。通用包默认使用清华 PyPI 镜像，`PIP_INDEX_URL` 可覆盖；PyTorch 的 CPU/CUDA wheel 始终通过隔离配置的 `SAM_TORCH_*` 专用索引安装。Linux 缺少 venv/ensurepip 时请安装发行版的 `python3-venv` 包。QGIS 移动、卸载或升级导致旧 venv 无法启动时，用 `SAM_RECREATE=1` 重建。详细说明见 [安装文档](docs/install.md)。
 
 更详细的模型目录说明见 [`docs/model_layout.md`](docs/model_layout.md)。
 

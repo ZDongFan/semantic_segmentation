@@ -36,12 +36,18 @@ Linux/macOS:
 ./create_sam_venv.sh
 ```
 
-脚本默认在线安装依赖。Windows 下会依次尝试当前用户默认安装位置 `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`、`C:\Python312\python.exe`、`py -3.12`、PATH 中的 `python3.12`，最后才使用 `python`。最后的回退解释器不是 Python 3.12 时，脚本会提示警告但仍继续执行。需要明确指定解释器时可设置 `SAM_PYTHON`:
+插件要求 QGIS 3.44+。脚本先检查显式 `SAM_PYTHON`，然后按当前 QGIS 环境、其他 QGIS 安装、独立 Python 的顺序发现解释器。通常无需额外安装独立 Python，不固定 Python 版本；依赖安装和最终导入验证决定兼容性。显式解释器无效时直接失败，自动发现的候选失败时继续回退。
+
+Windows 入口调用同目录的 `create_sam_venv.ps1`，检查 `apps/Python3*/python.exe` 并按数字版本排序，禁止自动选择 QGIS `bin/python.exe` 包装器。Linux 检查 QGIS 前缀、QGIS 所在发行版的系统 Python 和独立 Python；缺少 venv/ensurepip 时可能需要安装 `python3-venv`。macOS 检查系统和用户 Applications 下的 QGIS 应用包。隔离打包内部 Python 不可用时，可通过 `SAM_PYTHON` 指定外部 Python：
 
 ```bat
-set "SAM_PYTHON=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+set "SAM_PYTHON=<可用 Python 的完整路径>"
 create_sam_venv.bat
 ```
+
+两个入口复用标准库辅助脚本 `runtime_setup.py`，只向独立 venv 安装依赖，验证 `include-system-site-packages=false`。安装开始后不会切换基础解释器。
+
+通用包默认从清华 PyPI 镜像 `https://pypi.tuna.tsinghua.edu.cn/simple` 安装；用户已有的 `PIP_INDEX_URL` 优先。失败时不自动换源，可显式设置 `PIP_INDEX_URL=https://pypi.org/simple` 或其他可信镜像后重试。日志只显示默认/用户索引类型，避免输出 URL 凭据。PyTorch 通过清除 pip 环境变量、禁用配置文件和 `--isolated --index-url` 使用独立 wheel 源；通用镜像及额外索引均不影响 PyTorch。后续通用依赖使用精确版本约束及已有构建环境，版本冲突直接失败，并验证 torch/torchvision 未被替换。
 
 如需把 venv 实体放到其他短路径，可设置 `SAM_VENV_DIR`；脚本仍会自动创建插件目录联接：
 
@@ -49,6 +55,8 @@ create_sam_venv.bat
 set "SAM_VENV_DIR=D:\qgis_runtime\lcc_venv"
 create_sam_venv.bat
 ```
+
+Linux/macOS 也支持 `SAM_VENV_DIR`，自定义实体目录通过符号链接接入固定入口。
 
 对应的通用联接命令为：
 
@@ -58,7 +66,7 @@ mklink /J "<插件目录>\vendor\sam_runtime\venv" "<venv 实体目录>"
 
 正常情况下无需手工执行该命令。
 
-已有 `venv/` 时脚本会停止，避免覆盖本机环境。如需重建，可先手动删除 `venv/`，或设置:
+已有 runtime 时脚本会停止。QGIS 移动、卸载或升级使原环境失效时，请显式重建；删除前会验证具体 venv 路径及标记，拒绝不明目录。失败时保留实体环境和诊断。设置:
 
 ```bat
 set SAM_RECREATE=1
@@ -86,8 +94,9 @@ create_sam_venv.bat
 脚本分两层判断 CUDA:
 
 - 检测到 NVIDIA 环境时，会根据驱动报告的 CUDA 能力按兼容顺序尝试 PyTorch 官方 CUDA wheel 源；安装失败或运行时不可用时回退到 CPU 版 PyTorch。
+- CPU wheel 可通过 `SAM_TORCH_CPU_INDEX` 指定，默认 `https://download.pytorch.org/whl/cpu`。
 - 可通过 `SAM_TORCH_CUDA_INDEX` 指定单个 CUDA wheel 源，或通过 `SAM_TORCH_CUDA_INDEXES` 指定多个候选源；可通过 `SAM_TORCH_PACKAGES` 指定 `torch` / `torchvision` 的版本范围。
-- 只有同时检测到 `nvcc` 和 C/C++ 编译工具链时，才设置 `SAM2_BUILD_CUDA=1` 构建 SAM2 CUDA 扩展。
+- 只有同时检测到 `nvcc` 和 C/C++ 编译工具链且未显式设置 `SAM2_BUILD_CUDA=0` 时，才设置 `SAM2_BUILD_CUDA=1` 构建 SAM2 CUDA 扩展。
 - 缺少 CUDA 编译工具链时会设置 `SAM2_BUILD_CUDA=0`，仍允许使用 GPU PyTorch 或 CPU 推理。
 
 ## 环境检查

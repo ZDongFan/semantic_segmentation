@@ -1,6 +1,8 @@
 # 插件统一运行环境依赖参考。
 # create_sam_venv.bat / create_sam_venv.sh 会根据 CUDA 情况先安装 torch/torchvision，
-# 再安装主推理和 SAM AI 编辑共用的依赖。这里保留为人工排查或自定义安装时的参考清单。
+# 再安装主推理和 SAM AI 编辑共用的依赖。这里仅作为依赖参考清单。
+# 通用包默认来自清华 PyPI 镜像，用户可通过 PIP_INDEX_URL 覆盖。
+# torch/torchvision 由创建脚本先从专用 PyTorch wheel 索引安装；此文件不硬编码索引。
 numpy
 opencv-contrib-python
 Pillow

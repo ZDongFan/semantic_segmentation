@@ -1,170 +1,134 @@
 #!/usr/bin/env bash
-# 创建插件统一 Python 3.12 虚拟环境。
-# 默认位置固定为 land_cover_classification/vendor/sam_runtime/venv，供主推理和 SAM AI 编辑共用。
+# 创建插件统一独立运行时，按 QGIS、系统发行版、独立 Python 的顺序探测。
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/venv"
+sort_versions() {
+    # macOS 的 sort 不支持 -V，使用补齐的数字段作为排序键。
+    awk -F '\t' '{
+        n=split($1, v, ".");
+        printf "%08d.%08d.%08d.%08d\t%s\n", v[1], v[2], v[3], v[4], $2
+    }' | LC_ALL=C sort -r | cut -f2-
+}
 
-if [[ -z "${SAM_PYTHON:-}" ]]; then
-    if command -v python3.12 >/dev/null 2>&1; then
-        SAM_PYTHON="python3.12"
-    elif command -v python3 >/dev/null 2>&1; then
-        SAM_PYTHON="python3"
-    else
-        SAM_PYTHON="python"
-    fi
-fi
-
-echo "使用解释器: ${SAM_PYTHON}"
-"${SAM_PYTHON}" --version
-
-if [[ -d "${VENV_DIR}" ]]; then
-    if [[ "${SAM_RECREATE:-0}" == "1" ]]; then
-        echo "SAM_RECREATE=1，正在重建插件统一虚拟环境: ${VENV_DIR}"
-        rm -rf "${VENV_DIR}"
-    else
-        echo "发现已有插件统一虚拟环境: ${VENV_DIR}"
-        echo "如需重新创建，请先手动删除该目录，或设置 SAM_RECREATE=1 后重试。"
-        exit 1
-    fi
-fi
-
-echo "创建插件统一虚拟环境: ${VENV_DIR}"
-"${SAM_PYTHON}" -m venv "${VENV_DIR}"
-
-VENV_PY="${VENV_DIR}/bin/python"
-if [[ ! -x "${VENV_PY}" ]]; then
-    echo "未找到 venv 中的 python: ${VENV_PY}"
-    exit 1
-fi
-
-echo "升级 pip/setuptools/wheel..."
-"${VENV_PY}" -m pip install --upgrade pip setuptools wheel
-
-SAM_TORCH_CPU_INDEX="${SAM_TORCH_CPU_INDEX:-https://download.pytorch.org/whl/cpu}"
-SAM_TORCH_PACKAGES="${SAM_TORCH_PACKAGES:-torch torchvision}"
-
-USE_CUDA_TORCH=0
-if command -v nvidia-smi >/dev/null 2>&1; then
-    USE_CUDA_TORCH=1
-elif [[ -d /proc/driver/nvidia || -d /usr/local/cuda ]]; then
-    USE_CUDA_TORCH=1
-fi
-export USE_CUDA_TORCH
-
-TORCH_INSTALL_MODE=cpu
-if [[ "${USE_CUDA_TORCH}" == "1" ]]; then
-    echo "检测到 NVIDIA 环境，优先尝试 CUDA 版 PyTorch。"
-    if [[ -n "${SAM_TORCH_CUDA_INDEX:-}" ]]; then
-        SAM_TORCH_CUDA_INDEXES="${SAM_TORCH_CUDA_INDEX}"
-    fi
-    if [[ -z "${SAM_TORCH_CUDA_INDEXES:-}" ]]; then
-        SAM_TORCH_CUDA_INDEXES="$("${VENV_PY}" - <<'PY'
-import re
-import subprocess
-
-candidates = [
-    ((12, 8), "cu128"),
-    ((12, 6), "cu126"),
-    ((12, 4), "cu124"),
-    ((12, 1), "cu121"),
-    ((11, 8), "cu118"),
-]
-probe = subprocess.run(["nvidia-smi"], capture_output=True, text=True, errors="ignore")
-match = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", probe.stdout)
-driver_cuda = tuple(map(int, match.groups())) if match else (99, 99)
-print(" ".join(
-    "https://download.pytorch.org/whl/" + name
-    for required, name in candidates
-    if driver_cuda >= required
-))
-PY
-)"
-    fi
-
-    torch_installed=0
-    for index_url in ${SAM_TORCH_CUDA_INDEXES}; do
-        echo "Trying PyTorch wheel index: ${index_url}"
-        if "${VENV_PY}" -m pip install --force-reinstall ${SAM_TORCH_PACKAGES} --index-url "${index_url}"; then
-            if "${VENV_PY}" - <<'PY'
-import sys
-import torch
-
-print(
-    "torch",
-    torch.__version__,
-    "cuda_runtime",
-    torch.version.cuda,
-    "cuda_available",
-    torch.cuda.is_available(),
-)
-sys.exit(0 if torch.version.cuda and torch.cuda.is_available() else 1)
-PY
-            then
-                torch_installed=1
-                TORCH_INSTALL_MODE=cuda
-                break
+qgis_app_candidates() {
+    local app version python
+    local roots=("/Applications" "${HOME}/Applications")
+    for app in "${roots[@]}"; do
+        for app in "$app"/QGIS*.app; do
+            [[ -d "$app" ]] || continue
+            version=""
+            if [[ -x /usr/libexec/PlistBuddy ]]; then
+                version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || true)"
             fi
-        fi
+            if [[ -z "$version" ]]; then
+                version="$(basename "$app" | sed -E 's/^[^0-9]*//; s/[^0-9.].*$//')"
+            fi
+            printf '%s\t%s\n' "${version:-0}" "$app"
+        done
+    done | sort_versions | while IFS= read -r app; do
+        app_python_candidates "$app"
     done
+}
 
-    if [[ "${torch_installed}" != "1" ]]; then
-        echo "CUDA PyTorch installation failed or CUDA is unavailable at runtime. Falling back to CPU PyTorch wheels..."
-        # shellcheck disable=SC2086
-        "${VENV_PY}" -m pip install --force-reinstall ${SAM_TORCH_PACKAGES} --index-url "${SAM_TORCH_CPU_INDEX}"
+app_python_candidates() {
+    local app="$1" python version
+    for python in "$app"/Contents/Frameworks/Python.framework/Versions/*/bin/python3; do
+        [[ -x "$python" ]] || continue
+        version="${python%/bin/python3}"
+        printf '%s\t%s\n' "${version##*/}" "$python"
+    done | sort_versions
+    printf '%s\n' "$app/Contents/MacOS/bin/python3"
+}
+
+prefix_candidates() {
+    local prefix="$1"
+    # 兼容 /usr、/usr/share/qgis 和 app 内安装前缀。
+    printf '%s\n' "$prefix/bin/python3" "$prefix/../bin/python3" "$prefix/../../bin/python3"
+}
+
+qgis_candidates() {
+    local command_path prefix
+    if [[ -n "${ORIGINAL_QGIS_PREFIX:-}" ]]; then
+        prefix_candidates "$ORIGINAL_QGIS_PREFIX"
+        if [[ "$RUNTIME_PLATFORM" == Darwin && "$ORIGINAL_QGIS_PREFIX" == *.app/* ]]; then
+            app_python_candidates "${ORIGINAL_QGIS_PREFIX%%.app*}.app"
+        fi
     fi
-else
-    echo "未检测到 NVIDIA 环境，安装 CPU 版 PyTorch。"
-    # shellcheck disable=SC2086
-    "${VENV_PY}" -m pip install --force-reinstall ${SAM_TORCH_PACKAGES} --index-url "${SAM_TORCH_CPU_INDEX}"
-fi
-export TORCH_INSTALL_MODE
-
-SAM2_BUILD_CUDA=0
-if command -v nvcc >/dev/null 2>&1; then
-    if command -v gcc >/dev/null 2>&1 || command -v clang >/dev/null 2>&1; then
-        SAM2_BUILD_CUDA=1
+    if [[ "${RUNTIME_PLATFORM}" == Darwin ]]; then
+        qgis_app_candidates
+    else
+        for command_path in qgis qgis-ltr; do
+            command_path="$(command -v "$command_path" || true)"
+            [[ -n "$command_path" ]] || continue
+            prefix="$(cd "$(dirname "$command_path")/.." && pwd -P)"
+            prefix_candidates "$prefix"
+        done
+        printf '%s\n' /usr/bin/python3 /usr/local/bin/python3
     fi
+}
+
+try_candidate() {
+    local candidate="$1" source="$2" item
+    if [[ "$candidate" != */* ]]; then candidate="$(command -v "$candidate" || true)"; fi
+    if [[ -z "$candidate" || ! -x "$candidate" ]]; then
+        printf 'Unavailable candidate: %s\n' "$1" >&2
+        return 1
+    fi
+    candidate="$(cd "$(dirname "$candidate")" && pwd -P)/$(basename "$candidate")"
+    for item in "${SEEN[@]+"${SEEN[@]}"}"; do
+        [[ "$item" != "$candidate" ]] || return 1
+    done
+    SEEN+=("$candidate")
+    printf 'Checking %s: %s\n' "$source" "$candidate" >&2
+    if "$candidate" "$HELPER" --probe --target "$VENV_DIR" --link "$VENV_LINK"; then
+        SELECTED_PYTHON="$candidate"
+        SELECTED_SOURCE="$source"
+        return 0
+    fi
+    printf 'Candidate failed. If venv/ensurepip is missing, install your distribution python3-venv package.\n' >&2
+    return 1
+}
+
+select_python() {
+    local candidate
+    if [[ -n "${SAM_PYTHON:-}" ]]; then
+        if try_candidate "$SAM_PYTHON" SAM_PYTHON; then return 0; fi
+        echo 'Invalid SAM_PYTHON; no automatic fallback is allowed.' >&2
+        return 1
+    fi
+    while IFS= read -r candidate; do
+        if try_candidate "$candidate" 'QGIS/system distribution Python'; then return 0; fi
+    done < <(qgis_candidates)
+    echo 'No usable QGIS Python. Checking standalone Python.' >&2
+    while IFS= read -r candidate; do
+        if try_candidate "$candidate" 'PATH Python'; then return 0; fi
+    done < <(type -a -p python3 python 2>/dev/null || true)
+    echo 'No usable Python. Flatpak/Snap/AppImage Python may be inaccessible; set SAM_PYTHON to an external Python with venv/ensurepip.' >&2
+    return 1
+}
+
+main() {
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+    VENV_LINK="${SCRIPT_DIR}/venv"
+    VENV_DIR="${SAM_VENV_DIR:-$VENV_LINK}"
+    HELPER="${SCRIPT_DIR}/runtime_setup.py"
+    if [[ "${1:-}" != --discover-only && "${SAM_RECREATE:-0}" != 1 ]] &&
+        [[ -e "$VENV_LINK" || -L "$VENV_LINK" || -e "$VENV_DIR" || -L "$VENV_DIR" ]]; then
+        echo 'Existing runtime found. Set SAM_RECREATE=1 to rebuild.' >&2
+        return 1
+    fi
+    ORIGINAL_QGIS_PREFIX="${QGIS_PREFIX_PATH:-}"
+    unset PYTHONHOME PYTHONPATH PYTHONUSERBASE QGIS_PREFIX_PATH VIRTUAL_ENV
+    export PYTHONNOUSERSITE=1 PYTHONUTF8=1 PYTHONIOENCODING=utf-8:backslashreplace
+    RUNTIME_PLATFORM="$(uname -s)"
+    SEEN=()
+    select_python || return 1
+    printf 'Selected %s: %s\n' "$SELECTED_SOURCE" "$SELECTED_PYTHON"
+    [[ "${1:-}" != --discover-only ]] || return 0
+    "$SELECTED_PYTHON" "$HELPER" --target "$VENV_DIR" --link "$VENV_LINK" --source "$SELECTED_SOURCE"
+}
+
+# 允许回归测试加载发现函数，不执行创建流程。
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-export SAM2_BUILD_CUDA
-
-if [[ "${SAM2_BUILD_CUDA}" == "1" ]]; then
-    echo "检测到 nvcc 和 C/C++ 编译工具链，SAM2 可在需要时构建 CUDA 扩展。"
-else
-    echo "未检测到完整 CUDA 编译工具链，禁用 SAM2 CUDA 扩展构建。"
-fi
-
-echo "安装插件统一运行环境依赖..."
-"${VENV_PY}" -m pip install \
-    sam2 \
-    opencv-contrib-python \
-    numpy \
-    Pillow \
-    segmentation-models-pytorch==0.4.* \
-    timm \
-    rasterio \
-    scipy \
-    PyYAML
-
-echo "验证插件统一运行环境..."
-"${VENV_PY}" - <<'PY'
-import torch
-import torchvision
-import sam2
-import cv2
-import numpy
-import rasterio
-import scipy
-import yaml
-import timm
-import segmentation_models_pytorch
-import os
-
-print("torch", torch.__version__, "cuda", torch.cuda.is_available())
-print("plugin runtime ok")
-if os.environ.get("TORCH_INSTALL_MODE") == "cuda" and (not torch.version.cuda or not torch.cuda.is_available()):
-    raise SystemExit("Expected CUDA PyTorch, but the runtime is CPU-only.")
-PY
-
-echo "插件统一虚拟环境创建完成: ${VENV_DIR}"

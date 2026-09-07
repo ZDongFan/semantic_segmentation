@@ -4,7 +4,7 @@
 
 [general]
 name=LandCoverClassification
-qgisMinimumVersion=3.28
+qgisMinimumVersion=3.44
 qgisMaximumVersion=3.99
 description=基于 PyTorch bundle 的遥感影像语义分割插件，支持可选 DEM 规则后处理与 SAM AI 辅助编辑。
 version=0.1

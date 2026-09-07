@@ -45,54 +45,56 @@ Linux / macOS：
 land_cover_classification/vendor/sam_runtime/create_sam_venv.sh
 ```
 
-国内网络环境可在创建前设置清华 PyPI 镜像。该设置用于 `pip`、SAM2 和其他通用 Python 依赖；脚本为 PyTorch 的 CPU / CUDA wheel 显式指定了 `SAM_TORCH_CPU_INDEX`、`SAM_TORCH_CUDA_INDEX` 或 `SAM_TORCH_CUDA_INDEXES`，因此不会受 `PIP_INDEX_URL` 影响。
+插件要求 **QGIS 3.44+**。脚本默认优先使用 QGIS 自带或实际使用的 Python，通常无需额外安装独立 Python，也不限制 Python 必须为某个固定版本。解释器必须能够独立启动并提供 `venv` / `ensurepip`；第三方包兼容性由安装结果和完整导入验证判断。
+
+发现顺序为：显式 `SAM_PYTHON`、当前 QGIS 环境、其他 QGIS 安装、独立 Python。显式解释器无效时直接失败；自动发现失败时继续下一个候选。Windows 从 QGIS 的 `apps\Python3*\python.exe` 发现解释器，不选择 `bin\python.exe` 或 QGIS 启动包装器。多套 QGIS 按数字版本降序检查。Linux 优先 QGIS 安装前缀及系统发行版 Python；缺少标准库支持时，安装发行版对应的 `python3-venv` 包后重试。macOS 检查系统与用户 Applications 下的 QGIS 应用包。Flatpak / Snap / AppImage 内部 Python 无法独立使用时，请设置 `SAM_PYTHON` 指向外部可用解释器。
+
+通用依赖（pip、setuptools、wheel、SAM2 等）默认使用清华镜像：
+
+```text
+https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+已有 `PIP_INDEX_URL` 会覆盖默认值。日志只说明索引来源类型，不输出自定义 URL 凭据。镜像失败会保留 pip 错误并停止，不自动换源；可以显式切换到官方 PyPI 或其他可信镜像：
 
 Windows 命令提示符：
 
 ```bat
-set "PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple"
+set "PIP_INDEX_URL=https://pypi.org/simple"
 land_cover_classification\vendor\sam_runtime\create_sam_venv.bat
-```
-
-如果 Python 3.12 是按当前用户安装的，脚本会自动探测：
-
-```text
-%LOCALAPPDATA%\Programs\Python\Python312\python.exe
-```
-
-如需指定解释器或短路径，可在运行前设置：
-
-```bat
-set "SAM_PYTHON=%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
-set "SAM_VENV_DIR=D:\qgis_runtime\lcc_venv"
-land_cover_classification\vendor\sam_runtime\create_sam_venv.bat
-```
-
-通常不需要手工执行 `mklink`；脚本会自动创建：
-
-```bat
-mklink /J "<插件目录>\vendor\sam_runtime\venv" "<venv 实体目录>"
 ```
 
 Windows PowerShell：
 
 ```powershell
-$env:PIP_INDEX_URL = "https://pypi.tuna.tsinghua.edu.cn/simple"
+$env:PIP_INDEX_URL = "https://pypi.org/simple"
 .\land_cover_classification\vendor\sam_runtime\create_sam_venv.bat
 ```
 
 Linux / macOS：
 
 ```bash
-PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+PIP_INDEX_URL=https://pypi.org/simple \
   land_cover_classification/vendor/sam_runtime/create_sam_venv.sh
 ```
 
+如需显式指定解释器或短路径：
+
+```bat
+set "SAM_PYTHON=<可用 Python 的完整路径>"
+set "SAM_VENV_DIR=D:\qgis_runtime\lcc_venv"
+land_cover_classification\vendor\sam_runtime\create_sam_venv.bat
+```
+
+Windows 自动创建目录联接；Linux/macOS 使用 `SAM_VENV_DIR` 时会建立符号链接，插件始终访问固定的 `vendor/sam_runtime/venv` 入口。新环境必须满足 `include-system-site-packages=false`，不继承或修改 QGIS 的 site-packages。
+
+PyTorch 安装独立使用 `SAM_TORCH_*` wheel 索引：清除 pip 环境变量、禁用用户/全局 pip 配置文件、使用 `--isolated` 和显式 `--index-url`。清华镜像、`PIP_INDEX_URL`、`PIP_EXTRA_INDEX_URL` 和额外索引配置均不能改变 PyTorch 来源。后续通用依赖安装使用精确 torch/torchvision 约束和已有构建环境，版本冲突会明确失败；安装完成后再次校验版本及 CUDA 状态。
+
 脚本会检测 `nvidia-smi`。检测到 NVIDIA GPU 时会根据驱动报告的 CUDA 能力，从 PyTorch 官方 CUDA wheel 源中按兼容顺序尝试安装 `torch` / `torchvision`；如果 CUDA wheel 安装或运行时校验失败，会回退到 CPU 版，保证插件仍可运行。未检测到 NVIDIA 环境时直接安装 CPU 版。随后会安装 SAM2、OpenCV、rasterio、segmentation-models-pytorch、timm、scipy、PyYAML 等主推理和 AI 编辑共用依赖。
 
-如需在特殊环境中手动指定 PyTorch wheel 源，可设置 `SAM_TORCH_CUDA_INDEX` 或 `SAM_TORCH_CUDA_INDEXES`；如需指定包版本范围，可设置 `SAM_TORCH_PACKAGES`。
+如需在特殊环境中手动指定 PyTorch wheel 源，可设置 `SAM_TORCH_CPU_INDEX`、`SAM_TORCH_CUDA_INDEX` 或 `SAM_TORCH_CUDA_INDEXES`；如需指定包版本范围，可设置 `SAM_TORCH_PACKAGES`。
 
-已有 `venv/` 时脚本会停止，避免覆盖本机环境。如需重建，可先手动删除 `venv/`，或设置：
+已有 runtime 时脚本会停止。QGIS 被卸载、移动或升级后，如果原 venv 无法启动，应显式重建。脚本仅删除经路径校验且带 `pyvenv.cfg` 或创建标记的具体 venv，安装失败保留诊断和目录；不会删除无法识别的用户目录。重建时设置：
 
 ```bat
 set SAM_RECREATE=1
