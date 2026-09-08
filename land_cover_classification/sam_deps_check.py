@@ -11,6 +11,11 @@ import os
 import subprocess
 import sys
 
+try:
+    from .vendor.sam_runtime.runtime_setup import clean_environment
+except ImportError:
+    from vendor.sam_runtime.runtime_setup import clean_environment
+
 
 DEFAULT_BACKEND = "sam2"
 DEFAULT_MODEL_TYPE = "sam2.1_hiera_base_plus"
@@ -60,14 +65,9 @@ def default_python_executable():
 def runtime_environment(python_executable=None):
     """返回启动 SAM worker 时使用的清洁环境变量。"""
     python_executable = python_executable or default_python_executable()
-    env = os.environ.copy()
-
-    # 清理 QGIS/OSGeo4W 注入的 Python 环境变量，避免污染插件统一 venv。
-    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "QGIS_PREFIX_PATH"):
-        env.pop(key, None)
-
-    env["PYTHONNOUSERSITE"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8"
+    env = clean_environment(os.environ)
+    env["GDAL_FILENAME_IS_UTF8"] = "YES"
+    env["CPL_DEBUG"] = "OFF"
     env["VIRTUAL_ENV"] = default_venv_dir()
 
     python_dir = os.path.dirname(os.path.abspath(python_executable))
@@ -164,7 +164,7 @@ def installation_hint(missing, error="", _backend=None):
             "",
             "虚拟环境已存在，但下列模块缺失或导入失败:",
             "  {}".format(", ".join(missing)),
-            "请重新运行环境创建脚本；如需重建，可先删除 venv 或设置 SAM_RECREATE=1。",
+            "请运行安装入口查看完整验证日志；已有异常环境会保留，不自动删除或修复。",
         ])
 
     if error:

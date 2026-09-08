@@ -233,3 +233,4 @@ class LandCoverClassification:
         self.dock.show()
         self.dock.raise_()
         self.dock.activateWindow()
+        self.dlg.check_runtime_on_startup()

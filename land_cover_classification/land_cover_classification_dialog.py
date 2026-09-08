@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """LandCoverClassification 对话框。"""
 
+import codecs
 import json
+import shlex
 import math
 import os
 import shutil
@@ -47,6 +49,7 @@ from qgis.gui import QgsFileWidget, QgsRubberBand
 
 from . import pytorch_deps_check
 from . import sam_deps_check
+from .vendor.sam_runtime.runtime_setup import clean_environment, redact
 from .ai_edit_controller import AiEditController
 from .ai_segment_tool import AiSegmentMapTool
 from .inference_roi_tool import InferenceRoiMapTool
@@ -293,6 +296,155 @@ def _remove_existing_shapefile(path):
     for candidate in _shape_base_files(path):
         if os.path.exists(candidate):
             os.remove(candidate)
+
+class RuntimeInstallDialog(QtWidgets.QDialog):
+    """用与手动安装相同的入口异步安装，持续展示并保存脱敏日志。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("安装插件统一运行环境")
+        self.resize(760, 480)
+        self.setModal(False)
+        self._running = False
+        self._cancelled = False
+        self._buffer = ""
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._logfile = None
+        self._cancel_file = None
+        self._log_path = ""
+        self._script = pytorch_deps_check._create_script_path()
+        layout = QtWidgets.QVBoxLayout(self)
+        self._stage = QtWidgets.QLabel(
+            "下载独立 Python 3.12，创建 venv 并安装依赖。安装需要联网，模型由外部提供。")
+        self._stage.setWordWrap(True)
+        layout.addWidget(self._stage)
+        self._output = QtWidgets.QPlainTextEdit()
+        self._output.setReadOnly(True)
+        layout.addWidget(self._output)
+        buttons = QtWidgets.QHBoxLayout()
+        self._start = QtWidgets.QPushButton("开始安装")
+        self._copy = QtWidgets.QPushButton("复制手动安装命令")
+        self._close = QtWidgets.QPushButton("关闭")
+        for button in (self._start, self._copy, self._close):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        self._start.clicked.connect(self._begin)
+        self._copy.clicked.connect(self._copy_command)
+        self._close.clicked.connect(self.reject)
+        self._process = QProcess(self)
+        self._process.setProcessChannelMode(QProcess.MergedChannels)
+        self._process.readyReadStandardOutput.connect(self._read_output)
+        self._process.finished.connect(self._finished)
+        self._process.errorOccurred.connect(self._error)
+
+    def _copy_command(self):
+        """Windows 命令可直接粘贴到 PowerShell，其他系统显式使用 Bash。"""
+        command = ("& '" + self._script.replace("'", "''") + "'" if os.name == "nt"
+                   else "bash " + shlex.quote(self._script))
+        QtWidgets.QApplication.clipboard().setText(command)
+
+    def _append(self, text):
+        """只显示完整解码后的脱敏行，防止分块边界泄漏 URL 凭据。"""
+        text = redact(text)
+        self._output.appendPlainText(text.rstrip("\r\n"))
+        if self._logfile:
+            self._logfile.write(text.rstrip("\r\n") + "\n")
+            self._logfile.flush()
+        if text.startswith("[stage]"):
+            self._stage.setText(text.strip())
+
+    def _begin(self):
+        """QProcess 启动脚本，QGIS 主进程只接收文本日志。"""
+        if self._running:
+            return
+        try:
+            log_dir = (os.path.join(os.environ["LOCALAPPDATA"], "LCCRuntime", "logs")
+                       if os.name == "nt" else os.path.join(os.path.dirname(self._script), "logs"))
+            os.makedirs(log_dir, exist_ok=True)
+            self._log_path = os.path.join(log_dir, "qgis-install-{}.log".format(uuid.uuid4().hex))
+            self._logfile = open(self._log_path, "w", encoding="utf-8")
+            self._cancel_file = self._log_path + ".cancel"
+        except OSError as exc:
+            self._append("无法创建安装日志: {}".format(exc))
+            return
+        env = QProcessEnvironment()
+        for key, value in clean_environment(os.environ).items():
+            env.insert(key, value)
+        env.insert("LCC_CANCEL_FILE", self._cancel_file)
+        self._process.setProcessEnvironment(env)
+        self._process.setWorkingDirectory(os.path.dirname(self._script))
+        self._running = True
+        self._start.setEnabled(False)
+        self._close.setText("取消安装")
+        self._append("界面日志: {}".format(self._log_path))
+        self._stage.setText("正在启动安装入口……")
+        if os.name == "nt":
+            # 工作目录已固定到脚本目录，避免 cmd 对含空格完整路径的二次解析。
+            self._process.start(_cmd_executable(),
+                                ["/d", "/c", "create_sam_venv.bat", "--non-interactive"])
+        else:
+            self._process.start("bash", [self._script, "--non-interactive"])
+
+    def _read_output(self):
+        """持续读取合并的 stdout/stderr，UTF-8 字符跨块时保留解码状态。"""
+        self._buffer += self._decoder.decode(bytes(self._process.readAllStandardOutput()))
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._append(line)
+
+    def _error(self, error):
+        """保留 QProcess 原始错误；无法启动时也完成日志收尾。"""
+        self._append("QProcess 错误 {}: {}".format(error, self._process.errorString()))
+        if error == QProcess.FailedToStart:
+            self._finished(-1, QProcess.CrashExit)
+
+    def _finished(self, exit_code, exit_status):
+        """安装成功只刷新状态，不自动开始推理。"""
+        self._read_output()
+        self._buffer += self._decoder.decode(b"", final=True)
+        if self._buffer:
+            self._append(self._buffer)
+            self._buffer = ""
+        self._running = False
+        success = (not self._cancelled and exit_code == 0 and
+                   exit_status == QProcess.NormalExit and pytorch_deps_check.venv_ready())
+        result = "安装完成，环境已就绪；可关闭后手动运行推理。" if success else (
+            "安装已取消，已保留目录及日志。" if self._cancelled else "安装未完成，请查看上方原始错误。")
+        self._stage.setText(result)
+        self._append("{}\n退出码: {}；进程状态: {}\n日志: {}".format(
+            result, exit_code, exit_status, self._log_path))
+        self.parent().statusLabel.setText(result)
+        self._close.setText("关闭")
+        self._close.setEnabled(True)
+        if self._logfile:
+            self._logfile.close()
+            self._logfile = None
+        if self._cancel_file and os.path.isfile(self._cancel_file):
+            os.remove(self._cancel_file)
+
+    def reject(self):
+        """安装中关闭或按 Esc 视为取消，等待子进程停止后保留对话框。"""
+        if self._running:
+            try:
+                with open(self._cancel_file, "w", encoding="utf-8") as handle:
+                    handle.write("cancel\n")
+            except OSError as exc:
+                self._append("无法写入取消请求: {}".format(exc))
+                return
+            self._cancelled = True
+            self._stage.setText("正在取消并停止安装子进程……")
+            self._close.setEnabled(False)
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        """窗口关闭按钮遵循同样的取消语义。"""
+        if self._running:
+            self.reject()
+            event.ignore()
+        else:
+            event.accept()
+
 
 class _MirroredLabel:
 
@@ -2010,19 +2162,25 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.outputFileWidget.setFilePath(self._vector_output_path())
         self.rasterFileWidget.setFilePath(self._raster_output_path())
 
+    def check_runtime_on_startup(self):
+        """打开插件时只检查 venv 解释器是否存在，缺少时立即引导安装。"""
+        if not pytorch_deps_check.venv_ready():
+            self._show_runtime_installer()
+
+    def _show_runtime_installer(self):
+        """重复点击复用安装窗口，避免同一界面启动多个安装。"""
+        dialog = getattr(self, "_runtime_install_dialog", None)
+        if dialog is None or not dialog.isVisible():
+            dialog = RuntimeInstallDialog(self)
+            self._runtime_install_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _ensure_pytorch_venv_available(self):
         if pytorch_deps_check.venv_ready():
             return True
-        status = {
-            "missing": [name for name, _ in pytorch_deps_check.requirements()],
-            "error": "",
-            "cuda_available": False,
-            "cuda_checked": False,
-        }
-        message = pytorch_deps_check.installation_hint(status)
-        self.statusLabel.setText("PyTorch 运行环境未就绪:\n{}".format(message))
-        QtWidgets.QMessageBox.warning(
-            self, "缺少插件统一运行环境", message)
+        self.statusLabel.setText("缺少插件运行环境，请重新打开插件完成安装。")
         return False
 
     def _prepare_inference_context(self):
@@ -2852,6 +3010,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 canvas.refresh()
             except Exception:
                 pass
+        if not sam_deps_check.venv_ready():
+            self.statusLabel.setText("缺少插件运行环境，请重新打开插件完成安装。")
+            return
         ok, message = sam_deps_check.ensure_ready()
         if not ok:
             QtWidgets.QMessageBox.warning(self, "SAM 环境未就绪", message)

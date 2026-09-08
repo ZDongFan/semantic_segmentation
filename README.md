@@ -9,7 +9,7 @@
 ## 主要功能
 
 - 扫描模型根目录下带 `manifest.json` 的 PyTorch 语义分割 bundle，并在模型下拉框中列出；bundle 子目录名由外部模型提供方决定，不作为兼容性判断条件。
-- 使用插件统一运行环境 `vendor/sam_runtime/venv/` 子进程执行 PyTorch 主推理和 SAM AI 编辑，QGIS 主进程不导入 `torch`；打开插件面板时不检查 / 加载 venv，点击“运行”后才检查 PyTorch 主推理环境。
+- 使用插件统一运行环境 `vendor/sam_runtime/venv/` 子进程执行 PyTorch 主推理和 SAM AI 编辑，QGIS 主进程不导入 `torch`；启动插件、打开主面板时立即检查 venv 是否存在，缺少时弹出安装引导；点击推理或 AI 编辑不再触发安装弹窗。
 - 输入支持 JPEG、PNG、GeoTIFF、ENVI `.dat/.img` 与 ERDAS Imagine `.img`；`.ige` 作为同名 `.img` 的伴随入口。插件按 GDAL 实际驱动识别 `ENVI`/`HFA`，统一 runtime 不能直读时会以可取消任务转换为会话级 tiled BigTIFF。
 - 当前草稿工作流固定处理 `landslide` 类别：启动推理前会在 `manifest.json` 的类别列表中以大小写不敏感方式查找唯一的 `landslide`。如同时声明 `landslide_class_id`，其值必须与该类别索引一致；缺失、重复或冲突会在启动子进程前失败。
 - 生产推理采用“核心区 + halo”流式处理：输入影像通过有限 `rasterio.windows.Window` 读取，DEM 只重投影到当前局部格网，并调用 bundle 内 `dem_factors.py` 计算局部派生因子。
@@ -30,7 +30,7 @@
 5. 如需使用 AI 辅助编辑，准备 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`。
 6. 重启 QGIS，并在插件管理器中启用 `LandCoverClassification`。
 
-创建脚本优先使用 QGIS 自带或实际使用的 Python，通常无需额外安装独立 Python；不固定 Python 版本，可用 `SAM_PYTHON` 显式覆盖。所有依赖仅安装到独立 venv。通用包默认使用清华 PyPI 镜像，`PIP_INDEX_URL` 可覆盖；PyTorch 的 CPU/CUDA wheel 始终通过隔离配置的 `SAM_TORCH_*` 专用索引安装。Linux 缺少 venv/ensurepip 时请安装发行版的 `python3-venv` 包。QGIS 移动、卸载或升级导致旧 venv 无法启动时，用 `SAM_RECREATE=1` 重建。详细说明见 [安装文档](docs/install.md)。
+安装入口下载固定的独立 CPython 3.12.12（构建 20251014），创建唯一 venv；不依赖 QGIS/系统 Python。缺少环境时插件可引导安装，也可手动执行 `.bat` 或 `bash create_sam_venv.sh`，实时日志和取消使用相同流程。通用包默认清华镜像，`PIP_INDEX_URL` 可覆盖；Windows/Linux 保留隔离的 `SAM_TORCH_*` 源与 CUDA/CPU 回退，macOS 使用官方 PyPI 并按 CPU 验证。macOS Intel 当前存在官方 Torch/SAM2 依赖冲突。已有环境只验证，不自动删除、修复或重装；模型由外部提供。平台实测范围、固定资产和日志位置见 [安装文档](docs/install.md)。
 
 更详细的模型目录说明见 [`docs/model_layout.md`](docs/model_layout.md)。
 

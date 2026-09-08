@@ -11,6 +11,11 @@ import os
 import subprocess
 import sys
 
+try:
+    from .vendor.sam_runtime.runtime_setup import clean_environment
+except ImportError:
+    from vendor.sam_runtime.runtime_setup import clean_environment
+
 
 # 复用现有 SAM runtime 目录作为插件级统一运行环境，避免维护两套 venv。
 DEFAULT_VENV_RELATIVE = os.path.join("vendor", "sam_runtime", "venv")
@@ -50,12 +55,7 @@ def default_python_executable():
 def runtime_environment(python_executable=None):
     """返回启动 PyTorch runner 时使用的清洁环境变量。"""
     python_executable = python_executable or default_python_executable()
-    env = os.environ.copy()
-    for key in ("PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE", "QGIS_PREFIX_PATH"):
-        env.pop(key, None)
-    env["PYTHONNOUSERSITE"] = "1"
-    env["PYTHONUTF8"] = "1"
-    env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
+    env = clean_environment(os.environ)
     env["GDAL_FILENAME_IS_UTF8"] = "YES"
     env["CPL_DEBUG"] = "OFF"
     env["VIRTUAL_ENV"] = default_venv_dir()
@@ -225,7 +225,7 @@ def installation_hint(status=None):
             "",
             "虚拟环境已存在，但以下模块缺失或导入失败:",
             "  {}".format(", ".join(status.get("missing") or [])),
-            "请重新运行 vendor/sam_runtime/ 下的环境创建脚本；必要时先删除 venv 或设置 SAM_RECREATE=1。",
+            "请运行 vendor/sam_runtime/ 下的安装入口查看验证日志；已有异常环境不会自动删除或修复。",
         ])
 
     if status.get("error"):
