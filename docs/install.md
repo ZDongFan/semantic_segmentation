@@ -11,7 +11,7 @@ land_cover_classification/vendor/sam_runtime/venv/
 - PyTorch bundle 主推理
 - SAM2 AI 辅助编辑
 
-Windows 下脚本默认将 venv 实体放在 `%LOCALAPPDATA%\LCCRuntime\venv`，并在插件目录的 `vendor\sam_runtime\venv` 创建目录联接。这样可以避免 QGIS 默认插件路径过长导致 wheel 安装失败；插件代码和验证命令仍使用原有入口路径。
+Windows 下脚本固定将 venv 实体放在 `%LOCALAPPDATA%\LCCRuntime\venv`，并在插件目录的 `vendor\sam_runtime\venv` 创建目录联接。这样可以避免 QGIS 默认插件路径过长导致 wheel 安装失败；插件代码和验证命令仍使用原有入口路径。
 
 不要把 PyTorch、SAM2、rasterio、segmentation-models-pytorch 等重依赖安装到 QGIS 主进程 Python 中。QGIS 主进程只负责界面、图层、矢量化与导出。
 
@@ -37,7 +37,7 @@ Linux 默认目录：
 
 ### 插件引导安装
 
-启动插件、打开主面板时立即检查 venv 是否存在；缺少时直接打开安装提示框，提供“开始安装”“复制手动安装命令”“关闭”。安装使用 QProcess 异步执行与手动方式相同的 `.bat` / `.sh`，显示阶段、连续输出和日志路径；安装过程中“关闭”变为“取消安装”。
+启动插件、打开主面板时仅检查 venv 解释器文件是否存在，不导入重依赖，也不代表环境功能验收已通过；缺少时直接打开安装提示框，提供“开始安装”“复制手动安装命令”“关闭”。安装使用 QProcess 异步执行与手动方式相同的 `.bat` / `.sh`，显示阶段、连续输出和日志路径；安装过程中“关闭”变为“取消安装”。
 
 成功后更新环境状态，不自动开始推理。失败或取消保留窗口、原始异常、退出码及已有目录，不触发修复或重装。日志可选择、复制；URL 中的代理和索引认证、路径及查询参数均脱敏。安装器不修改 QGIS 主进程的 Python 包路径或注册 QGIS DLL 目录。
 
@@ -145,7 +145,9 @@ Torch 步骤清除通用 `PIP_*` 来源配置、禁用 pip 配置文件，使用
 '<插件目录>/vendor/sam_runtime/venv/bin/python' '<插件目录>/vendor/sam_runtime/runtime_setup.py' --functional-check
 ```
 
-### 本次实际验收（2026-09-08）
+### 提交附带的验收记录（2026-09-08）
+
+以下为提交 `8f0f84cc` 附带的历史验收记录，不表示每次更新文档或索引后重新执行过这些测试。本地测试资产与已提交测试应分别核对，开发入口及复验建议见 [development.md](development.md)。
 
 | 平台 | 独立 Python 安装 | 完整依赖与外部模型 |
 | --- | --- | --- |
@@ -198,7 +200,7 @@ land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt
 1. 重启 QGIS。
 2. 启用 `LandCoverClassification` 插件。
 3. 在“模型推理”页签选择输入影像和 PyTorch bundle；DEM 文件可不选，也可只覆盖目标范围的一部分，再执行全图推理。
-4. 如需仅处理当前视图，可在“草稿编辑”页签使用“按当前画布范围推理”；该功能要求输入影像具有有效地理参考，且当前画布与影像存在有效交集。
+4. 如需仅处理当前视图，可在“模型推理”页签使用“按当前画布范围推理”；该功能要求输入影像具有有效地理参考，且当前画布与影像存在有效交集。
 5. 如需处理任意闭合范围，可在“模型推理”页签逐点绘制多边形，确认蓝色预览后点击“按绘制范围推理”。范围只在当前插件会话中保留，且同样要求输入影像具有有效地理参考。
 
 输入文件可使用 JPEG、PNG、GeoTIFF、ENVI `.dat/.img` 或 ERDAS Imagine `.img`。`.ige` 只能作为同目录同名 `.img` 的入口。点击运行或启动 AI 编辑后，插件会分别验证 QGIS GDAL 与统一 runtime 的实际读取能力；runtime 缺少 ENVI/HFA 驱动时，QGIS 会以可取消任务转换为会话级 tiled BigTIFF。转换前会检查临时目录空间，原始文件不会被覆盖。

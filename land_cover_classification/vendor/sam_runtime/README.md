@@ -18,4 +18,4 @@ Linux/macOS：运行 `bash create_sam_venv.sh`，默认 Python 和 venv 均在�
 
 日志：Windows 为 `%LOCALAPPDATA%\LCCRuntime\logs`，Linux/macOS 为本目录 `logs`。界面日志为 `qgis-install-*.log`，入口日志为 `install-*.log`；失败和取消均保留日志。
 
-本次 Windows CPU 环境、真实外部 bundle 和 SAM2 worker 已通过；Linux/macOS 未实测，CUDA 实机和整机断网重启 QGIS 尚未验证。完整资产列表、校验值、配置、错误处理和验收记录见 [安装文档](../../../docs/install.md)。
+本次 Windows CPU 环境、真实外部 bundle 和 SAM2 worker 已通过；Linux/macOS 未实测，CUDA 实机和整机断网重启 QGIS 尚未验证。完整资产列表、校验值、配置、错误处理和验收记录见 [安装文档](../../../docs/install.md)；开发调用关系及索引维护见 [开发文档](../../../docs/development.md)。

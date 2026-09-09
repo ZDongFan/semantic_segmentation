@@ -25,19 +25,19 @@
 
 1. 安装 QGIS 3.44+。
 2. 将 `land_cover_classification/` 目录部署到 QGIS 插件目录。
-3. 运行 `land_cover_classification/vendor/sam_runtime/create_sam_venv.bat` 或 `create_sam_venv.sh` 创建插件统一运行环境。
+3. 运行 `land_cover_classification/vendor/sam_runtime/create_sam_venv.bat` 或 `bash land_cover_classification/vendor/sam_runtime/create_sam_venv.sh` 创建插件统一运行环境，也可在打开插件后的安装引导中点击“开始安装”。
 4. 将训练仓导出的 PyTorch bundle 子目录放入 `land_cover_classification/models/semantic_segmentation/`。
 5. 如需使用 AI 辅助编辑，准备 `land_cover_classification/models/sam2/sam2.1_hiera_base_plus.pt`。
 6. 重启 QGIS，并在插件管理器中启用 `LandCoverClassification`。
 
 安装入口下载固定的独立 CPython 3.12.12（构建 20251014），创建唯一 venv；不依赖 QGIS/系统 Python。缺少环境时插件可引导安装，也可手动执行 `.bat` 或 `bash create_sam_venv.sh`，实时日志和取消使用相同流程。通用包默认清华镜像，`PIP_INDEX_URL` 可覆盖；Windows/Linux 保留隔离的 `SAM_TORCH_*` 源与 CUDA/CPU 回退，macOS 使用官方 PyPI 并按 CPU 验证。macOS Intel 当前存在官方 Torch/SAM2 依赖冲突。已有环境只验证，不自动删除、修复或重装；模型由外部提供。平台实测范围、固定资产和日志位置见 [安装文档](docs/install.md)。
 
-更详细的模型目录说明见 [`docs/model_layout.md`](docs/model_layout.md)。
+更详细的模型目录说明见 [`docs/model_layout.md`](docs/model_layout.md)。开发入口、安装调用关系和本地代码索引维护见 [`docs/development.md`](docs/development.md)。
 
 ## 使用流程
 
 1. 在 `模型推理` 页签中选择 PyTorch bundle 和输入图层或本地影像；DEM 文件为可选项，允许部分覆盖。
-2. 点击“运行”执行全图推理；已地理配准的影像也可在 `草稿编辑` 页签点击“按当前画布范围推理”，仅刷新当前视图与输入影像相交的范围。
+2. 点击“运行”执行全图推理；已地理配准的影像也可在 `模型推理` 页签点击“按当前画布范围推理”，仅刷新当前视图与输入影像相交的范围。
 3. 基础参数校验通过后，插件检查 PyTorch 统一运行环境，生成类别 GeoTIFF、后处理审计 JSON，并把结果融合到会话草稿。
 4. 推理完成后自动进入 `草稿编辑` 页签；可直接手动编辑，使用 AI 辅助编辑追加对象，或在未发生后续修改前撤销最近一次模型推理融合。
 5. 在 `导出` 页签中选择格式和目录，点击“导出结果”从当前草稿导出最终成果。

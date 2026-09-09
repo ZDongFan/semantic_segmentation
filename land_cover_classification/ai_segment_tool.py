@@ -57,7 +57,8 @@ class AiSegmentMapTool(QgsMapTool):
             return
         super().deactivate()
 
-    def canvasPressEvent(self, event):
+    def canvasReleaseEvent(self, event):
+        # 松开后再预测，避免等待期间处理松开事件后被 QGIS 按下回调重新置位。
         if self._disposed:
             return
         point = self.toMapCoordinates(event.pos())
