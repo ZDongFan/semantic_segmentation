@@ -52,15 +52,151 @@ safe_archive() {
     ' "$details" || { echo 'Unsafe archive member or link' >&2; return 1; }
 }
 
+assert_download_file() {
+    if [[ -L "$1" || ( -e "$1" && ! -f "$1" ) ]]; then
+        echo "下载路径必须是普通文件，已保留: $1" >&2; return 1
+    fi
+}
+download_size() {
+    if [[ ! -e "$1" ]]; then echo 0
+    else stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; fi
+}
+download_mib() { awk -v size="$1" 'BEGIN {printf "%.2f", size/1048576}'; }
+download_now() { echo "$SECONDS"; }
+download_progress() {
+    # 采样时间与字节数作为参数传入，便于用可控时钟验证日志。
+    awk -v size="$1" -v previous="$2" -v now="$3" -v last="$4" -v started="$5" -v attempt="$6" '
+        BEGIN {
+            delta=size-previous; if(delta<0) delta=0;
+            printf "[download] 已下载 %.2f MiB；最近速度 %.1f KiB/s；本次耗时 %.0f 秒；尝试 %d/3%s\n",
+                size/1048576, delta/1024/(now-last), now-started, attempt,
+                delta==0 ? "；正在等待数据" : "";
+        }'
+}
+download_log_stream() {
+    # awk 必须逐行刷新，tee 直接转发字节到 QProcess 与日志。
+    awk '{gsub(/(https?|socks5h?|socks4):\/\/[^[:space:]<>]+/, "[redacted URL]"); print; fflush()}' | tee -a "$1"
+}
+acquire_bootstrap_lock() {
+    mkdir "$1" || { echo "Another installation or interrupted lock exists: $1" >&2; return 1; }
+}
+stop_download() {
+    if [[ -n "${pid:-}" ]]; then
+        kill "$pid" 2>/dev/null || true
+        # wait 的非零状态不应触发 set -e，必须先回收进程再释放锁。
+        wait "$pid" 2>/dev/null || true
+        pid=''
+        [[ ! -f "$lock/curl-error" ]] || cat "$lock/curl-error"
+        echo "[download] 已保留 $(download_mib "$(download_size "$download_part")") MiB；已保留下载文件，重新执行安装入口可继续下载: $download_part"
+    fi
+}
+release_bootstrap_lock() {
+    stop_download
+    rm -f "$lock/names" "$lock/details" "$lock/curl-status" "$lock/curl-error"
+    rmdir "$lock"
+}
+download_cpython() {
+    # 调用方持有安装锁；测试可注入短超时与本地 URL，生产入口保持固定默认值。
+    local url="$1" sha="$2" cache="$3" connect_timeout="${4:-30}" max_time="${5:-900}"
+    local speed_time="${6:-120}" speed_limit="${7:-1024}" interval="${8:-10}"
+    local delay1="${9:-2}" delay2="${10:-5}" protocol="${11:-=https}"
+    local part="$cache.part" attempt size previous_size now previous_time started code status delay retry_start
+    download_part="$part"
+    assert_download_file "$cache" || return 1
+    assert_download_file "$part" || return 1
+    check_cancel || return 130
+    if [[ -f "$cache" ]]; then
+        echo '[stage] 校验已有 CPython 缓存 SHA-256'
+        [[ "$(hash_file "$cache")" == "$sha" ]] || {
+            echo "SHA-256 校验失败，缓存已保留，请移走异常文件后重新下载: $cache"; return 1;
+        }
+        return 0
+    fi
+    if [[ -f "$part" ]]; then
+        echo '[stage] 校验已保留下载的 SHA-256'
+        if [[ "$(hash_file "$part")" == "$sha" ]]; then
+            check_cancel || return 130
+            mv "$part" "$cache" || return 1
+            echo '[stage] 完整临时文件 SHA-256 校验通过，已发布缓存'
+            return 0
+        fi
+    fi
+    for attempt in 1 2 3; do
+        check_cancel || return 130
+        assert_download_file "$part" || return 1
+        previous_size="$(download_size "$part")" || return 1
+        if (( previous_size > 0 )); then
+            echo "[stage] 正在续传 CPython：已保留 $(download_mib "$previous_size") MiB，尝试 $attempt/3"
+        else
+            echo "[stage] 正在下载 CPython：已保留 0.00 MiB，尝试 $attempt/3"
+        fi
+        curl --disable --fail --location --silent --show-error --continue-at - \
+            --connect-timeout "$connect_timeout" --max-time "$max_time" \
+            --speed-time "$speed_time" --speed-limit "$speed_limit" \
+            --proto "$protocol" --proto-redir "$protocol" --tlsv1.2 \
+            --write-out '%{http_code}' --output "$part" "$url" > "$lock/curl-status" 2> "$lock/curl-error" &
+        pid=$!
+        started="$(download_now)"
+        previous_time="$started"
+        while kill -0 "$pid" 2>/dev/null; do
+            if ! check_cancel; then stop_download; return 130; fi
+            now="$(download_now)"
+            if (( now - previous_time >= interval )); then
+                size="$(download_size "$part")" || { stop_download; return 1; }
+                download_progress "$size" "$previous_size" "$now" "$previous_time" "$started" "$attempt"
+                previous_time="$now"
+                previous_size="$size"
+            fi
+            sleep 0.2
+        done
+        code=0
+        wait "$pid" || code=$?
+        pid=''
+        cat "$lock/curl-error"
+        status="$(cat "$lock/curl-status")"
+        size="$(download_size "$part")" || return 1
+        echo "[download] 本次传输结束：curl exit $code；HTTP $status；已保留 $(download_mib "$size") MiB"
+        check_cancel || return 130
+        if [[ "$code" == 0 || "$code" == 33 || "$status" == 416 ]]; then
+            echo '[stage] 校验下载文件 SHA-256'
+            if [[ -f "$part" && "$(hash_file "$part")" == "$sha" ]]; then
+                check_cancel || return 130
+                mv "$part" "$cache" || return 1
+                echo '[stage] CPython 下载完成，SHA-256 校验通过，已发布缓存'
+                return 0
+            fi
+            echo "SHA-256 校验失败或服务端不支持续传 (curl exit $code; HTTP $status)，已保留，请移走异常文件后重新下载: $part"
+            return 1
+        fi
+        case "$code:$status" in
+            5:*|6:*|7:*|18:*|28:*|52:*|55:*|56:*|22:408|22:429|22:500|22:502|22:503|22:504) ;;
+            *) echo "已保留下载文件，重新执行安装入口可继续下载: $part"; return "$code" ;;
+        esac
+        if (( attempt == 3 )); then
+            echo "已保留下载文件，重新执行安装入口可继续下载: $part"; return "$code"
+        fi
+        delay="$delay1"
+        if (( attempt == 2 )); then delay="$delay2"; fi
+        echo "[stage] 连接中断，已保留 $(download_mib "$size") MiB，$delay 秒后继续下载。"
+        retry_start="$(download_now)"
+        while (( $(download_now) - retry_start < delay )); do
+            if ! check_cancel; then
+                echo "已保留下载文件，重新执行安装入口可继续下载: $part"; return 130
+            fi
+            sleep 0.2
+        done
+    done
+}
+
 main() {
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-    local system machine arm_capable=0 tool part cache base python target link
+    local system machine arm_capable=0 tool cache base python target link
     lock=''
     pid=''
     mkdir -p "$SCRIPT_DIR/logs"
     export LCC_LOG_PATH="$SCRIPT_DIR/logs/install-$(date +%Y%m%d-%H%M%S)-$$.log"
     # 终端与日志使用同一脱敏流；公共 Python 不再重复写入文件。
-    exec > >(awk '{gsub(/(https?|socks5h?|socks4):\/\/[^[:space:]<>]+/, "[redacted URL]"); print; fflush()}' | tee -a "$LCC_LOG_PATH") 2>&1
+    exec > >(download_log_stream "$LCC_LOG_PATH") 2>&1
     export LCC_LOG_CAPTURED=1
     echo "Log: $LCC_LOG_PATH"
     system="$(uname -s)"
@@ -85,9 +221,9 @@ main() {
     base="$SCRIPT_DIR/python-3.12.12-20251014"
     python="$base/python/bin/python3"
     lock="$SCRIPT_DIR/.bootstrap-lock"
-    mkdir "$lock" || { echo "Another installation or interrupted lock exists: $lock"; return 1; }
+    acquire_bootstrap_lock "$lock" || return 1
     # 只释放本次持有的锁，下载中断保留临时文件和已验证缓存。
-    trap 'code=$?; trap - EXIT; [[ -z "$pid" ]] || kill "$pid" 2>/dev/null || true; rm -f "$lock/names" "$lock/details"; rmdir "$lock"; echo "Exit: $code; Log: $LCC_LOG_PATH"; exit "$code"' EXIT
+    trap 'code=$?; trap - EXIT; release_bootstrap_lock; echo "Exit: $code; Log: $LCC_LOG_PATH"; exit "$code"' EXIT
     trap 'exit 130' INT TERM
     # 引导阶段先隔离 QGIS 的 Python、GDAL/PROJ 与动态库注入。
     local key item cleaned_path='' qgis_prefix="${QGIS_PREFIX_PATH:-}" osgeo_root="${OSGEO4W_ROOT:-}"
@@ -117,19 +253,7 @@ main() {
     if [[ ! -e "$base" && ! -L "$base" ]]; then
         mkdir -p "$SCRIPT_DIR/downloads"
         cache="$SCRIPT_DIR/downloads/$SHA.tar.gz"
-        if [[ ! -e "$cache" ]]; then
-            part="$cache.part-$$"
-            echo '[stage] Downloading standalone CPython 3.12.12 / 20251014'
-            curl -fL --silent --show-error --retry 2 --connect-timeout 30 --max-time 900 --proto '=https' --tlsv1.2 \
-                "https://github.com/astral-sh/python-build-standalone/releases/download/20251014/$ASSET" -o "$part" &
-            pid=$!
-            while kill -0 "$pid" 2>/dev/null; do check_cancel; sleep 0.2; done
-            wait "$pid"
-            pid=''
-            [[ "$(hash_file "$part")" == "$SHA" ]] || { echo "SHA-256 mismatch: $part"; return 1; }
-            mv "$part" "$cache"
-        fi
-        [[ "$(hash_file "$cache")" == "$SHA" ]] || { echo "SHA-256 mismatch: $cache"; return 1; }
+        download_cpython "https://github.com/astral-sh/python-build-standalone/releases/download/20251014/$ASSET" "$SHA" "$cache"
         echo '[stage] SHA-256 verified; checking archive paths'
         safe_archive "$cache" "$lock/names" "$lock/details"
         rm "$lock/names" "$lock/details"

@@ -93,7 +93,13 @@ SAM_VENV_DIR='/可写路径/独立环境' bash '<插件目录>/vendor/sam_runtim
 
 Windows 固定存放在 LOCALAPPDATA，不接受 `SAM_VENV_DIR`。发现旧 `SAM_PYTHON` 时说明新策略并忽略该解释器；`SAM_RECREATE` 已取消，不再删除旧环境。已有完整 venv 只执行功能验证和 `pip check`，不重复安装。已有不完整或异常 venv 报告其路径及错误并停止，不复制旧 site-packages，不自动删除或修复。
 
-下载先写入 `.part-<PID>`，通过 SHA-256 才成为 `downloads/<SHA-256>.tar.gz` 缓存；重试复用校验通过的缓存。缓存损坏时明确失败。解压前拒绝越界路径和不安全链接，保留 Unix 可执行权限；新 Python 目录未完成时不会被静默覆盖。
+CPython 下载在安装锁保护下使用固定 `downloads/<SHA-256>.tar.gz.part`；超时、断流或取消后保留文件，重新执行现有安装入口会从已保留字节续传。每次请求从固定 GitHub release URL 开始，最多尝试 3 次，失败后分别等待 2 秒、5 秒；连接超时 30 秒、单次传输最长 900 秒、持续 120 秒低于 1,024 字节/秒会超时。仅重试 curl 退出码 `5/6/7/18/28/52/55/56` 或 HTTP `408/429/500/502/503/504`；权限、磁盘、证书、其他 HTTP 和不支持续传的错误直接停止并保留诊断。
+
+下载开始、失败、重试、取消和校验立即输出日志；传输期间每 10 秒输出累计 MiB、最近区间 KiB/s、本次耗时与尝试次数，无新数据时仍报告 `0 KiB/s` 和“正在等待数据”。不额外请求 HEAD 或显示总量百分比。取消在下载和退避期间约每 200 毫秒检查一次，等待 curl 完全退出后才释放本次锁。
+
+已有正式缓存和 `.part` 都先校验 SHA-256；完整 `.part` 直接发布，实际传输完成后也只有校验通过才原子改名为 `<SHA-256>.tar.gz` 并进入归档检查和解压。下载路径是目录、符号链接或重解析点时明确失败。服务端忽略 Range 或返回 416 时重新校验，失败则保留且不退回覆盖下载；SHA 不匹配时需用户确认没有安装进程后移走异常文件再重新下载。旧版 `.part-<PID>` 不会自动迁移、合并或清理，新版只续传固定 `.part`。
+
+解压前拒绝越界路径和不安全链接，保留 Unix 可执行权限；新 Python 目录未完成时不会被静默覆盖。
 
 Windows 引导使用系统独占文件句柄锁 `standalone-3.12.12.lock`；Bash 引导使用 `.bootstrap-lock`；公共实现使用 venv 相邻的 `.venv.install-lock`（自定义 venv 时按目录名命名）。并发安装直接失败。强制结束进程或断电可能留下目录锁：先确认没有安装进程，再人工处理日志指出的具体锁；脚本不会猜测并清除锁。
 
@@ -144,6 +150,24 @@ Torch 步骤清除通用 `PIP_*` 来源配置、禁用 pip 配置文件，使用
 ```bash
 '<插件目录>/vendor/sam_runtime/venv/bin/python' '<插件目录>/vendor/sam_runtime/runtime_setup.py' --functional-check
 ```
+
+### CPython 下载回归验收（2026-09-09）
+
+本次只验证下载阶段，使用标准库本地 HTTP 服务、1 MiB 合成内容、独立临时目录及真实 curl，不下载真实 CPython 大包，不安装或改动 Torch/SAM2、本机 Python、venv 和已有下载缓存。
+
+- [下载回归测试](../land_cover_classification/test/test_cpython_download.py)：36 项通过，Windows PowerShell / 系统 curl 与 Windows Git Bash / curl 各 18 项。覆盖全新下载和重定向、断流 Range 续传、三次耗尽后跨次恢复、取消和锁释放、并发拒绝、退避取消、连接失败与零进展、全部可重试 HTTP、忽略 Range、416 完整复验与失败保留、完整 `.part` 发布、错误 SHA / 正式缓存、目录 / 联接、中文空格路径、旧 PID 文件保留、可控时钟、速度重置及脱敏。最后统一 Bash 事件日志的 MiB 单位后，另外复验重试与取消两项通过。
+- 两套入口都完成超过 20 秒的真实管道验证：在子进程仍运行时收到 10 秒和 20 秒日志；Bash 包含生产 `awk` / `tee` 链路，第二条零进展日志为 `0.0 KiB/s`。通过 PowerShell 解析器、`bash -n`、新增 Python 测试编译和 `git diff --check`。
+- [QGIS 隔离验收脚本](../land_cover_classification/test/test_cpython_download_qgis.py) 通过 MCP 在真实 Windows QGIS 会话执行：复用 `RuntimeInstallDialog` 的 QProcess、日志解码、显示及取消入口。两条周期日志到达间隔约 10.06 秒，Qt 100 毫秒定时器共响应 236 次；取消后进程结束并保留 65,536 字节。PowerShell 启动时间不计入下载尝试耗时。测试未触发真实安装或自动推理。
+- 对既有未跟踪 `test_runtime_setup.py` 中 15 项依赖策略回归进行了补充检查，14 项通过；`test_cuda_success_stops_fallback` 的旧断言期待 `run()` 一次，现有实现含安装及 GPU 张量验证两次调用，失败与本次未改动的 `runtime_setup.py` 有关。旧解释器发现 / 自动重建用例不符合现行策略，未运行或修改。
+- Linux / macOS 没有目标实机，本次 Windows Git Bash 结果不能替代目标平台验收；BSD `stat`、macOS 系统 Bash/curl 及其 QProcess 链路仍待目标系统实测。真实 GitHub/TLS/代理断流、120 秒低速超时、900 秒上限、磁盘满及证书错误未逐项现场注入；本地 HTTP 验证通过函数参数缩短超时，不改变生产 HTTPS/TLS 及固定默认参数。
+
+在仓库根目录用可用的测试 Python 直接运行，避免测试包入口依赖 QGIS：
+
+```powershell
+python land_cover_classification/test/test_cpython_download.py -v
+```
+
+QGIS MCP 验证时用 `importlib.util.spec_from_file_location()` 加载验收脚本并将模块保存在 `sys.modules`，调用 `start()` 后等待真实事件循环；之后读取 `result()` 并调用 `cleanup()` 清理测试自己创建的窗口和临时文件。已有安装正在运行时脚本会拒绝开始。
 
 ### 提交附带的验收记录（2026-09-08）
 
