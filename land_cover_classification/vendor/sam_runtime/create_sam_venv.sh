@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux/macOS 只下载固定独立 Python，所有依赖安装复用公共实现。
+# Linux/macOS 使用固定独立 Python，所有依赖安装复用公共实现。
 set -euo pipefail
 
 select_platform() {
@@ -7,13 +7,13 @@ select_platform() {
     if [[ "$system" == Darwin && "$arm_capable" == 1 ]]; then machine=arm64; fi
     case "$system/$machine" in
         Linux/x86_64)
-            ASSET=cpython-3.12.12%2B20251014-x86_64-unknown-linux-gnu-install_only.tar.gz
+            ASSET=cpython-3.12.12+20251014-x86_64-unknown-linux-gnu-install_only.tar.gz
             SHA=1ab2b6594d1c3d76cbebea09d6bc3e6ba68d8eb3b6322080375c4cc3dd188f34 ;;
         Darwin/x86_64)
-            ASSET=cpython-3.12.12%2B20251014-x86_64-apple-darwin-install_only.tar.gz
+            ASSET=cpython-3.12.12+20251014-x86_64-apple-darwin-install_only.tar.gz
             SHA=9b8589eefb153cbe7cb652993d0ecc94aeb2fa13c1a2e8bc240f5f74f23bb21b ;;
         Darwin/arm64|Darwin/aarch64)
-            ASSET=cpython-3.12.12%2B20251014-aarch64-apple-darwin-install_only.tar.gz
+            ASSET=cpython-3.12.12+20251014-aarch64-apple-darwin-install_only.tar.gz
             SHA=6ceba34fe78802853a30bde6f303a0a54f71f6ab07a673da34e90c0aa06c786e ;;
         */i386|*/i486|*/i586|*/i686|*/armv7l)
             echo '32 位系统不受当前 PyTorch/SAM2 依赖链支持。' >&2; return 1 ;;
@@ -188,6 +188,28 @@ download_cpython() {
     done
 }
 
+select_cpython_archive() {
+    # 直接设置 ARCHIVE，避免命令替换使下载进程及取消状态落入子 shell。
+    local packages="$1" asset="$2" sha="$3" cache="$4" url="$5"
+    local local_archive="$packages/$asset"
+    check_cancel || return 130
+    assert_download_file "$local_archive" || return 1
+    if [[ -f "$local_archive" ]]; then
+        echo "[stage] 校验本地 CPython 包 SHA-256: $local_archive"
+        [[ "$(hash_file "$local_archive")" == "$sha" ]] || {
+            echo "本地 CPython 包 SHA-256 校验失败，文件已保留: $local_archive"; return 1;
+        }
+        check_cancel || return 130
+        ARCHIVE="$local_archive"
+        echo "[stage] 使用本地 CPython 包: $ARCHIVE"
+        return 0
+    fi
+    mkdir -p "$(dirname "$cache")" || return 1
+    download_cpython "$url" "$sha" "$cache" || return $?
+    check_cancel || return 130
+    ARCHIVE="$cache"
+}
+
 main() {
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
     local system machine arm_capable=0 tool cache base python target link
@@ -208,7 +230,7 @@ main() {
     echo "[stage] Platform: $PLATFORM"
     [[ -z "${SAM_PYTHON:-}" ]] || echo 'SAM_PYTHON is no longer used; standalone CPython 3.12.12 is downloaded.'
     [[ -z "${SAM_RECREATE:-}" ]] || echo 'SAM_RECREATE is no longer supported; existing environments are checked only.'
-    for tool in curl tar awk tee; do command -v "$tool" >/dev/null || { echo "Required tool missing: $tool"; return 1; }; done
+    for tool in tar awk tee; do command -v "$tool" >/dev/null || { echo "Required tool missing: $tool"; return 1; }; done
     command -v sha256sum >/dev/null || command -v shasum >/dev/null || { echo 'Required SHA-256 tool missing'; return 1; }
     link="$SCRIPT_DIR/venv"
     target="${SAM_VENV_DIR:-$link}"
@@ -251,16 +273,16 @@ main() {
     fi
     if [[ -e "$link" || -L "$link" ]]; then echo "Fixed entry already exists: $link"; return 1; fi
     if [[ ! -e "$base" && ! -L "$base" ]]; then
-        mkdir -p "$SCRIPT_DIR/downloads"
         cache="$SCRIPT_DIR/downloads/$SHA.tar.gz"
-        download_cpython "https://github.com/astral-sh/python-build-standalone/releases/download/20251014/$ASSET" "$SHA" "$cache"
+        select_cpython_archive "$SCRIPT_DIR/cpython_packages" "$ASSET" "$SHA" "$cache" \
+            "https://github.com/astral-sh/python-build-standalone/releases/download/20251014/${ASSET//+/%2B}"
         echo '[stage] SHA-256 verified; checking archive paths'
-        safe_archive "$cache" "$lock/names" "$lock/details"
+        safe_archive "$ARCHIVE" "$lock/names" "$lock/details"
         rm "$lock/names" "$lock/details"
         check_cancel
         mkdir "$base"
         echo "[stage] Extracting Python to final location: $base"
-        tar -xzf "$cache" -C "$base"
+        tar -xzf "$ARCHIVE" -C "$base"
         printf '%s' "$SHA" > "$base/.verified-archive"
     fi
     [[ -f "$base/.verified-archive" && "$(cat "$base/.verified-archive")" == "$SHA" ]] || {

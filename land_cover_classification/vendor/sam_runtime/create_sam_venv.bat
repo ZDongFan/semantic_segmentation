@@ -152,6 +152,38 @@ function Get-CPythonArchive {
         throw
     }
 }
+function Select-CPythonArchive([string]$packages, [string]$asset, [string]$sha,
+                               [string]$cache, [string]$url, [string]$curl) {
+    # 本地包优先且只读；异常包必须停止，不能以联网下载绕过。
+    Test-Cancel
+    $localArchive = Join-Path $packages $asset
+    Assert-DownloadFile $localArchive
+    if ([IO.File]::Exists($localArchive)) {
+        Write-Log "[stage] 校验本地 CPython 包 SHA-256: $localArchive"
+        if ((Get-ArchiveHash $localArchive) -ne $sha) { throw "本地 CPython 包 SHA-256 校验失败，文件已保留: $localArchive" }
+        Test-Cancel
+        Write-Log "[stage] 使用本地 CPython 包: $localArchive"
+        return $localArchive
+    }
+    [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($cache)) | Out-Null
+    Get-CPythonArchive -url $url -sha $sha -cache $cache -curl $curl
+    Test-Cancel
+    return $cache
+}
+function Assert-SafeArchive([string]$archive, [string]$tar) {
+    Write-Log '[stage] SHA-256 verified; checking archive paths'
+    $names = @(& $tar -tzf $archive 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw ($names -join "`n") }
+    foreach ($name in $names) {
+        if ($name -notmatch '^python/' -or $name -match '(^|/)\.\.(/|$)|[\\:]') { throw "Unsafe archive path: $name" }
+    }
+    $details = @(& $tar -tvzf $archive 2>&1)
+    if ($LASTEXITCODE -ne 0) { throw ($details -join "`n") }
+    foreach ($entry in $details) {
+        if ($entry -notmatch '^[-d]') { throw "Unsupported archive member: $entry" }
+    }
+    Test-Cancel
+}
 # 安装主体与下载函数分隔，测试只加载上面的生产函数。
 # INSTALL_MAIN_BEGIN
 try {
@@ -211,29 +243,18 @@ try {
         if (Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue) { throw "Fixed entry already exists: $link" }
         $sha = '2d670beb3b930d30e3a13cc909923a001dbdfcb5537692d5da40b6b41643ce1c'
         if (-not (Get-Item -LiteralPath $base -Force -ErrorAction SilentlyContinue)) {
-            foreach ($tool in @($tar, $curl)) { if (-not (Test-Path -LiteralPath $tool)) { throw "Required system tool missing: $tool" } }
-            $asset = 'cpython-3.12.12%2B20251014-x86_64-pc-windows-msvc-install_only.tar.gz'
-            $url = 'https://github.com/astral-sh/python-build-standalone/releases/download/20251014/' + $asset
+            if (-not (Test-Path -LiteralPath $tar)) { throw "Required system tool missing: $tar" }
+            $asset = 'cpython-3.12.12+20251014-x86_64-pc-windows-msvc-install_only.tar.gz'
+            $url = 'https://github.com/astral-sh/python-build-standalone/releases/download/20251014/' + $asset.Replace('+', '%2B')
             $sha = '2d670beb3b930d30e3a13cc909923a001dbdfcb5537692d5da40b6b41643ce1c'
             $cacheDir = Join-Path $root 'downloads'
-            [IO.Directory]::CreateDirectory($cacheDir) | Out-Null
             $cache = Join-Path $cacheDir ($sha + '.tar.gz')
-            Get-CPythonArchive -url $url -sha $sha -cache $cache -curl $curl
-            Write-Log '[stage] SHA-256 verified; checking archive paths'
-            $names = @(& $tar -tzf $cache 2>&1)
-            if ($LASTEXITCODE -ne 0) { throw ($names -join "`n") }
-            foreach ($name in $names) {
-                if ($name -notmatch '^python/' -or $name -match '(^|/)\.\.(/|$)|[\\:]') { throw "Unsafe archive path: $name" }
-            }
-            $details = @(& $tar -tvzf $cache 2>&1)
-            if ($LASTEXITCODE -ne 0) { throw ($details -join "`n") }
-            foreach ($entry in $details) {
-                if ($entry -notmatch '^[-d]') { throw "Unsupported archive member: $entry" }
-            }
+            $archive = Select-CPythonArchive -packages (Join-Path $env:LCC_SETUP_DIR 'cpython_packages') -asset $asset -sha $sha -cache $cache -url $url -curl $curl
+            Assert-SafeArchive $archive $tar
             Test-Cancel
             [IO.Directory]::CreateDirectory($base) | Out-Null
             Write-Log "[stage] Extracting Python to final location: $base"
-            & $tar -xzf $cache -C $base 2>&1 | ForEach-Object { Write-Log "$_" }
+            & $tar -xzf $archive -C $base 2>&1 | ForEach-Object { Write-Log "$_" }
             if ($LASTEXITCODE -ne 0) { throw "tar failed (exit $LASTEXITCODE); incomplete Python retained: $base" }
             [IO.File]::WriteAllText((Join-Path $base '.verified-archive'), $sha)
         }

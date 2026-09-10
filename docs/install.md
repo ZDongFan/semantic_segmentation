@@ -33,7 +33,7 @@ Linux 默认目录：
 
 ## 二、创建插件统一运行环境
 
-插件要求 QGIS 3.44+。安装入口下载 **python-build-standalone 完整 CPython 3.12.12，构建 20251014**，以该独立解释器创建不继承系统 site-packages 的 venv；不使用 embeddable ZIP，也不使用 QGIS 或系统 Python 创建环境。安装需要联网。模型由外部提供，准备齐全后推理可离线运行。
+插件要求 QGIS 3.44+。安装入口优先使用预置包，否则下载 **python-build-standalone 完整 CPython 3.12.12，构建 20251014**，以该独立解释器创建不继承系统 site-packages 的 venv；不使用 embeddable ZIP，也不使用 QGIS 或系统 Python 创建环境。安装需要联网。模型由外部提供，准备齐全后推理可离线运行。
 
 ### 插件引导安装
 
@@ -65,18 +65,30 @@ bash '<插件目录>/vendor/sam_runtime/create_sam_venv.sh'
 
 安装逻辑只有三个主要实现文件：上述两个入口负责平台、下载、校验和安全解压；`runtime_setup.py` 负责 venv、依赖、功能验证及日志。不会创建后再搬迁 Python 或 venv。
 
-### 固定 Python 资产
+### 固定 Python 下载链接
+
+仓库预置下表中的 Windows x86_64 包，完整获取插件后无需再次下载该 CPython 归档。其他系统或预置包缺失时，如果网络不顺畅、安装器下载缓慢或反复中断，可使用专业下载器（如 迅雷等）下载。按当前系统和架构选择下表中的下载链接，下载完成后按下一节说明放入预置目录，再运行原安装入口。
 
 以下四项已于 2026-09-08 对照 [GitHub 20251014 release 元数据](https://api.github.com/repos/astral-sh/python-build-standalone/releases/tags/20251014) 逐项确认资产存在和官方 SHA-256，并固定在相应入口中。
 
-| 平台 | 资产 | SHA-256 |
-| --- | --- | --- |
-| Windows x86_64 | [cpython-3.12.12+20251014-x86_64-pc-windows-msvc-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-pc-windows-msvc-install_only.tar.gz) | `2d670beb3b930d30e3a13cc909923a001dbdfcb5537692d5da40b6b41643ce1c` |
-| Linux x86_64 | [cpython-3.12.12+20251014-x86_64-unknown-linux-gnu-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-unknown-linux-gnu-install_only.tar.gz) | `1ab2b6594d1c3d76cbebea09d6bc3e6ba68d8eb3b6322080375c4cc3dd188f34` |
-| macOS Intel | [cpython-3.12.12+20251014-x86_64-apple-darwin-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-apple-darwin-install_only.tar.gz) | `9b8589eefb153cbe7cb652993d0ecc94aeb2fa13c1a2e8bc240f5f74f23bb21b` |
-| macOS Apple Silicon | [cpython-3.12.12+20251014-aarch64-apple-darwin-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-aarch64-apple-darwin-install_only.tar.gz) | `6ceba34fe78802853a30bde6f303a0a54f71f6ab07a673da34e90c0aa06c786e` |
+| 系统与架构 | 官方下载链接（文件名） |
+| --- | --- |
+| Windows x86_64 | [cpython-3.12.12+20251014-x86_64-pc-windows-msvc-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-pc-windows-msvc-install_only.tar.gz) |
+| Linux x86_64 | [cpython-3.12.12+20251014-x86_64-unknown-linux-gnu-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-unknown-linux-gnu-install_only.tar.gz) |
+| macOS Intel | [cpython-3.12.12+20251014-x86_64-apple-darwin-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-x86_64-apple-darwin-install_only.tar.gz) |
+| macOS Apple Silicon | [cpython-3.12.12+20251014-aarch64-apple-darwin-install_only.tar.gz](https://github.com/astral-sh/python-build-standalone/releases/download/20251014/cpython-3.12.12%2B20251014-aarch64-apple-darwin-install_only.tar.gz) |
 
 Windows 从系统注册表读取原生架构并检查操作系统位数；32 位进程运行在 x64 Windows 时仍选择 x64 包。macOS 使用 `hw.optional.arm64` 识别 Apple Silicon，Rosetta 下也选择 ARM64。真正 32 位系统明确报告 PyTorch/SAM2 不支持；Windows ARM64、Linux ARM64 和其他组合报告“当前安装脚本未提供该平台组合”。Linux 使用 glibc 包，解释器启动失败时保留原始错误，不额外安装系统库或改换架构。
+
+### 预置 CPython 压缩包
+
+使用下载器取得上表中的固定版本压缩包后，将其放入 `land_cover_classification/vendor/sam_runtime/cpython_packages/`（目录不存在时自行创建），保持官方原始文件名和字面量 `+`，不使用 URL 中的 `%2B`，也无需重命名为 SHA。多个系统的包可以共存，只选择当前系统与架构对应的精确文件名；其他版本、其他平台及未完成的 `.part` 文件不参与选择。
+
+已有 venv 或独立 Python 仍按原有规则处理。仅在需要取得 CPython 归档时，先检查预置目录：匹配文件必须是普通文件，经固定 SHA-256 校验及归档安全检查后只读解压。本地包不移动、不改名、不删除；损坏、目录、符号链接或重解析点会明确报错并保留，不静默联网绕过。没有匹配文件时才进入原有下载缓存、完整 `.part` 复验和联网续传流程。安装锁、取消及异常环境保留策略不变，日志区分本地包、已有缓存和联网下载。
+
+预置包仅跳过 CPython 下载；后续依赖安装仍使用现有来源和配置，需要联网。通用依赖的清华镜像和 `PIP_INDEX_URL`、Torch 来源及已有环境只验证行为不变。
+
+预置目录允许提交固定 Windows 包 `cpython-3.12.12+20251014-x86_64-pc-windows-msvc-install_only.tar.gz` 和空的 .gitkeep 占位文件；其他平台、其他版本的归档与临时文件仍由 Git 忽略。`pb_tool.cfg` 的 `extra_dirs: vendor models` 已覆盖本目录，无需修改构建配置。发布时默认携带已提交的 Windows 包，也可在干净的插件暂存目录中人工附带其他平台归档并打成 ZIP；`git archive` 会包含所选提交中的 Windows 包，被忽略的其他本地包需在发布暂存目录补入。不要将本机 venv、下载缓存或日志随包发布。
 
 ### 目录、重复执行与缓存
 
@@ -150,6 +162,15 @@ Torch 步骤清除通用 `PIP_*` 来源配置、禁用 pip 配置文件，使用
 ```bash
 '<插件目录>/vendor/sam_runtime/venv/bin/python' '<插件目录>/vendor/sam_runtime/runtime_setup.py' --functional-check
 ```
+
+### 预置 CPython 包验收（2026-09-10）
+
+- [预置包回归](../land_cover_classification/test/test_cpython_packages.py)：25 项中 23 项通过，2 项因 Windows 缺少创建文件符号链接权限跳过。覆盖本地包优先于异常缓存、固定文件名和其他资产忽略、多平台共存与 Rosetta 选择、错误 SHA/目录/目录联接拒绝并保留、越界归档及不安全归档链接、中文空格路径、校验前后取消、缓存/完整 .part 回退、既有 Python/venv 优先，以及 Git 忽略与人工附带包的 ZIP 内容。Windows 目录联接测试通过；文件符号链接及悬空链接用例保留待有权限的平台运行。
+- Windows 真实固定包：读取原有缓存并校验固定 SHA，仅复制到测试临时目录，以原始文件名运行生产批处理主体。测试副本将下载函数替换为失败哨兵，测试 helper 通过 Python 审计钩子禁止 socket；完成真实 3.12.12 解压、SSL/SQLite、无依赖临时 venv 创建。损坏预置包后再次验证已有独立 Python 跳过归档选择，已有 venv 只进入 verify-only。原缓存内容和修改时间保持不变。未安装 Torch/SAM2，没有修改现有 runtime；这不是整机断网或完整依赖安装验收。
+- [原下载回归](../land_cover_classification/test/test_cpython_download.py)：36 项全部通过，含真实 10/20 秒输出、断流续传、重试、锁、取消、缓存及脱敏。PowerShell 解析器、Bash 语法检查、相关 Python 编译及差异检查通过。
+- Bash 测试在 Windows Git Bash 执行；Linux/macOS 的平台选择与已有环境分支使用合成资产/替身，不能代替目标系统实测。本次没有重新执行 QGIS 界面验收或完整运行环境功能检查。
+
+可直接运行预置包测试；真实 Windows 引导用例需通过 LCC_TEST_CPYTHON_ARCHIVE 指向已有的固定官方包，测试不会自行下载。
 
 ### CPython 下载回归验收（2026-09-09）
 
