@@ -163,47 +163,9 @@ Torch 步骤清除通用 `PIP_*` 来源配置、禁用 pip 配置文件，使用
 '<插件目录>/vendor/sam_runtime/venv/bin/python' '<插件目录>/vendor/sam_runtime/runtime_setup.py' --functional-check
 ```
 
-### 预置 CPython 包验收（2026-09-10）
-
-- [预置包回归](../land_cover_classification/test/test_cpython_packages.py)：25 项中 23 项通过，2 项因 Windows 缺少创建文件符号链接权限跳过。覆盖本地包优先于异常缓存、固定文件名和其他资产忽略、多平台共存与 Rosetta 选择、错误 SHA/目录/目录联接拒绝并保留、越界归档及不安全归档链接、中文空格路径、校验前后取消、缓存/完整 .part 回退、既有 Python/venv 优先，以及 Git 忽略与人工附带包的 ZIP 内容。Windows 目录联接测试通过；文件符号链接及悬空链接用例保留待有权限的平台运行。
-- Windows 真实固定包：读取原有缓存并校验固定 SHA，仅复制到测试临时目录，以原始文件名运行生产批处理主体。测试副本将下载函数替换为失败哨兵，测试 helper 通过 Python 审计钩子禁止 socket；完成真实 3.12.12 解压、SSL/SQLite、无依赖临时 venv 创建。损坏预置包后再次验证已有独立 Python 跳过归档选择，已有 venv 只进入 verify-only。原缓存内容和修改时间保持不变。未安装 Torch/SAM2，没有修改现有 runtime；这不是整机断网或完整依赖安装验收。
-- [原下载回归](../land_cover_classification/test/test_cpython_download.py)：36 项全部通过，含真实 10/20 秒输出、断流续传、重试、锁、取消、缓存及脱敏。PowerShell 解析器、Bash 语法检查、相关 Python 编译及差异检查通过。
-- Bash 测试在 Windows Git Bash 执行；Linux/macOS 的平台选择与已有环境分支使用合成资产/替身，不能代替目标系统实测。本次没有重新执行 QGIS 界面验收或完整运行环境功能检查。
-
-可直接运行预置包测试；真实 Windows 引导用例需通过 LCC_TEST_CPYTHON_ARCHIVE 指向已有的固定官方包，测试不会自行下载。
-
-### CPython 下载回归验收（2026-09-09）
-
-本次只验证下载阶段，使用标准库本地 HTTP 服务、1 MiB 合成内容、独立临时目录及真实 curl，不下载真实 CPython 大包，不安装或改动 Torch/SAM2、本机 Python、venv 和已有下载缓存。
-
-- [下载回归测试](../land_cover_classification/test/test_cpython_download.py)：36 项通过，Windows PowerShell / 系统 curl 与 Windows Git Bash / curl 各 18 项。覆盖全新下载和重定向、断流 Range 续传、三次耗尽后跨次恢复、取消和锁释放、并发拒绝、退避取消、连接失败与零进展、全部可重试 HTTP、忽略 Range、416 完整复验与失败保留、完整 `.part` 发布、错误 SHA / 正式缓存、目录 / 联接、中文空格路径、旧 PID 文件保留、可控时钟、速度重置及脱敏。最后统一 Bash 事件日志的 MiB 单位后，另外复验重试与取消两项通过。
-- 两套入口都完成超过 20 秒的真实管道验证：在子进程仍运行时收到 10 秒和 20 秒日志；Bash 包含生产 `awk` / `tee` 链路，第二条零进展日志为 `0.0 KiB/s`。通过 PowerShell 解析器、`bash -n`、新增 Python 测试编译和 `git diff --check`。
-- [QGIS 隔离验收脚本](../land_cover_classification/test/test_cpython_download_qgis.py) 通过 MCP 在真实 Windows QGIS 会话执行：复用 `RuntimeInstallDialog` 的 QProcess、日志解码、显示及取消入口。两条周期日志到达间隔约 10.06 秒，Qt 100 毫秒定时器共响应 236 次；取消后进程结束并保留 65,536 字节。PowerShell 启动时间不计入下载尝试耗时。测试未触发真实安装或自动推理。
-- 对既有未跟踪 `test_runtime_setup.py` 中 15 项依赖策略回归进行了补充检查，14 项通过；`test_cuda_success_stops_fallback` 的旧断言期待 `run()` 一次，现有实现含安装及 GPU 张量验证两次调用，失败与本次未改动的 `runtime_setup.py` 有关。旧解释器发现 / 自动重建用例不符合现行策略，未运行或修改。
-- Linux / macOS 没有目标实机，本次 Windows Git Bash 结果不能替代目标平台验收；BSD `stat`、macOS 系统 Bash/curl 及其 QProcess 链路仍待目标系统实测。真实 GitHub/TLS/代理断流、120 秒低速超时、900 秒上限、磁盘满及证书错误未逐项现场注入；本地 HTTP 验证通过函数参数缩短超时，不改变生产 HTTPS/TLS 及固定默认参数。
-
-在仓库根目录用可用的测试 Python 直接运行，避免测试包入口依赖 QGIS：
-
 ```powershell
 python land_cover_classification/test/test_cpython_download.py -v
 ```
-
-QGIS MCP 验证时用 `importlib.util.spec_from_file_location()` 加载验收脚本并将模块保存在 `sys.modules`，调用 `start()` 后等待真实事件循环；之后读取 `result()` 并调用 `cleanup()` 清理测试自己创建的窗口和临时文件。已有安装正在运行时脚本会拒绝开始。
-
-### 提交附带的验收记录（2026-09-08）
-
-以下为提交 `8f0f84cc` 附带的历史验收记录，不表示每次更新文档或索引后重新执行过这些测试。本地测试资产与已提交测试应分别核对，开发入口及复验建议见 [development.md](development.md)。
-
-| 平台 | 独立 Python 安装 | 完整依赖与外部模型 |
-| --- | --- | --- |
-| Windows x86_64 | 实际 3.12.12 启动、SSL/SQLite、创建 venv、目录联接均通过；下载曾连接重置，使用此前实际下载且 SHA-256 通过的缓存完成 | CPU 完整功能验收通过；Torch 2.14.0+cpu、torchvision 0.29.0+cpu、SAM2 1.1.0、Rasterio 1.5.1；真实 bundle 和 SAM2 交互通过 |
-| Linux x86_64 | 官方资产/SHA 已核对；目标系统未实测 | 未验证 |
-| macOS Intel | 官方资产/SHA 已核对；目标系统未实测 | 官方依赖无交集；明确失败分支在本机模拟测试通过，目标系统未验证 |
-| macOS Apple Silicon | 官方资产/SHA 已核对；目标系统未实测 | 未验证，待 macOS CPU 实测 |
-
-本机安装器 19 项回归测试通过，覆盖原生架构选择、Rosetta 模拟、归档越界/链接、环境清理、凭据脱敏、并发锁、静默子进程取消、已有异常环境保留、精确版本约束和 CUDA 失败回退（模拟）。已有主推理输入适配 4 项测试通过。另实际验证了损坏缓存失败、pip 无匹配 wheel/冲突（dry-run）、中文及空格路径联接和重复确认，以及两个真实 Windows 入口并发时第二个被锁拒绝、首个正常完成。
-
-实际 QGIS 中验证了 QProcess 启动、实时日志、完整环境重复执行和取消；安装成功没有自动推理。使用外部 `landslide_mitb2_dem_50m_v1` 与 `sam2.1_hiera_base_plus.pt`，对中文及空格路径的 128×128 测试影像完成语义分割及 SAM 正负点交互。新 worker 进程通过审计钩子禁止 Python 网络连接，仍成功运行。**这不等于整机断网后重启 QGIS 的验收**：后者尚未执行；CUDA 实机、其他操作系统、真实 Rosetta 和 32 位宿主进程也尚未实测。
 
 ## 三、准备 PyTorch Bundle
 

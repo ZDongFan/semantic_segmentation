@@ -28,8 +28,4 @@ CPython 下载在安装锁保护下使用固定 `downloads/<SHA-256>.tar.gz.part
 
 日志：Windows 为 `%LOCALAPPDATA%\LCCRuntime\logs`，Linux/macOS 为本目录 `logs`。界面日志为 `qgis-install-*.log`，入口日志为 `install-*.log`；失败和取消均保留日志。
 
-预置包验收（2026-09-10）：新增 25 项中 23 项通过，2 项文件符号链接测试因 Windows 权限跳过；目录联接拒绝通过。真实固定 Windows 包在隔离目录完成禁止下载的引导、SSL/SQLite 与临时 venv 创建，既有 Python/venv 优先分支通过；原下载 36 项全部通过。没有修改现有 runtime，没有重新安装依赖；Linux/macOS 实机和本次 QGIS 界面未验证。详见安装文档的本次验收记录。
-
-本次下载回归（2026-09-09）：Windows PowerShell / 系统 curl 与 Windows Git Bash 共 36 项通过，两套入口均验证真实 10/20 秒日志；QGIS MCP 验证界面实时日志、主线程响应及取消保留通过。Git Bash 不代表 Linux/macOS 实机验收；目标平台、真实远端网络及磁盘/证书故障边界仍待验证。详细测试范围及既有 runtime 测试的一项旧断言失败见安装文档的本次验收记录。
-
 历史验收（2026-09-08）的 Windows CPU 环境、真实外部 bundle 和 SAM2 worker 已通过；Linux/macOS 未实测，CUDA 实机和整机断网重启 QGIS 尚未验证。完整资产列表、校验值、配置、错误处理和验收记录见 [安装文档](../../../docs/install.md)；开发调用关系及索引维护见 [开发文档](../../../docs/development.md)。
