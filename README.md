@@ -107,3 +107,7 @@ semantic_segmentation/
 草稿只在当前插件会话中保留。切换影像或关闭插件前，未导出的草稿会提示将丢失。可直接走 AI-only、推理-only 或混合编辑流程；导出时 Raster 写出参考影像网格上的 0/1 tiled BigTIFF，Shapefile 和 DXF 只包含公开字段，不会泄露 `origin`、`run_id` 或 `feature_uuid`。
 
 每次 AI 追加、原生编辑提交或模型融合都会先生成并校验新的 GeoPackage generation；只有成功后才复用同一个可见草稿图层切换数据源，失败或取消会保留上一版草稿。
+
+## 内部项目管理与成果查询
+
+插件以“项目”页为入口：创建或选择项目后，影像与 DEM 自动关联，切换时保存并恢复草稿。“发布项目版本”一次汇总所有已有成果，文件导出独立保留；同仓库 `backend/` 提供内部管理与外部只读服务。插件地址由 INI 配置，后端启动自动读取 `.env`，仅对外查询使用 API Key。部署需要单独准备 PostgreSQL/PostGIS，见 [项目服务部署与接口](docs/project_service.md) 和 [验证记录](docs/project_service_validation.md)。

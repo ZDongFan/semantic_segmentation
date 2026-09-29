@@ -26,6 +26,17 @@ import os.path
 DOCK_PANEL_WIDTH = 400
 
 
+class _ProjectDockWidget(QDockWidget):
+    """停靠面板关闭也必须通过草稿保存检查。"""
+
+    def closeEvent(self, event):
+        dialog = self.widget()
+        if dialog is not None and not dialog.close():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class LandCoverClassification:
     """QGIS 插件实现类。"""
 
@@ -159,6 +170,9 @@ class LandCoverClassification:
 
     def unload(self):
         """从 QGIS GUI 中移除本插件的菜单项与工具栏图标。"""
+        if self.dlg is not None and not sip.isdeleted(self.dlg):
+            if not self.dlg.close():
+                return
         for action in self.actions:
             self.iface.removePluginMenu(
                 self.tr(u'&地物分类'),
@@ -188,7 +202,7 @@ class LandCoverClassification:
 
     def _create_dock(self):
         """创建默认停靠在 QGIS 右侧的插件面板。"""
-        dock = QDockWidget(self.tr(u'地物分类'), self.iface.mainWindow())
+        dock = _ProjectDockWidget(self.tr(u'地物分类'), self.iface.mainWindow())
         dock.setObjectName("LandCoverClassificationDock")
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         dock.setMinimumWidth(DOCK_PANEL_WIDTH)
@@ -207,7 +221,7 @@ class LandCoverClassification:
             self.dlg.closeBtn.clicked.disconnect()
         except TypeError:
             pass
-        self.dlg.closeBtn.clicked.connect(dock.hide)
+        self.dlg.closeBtn.clicked.connect(dock.close)
 
         dock.setWidget(self.dlg)
         self.iface.mainWindow().addDockWidget(Qt.RightDockWidgetArea, dock)

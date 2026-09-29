@@ -62,6 +62,7 @@ from .draft_session import (
     layer_uri,
 )
 from .export_service import ExportService
+from .project_panel import ProjectPanel
 from .inference_controller import BundleContractError, InferenceController
 from .pytorch_inference_core import GEOTIFF_CREATION_OPTIONS, is_georeferenced
 from .pytorch_inference_runner import BoundedDiagnostics, decode_process_line
@@ -607,6 +608,14 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._init_defaults()
         self._wire_signals()
         self._refresh_models()
+        self._project_panel = ProjectPanel(self)
+        project_scroll = QtWidgets.QScrollArea(self.mainTabWidget)
+        project_scroll.setWidgetResizable(True)
+        project_scroll.setWidget(self._project_panel)
+        self.mainTabWidget.insertTab(0, project_scroll, "项目")
+        self.mainTabWidget.removeTab(self.mainTabWidget.indexOf(self.inferenceTab))
+        self.mainTabWidget.insertTab(1, self.inferenceTab, "模型推理")
+        self.mainTabWidget.setCurrentIndex(0)
 
     def _configure_workflow_tabs(self):
         """把界面组织为当前草稿、推理和导出三个独立工作区。"""
@@ -757,6 +766,14 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 "{}/last_dem_dir".format(SETTINGS_GROUP),
                 os.path.dirname(path),
             )
+
+        panel = getattr(self, "_project_panel", None)
+        if panel and panel.active and not panel.switching:
+            try:
+                panel.bind_input(panel.image["image_path"])
+            except Exception as exc:
+                panel._set_inputs(panel.image["image_path"], panel.image["dem_path"])
+                self._warn(str(exc))
 
     def _resolve_dem_path(self):
         path = self._normalize_input_path(self.mDemFile.filePath().strip())
@@ -1035,6 +1052,15 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         except RasterInputError as exc:
             self._warn(str(exc))
             return
+        panel = getattr(self, "_project_panel", None)
+        if panel and not panel.switching:
+            try:
+                panel.bind_input(input_path)
+            except Exception as exc:
+                if panel.image:
+                    panel._set_inputs(panel.image["image_path"], panel.image["dem_path"])
+                self._warn(str(exc))
+                return
         self._remove_stale_session_draft_layers(defer=True)
 
         if self._draft_session.is_active and (
@@ -1088,6 +1114,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._warn("请先选择有效的工作影像。")
             return False
         path = os.path.abspath(path)
+        panel = getattr(self, "_project_panel", None)
+        if panel and not panel.switching:
+            try:
+                panel.bind_input(path)
+            except Exception as exc:
+                self._warn(str(exc))
+                return False
 
         if self._draft_session.is_active:
             if self._draft_session.input_path == path:
@@ -2938,8 +2971,26 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             "地物分类", message,
             level=Qgis.Warning, duration=5)
 
+    def keyPressEvent(self, event):
+        """Escape 也走关闭保存路径，避免 QDialog 默认 reject 绕过项目持久化。"""
+        if event.key() == Qt.Key_Escape and getattr(self, "_project_panel", None):
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def closeEvent(self, event):
-        if self._draft_session.is_dirty:
+        panel = getattr(self, "_project_panel", None)
+        if panel and panel.active:
+            try:
+                if panel.busy or self._process is not None or self._ai_predicting:
+                    raise RuntimeError("请先完成或取消当前操作，再关闭项目。")
+                panel.save()
+            except Exception as exc:
+                self._warn("项目草稿保存失败，已保留当前会话: {}".format(exc))
+                event.ignore()
+                return
+        if self._draft_session.is_dirty and not (panel and panel.active):
             answer = QtWidgets.QMessageBox.question(
                 self, "关闭插件",
                 "当前会话草稿尚未导出，关闭后将丢失。是否关闭？")
@@ -2953,6 +3004,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._discard_draft_session()
         self._input_adapter_request_id += 1
         self._input_adapter.close()
+        if panel and panel.active:
+            panel.image = None
+            panel.label.setText("项目草稿已保存；再次打开项目影像可恢复编辑。")
         super().closeEvent(event)
 
     # AI 辅助编辑相关

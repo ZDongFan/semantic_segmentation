@@ -1,0 +1,7 @@
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+psycopg[binary]>=3.2,<4
+fiona>=1.10,<2
+shapely>=2.0,<3
+pyproj>=3.6,<4
+python-dotenv>=1.0,<2

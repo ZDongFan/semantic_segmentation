@@ -144,7 +144,8 @@ class ExportService:
     def _dissolved_parts(self, session):
         import processing
 
-        workdir = session.directory
+        # 每次导出独立中间目录，允许连续导出不同格式或重试发布。
+        workdir = tempfile.mkdtemp(prefix="export_", dir=session.directory)
         dissolved = os.path.join(workdir, "export_dissolved.gpkg")
         parts = os.path.join(workdir, "export_parts.gpkg")
         processing.run("native:dissolve", {
