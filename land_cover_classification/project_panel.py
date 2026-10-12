@@ -566,7 +566,7 @@ class ProjectPanel(QtWidgets.QWidget):
         preview.setWindowTitle("当前成果属性预览")
         layout = QtWidgets.QVBoxLayout(preview)
         hint = QtWidgets.QLabel(
-            "显示当前草稿的 17 个标准成果字段及分类、几何信息；NULL 表示未赋值。\n"
+            "显示当前草稿的 17 个标准成果字段及分类、几何信息；空白表示未赋值。\n"
             "向右滚动可查看全部字段。面积按 WGS84 椭球计算；发布时重新校验计算，"
             "Shapefile 导出合并、拆分后可能与此处要素划分不同。", preview)
         hint.setWordWrap(True)
@@ -599,7 +599,7 @@ class ProjectPanel(QtWidgets.QWidget):
             for col, (name, _) in enumerate(columns):
                 value = values[name]
                 if value is None:
-                    text = "NULL"
+                    text = ""
                 elif name in ("mj", "perimeter_m"):
                     text = "{:.3f}".format(value)
                 elif name in ("center_lon", "center_lat"):
