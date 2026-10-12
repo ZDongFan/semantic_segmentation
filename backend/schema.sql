@@ -1,6 +1,7 @@
 CREATE EXTENSION IF NOT EXISTS postgis;
 CREATE TABLE IF NOT EXISTS lcc_projects (
     id uuid PRIMARY KEY, name text NOT NULL,
+    ztz varchar(32) CHECK (ztz IS NULL OR ztz !~ '^[[:space:]]*$'),
     current_version uuid, created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS lcc_images (

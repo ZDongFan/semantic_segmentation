@@ -12,6 +12,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from land_cover_classification.result_attributes import normalize_cartographer
+
 from .geometry import validate_draft, write_scene
 
 
@@ -67,16 +69,17 @@ class Service:
             raise ServiceError(503, "成果文件不可用，请联系管理员。")
         return path
 
-    def create_project(self, name):
+    def create_project(self, name, ztz=None):
+        ztz = normalize_cartographer(ztz)
         with self.connection() as db:
             return db.execute(
-                "INSERT INTO lcc_projects(id,name) VALUES (%s,%s) RETURNING *",
-                (uuid.uuid4(), name)).fetchone()
+                "INSERT INTO lcc_projects(id,name,ztz) VALUES (%s,%s,%s) RETURNING *",
+                (uuid.uuid4(), name, ztz)).fetchone()
 
     def projects(self, internal=False):
         with self.connection() as db:
             return db.execute(
-                """SELECT p.id,p.name,p.current_version,p.created_at,
+                ("SELECT p.ztz," if internal else "SELECT ") + """p.id,p.name,p.current_version,p.created_at,
                    v.created_at AS published_at,v.sha256
                    FROM lcc_projects p LEFT JOIN lcc_versions v ON v.id=p.current_version """
                 + ("" if internal else "WHERE p.current_version IS NOT NULL ")
@@ -189,7 +192,8 @@ class Service:
                 if digest(path) != record["sha256"]:
                     raise ServiceError(503, "草稿文件校验失败，发布已终止。")
                 for feature_id, attributes, wkb in write_scene(
-                        temporary, path, project_id, scene_id, version_id, created.isoformat()):
+                        temporary, path, project_id, scene_id, version_id, created.isoformat(),
+                        ztz=project["ztz"]):
                     db.execute(
                         """INSERT INTO lcc_features(version_id,image_id,feature_id,properties,geom)
                            VALUES(%s,%s,%s,%s,ST_SetSRID(ST_GeomFromWKB(%s),4326))""",

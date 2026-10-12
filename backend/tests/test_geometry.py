@@ -16,7 +16,7 @@ def test_holes_and_multipart_metrics(draft):
         polygon, _, metrics = final_geometry(geometry, src.crs_wkt)
     assert len(polygon.geoms) == 2
     assert len(polygon.geoms[0].interiors) == 1
-    assert metrics["area_m2"] == pytest.approx(6800, rel=0.002)
+    assert metrics["mj"] == pytest.approx(6800, rel=0.002)
     assert metrics["perimeter_m"] == pytest.approx(720, rel=0.002)
     assert 116 < metrics["center_lon"] < 118
     assert 26 < metrics["center_lat"] < 28
@@ -65,5 +65,5 @@ def test_final_edit_changes_metrics():
     large = Polygon([(0, 0), (2, 0), (2, 2), (0, 2), (0, 0)])
     a = final_geometry(mapping(small), "EPSG:4326")[2]
     b = final_geometry(mapping(large), "EPSG:4326")[2]
-    assert b["area_m2"] > 3.9 * a["area_m2"]
+    assert b["mj"] > 3.9 * a["mj"]
     assert b["center_lon"] != a["center_lon"]

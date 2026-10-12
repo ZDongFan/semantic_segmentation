@@ -8,6 +8,8 @@ import tempfile
 
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
+    QgsDistanceArea,
+    QgsUnitTypes,
     QgsFeature,
     QgsField,
     QgsFields,
@@ -17,6 +19,8 @@ from qgis.core import (
     QgsVectorLayer,
     QgsWkbTypes,
 )
+
+from .result_attributes import RESULT_FIELDS, build_result_attributes, result_context
 
 from .draft_session import (
     FIELD_CLASS_ID,
@@ -37,25 +41,49 @@ OUTPUT_FORMAT_DXF = "dxf"
 class ExportService:
     """把当前 generation 导出为只含公开字段的终态成果。"""
 
-    def export(self, session, output_format, path):
+    def export(self, session, output_format, path, *, image_id=None, ztz=None):
         """导出当前草稿，并在成功后由调用方标记会话已导出。"""
         if session is None or not session.is_active:
             raise IOError("当前没有可导出的草稿会话。")
         if output_format == OUTPUT_FORMAT_RASTER:
             self.export_raster(session, path)
         elif output_format == OUTPUT_FORMAT_VECTOR:
-            self.export_vector(session, path)
+            self.export_vector(session, path, image_id=image_id, ztz=ztz)
         elif output_format == OUTPUT_FORMAT_DXF:
             self.export_dxf(session, path)
         else:
             raise ValueError("不支持的导出格式: {}".format(output_format))
 
-    def export_vector(self, session, path):
+    def export_vector(self, session, path, *, image_id=None, ztz=None):
         """dissolve 后拆分独立斑块，再导出公开属性字段。"""
+        result_context(image_id, ztz)
         parts = self._dissolved_parts(session)
         layer = QgsVectorLayer(parts, "final_parts", "ogr")
         if not layer.isValid():
             raise IOError("无法读取草稿导出结果。")
+        if not layer.crs().isValid():
+            raise ValueError("成果 CRS 无效，无法计算面积。")
+        distance = QgsDistanceArea()
+        distance.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+        if not distance.setEllipsoid("WGS84"):
+            raise ValueError("无法设置 WGS84 椭球。")
+
+        def attributes(geometry):
+            mj = distance.convertAreaMeasurement(
+                distance.measureArea(geometry), QgsUnitTypes.AreaSquareMeters)
+            values = build_result_attributes(image_id, ztz, mj=mj)
+            # DBF 不能静默把极小面积舍为零，也不能溢出字段宽度。
+            stored = "{:.3f}".format(values["mj"])
+            if float(stored) <= 0 or len(stored) > 24:
+                raise ValueError("面积超出 Shapefile Double(24,3) 可表示范围。")
+            return values
+
+        # 写出前逐面校验，避免无效面积破坏已有成果；不把整层驻留内存。
+        for feature in layer.getFeatures():
+            if not feature.geometry().isEmpty():
+                attributes(feature.geometry())
+        if os.path.exists(path) and not QgsVectorFileWriter.deleteShapeFile(path):
+            raise IOError("无法替换已有 Shapefile，请先关闭占用该文件的图层。")
         fields = self._public_fields()
         writer = self._writer(path, layer.crs(), QgsWkbTypes.MultiPolygon,
                               "ESRI Shapefile", fields)
@@ -70,6 +98,7 @@ class ExportService:
                     QgsWkbTypes.PolygonGeometry, True))
                 output.setAttributes([
                     LANDSLIDE_CLASS_ID, LANDSLIDE_CLASS_NAME, source_id,
+                    *attributes(output.geometry()).values(),
                 ])
                 if not writer.addFeature(output):
                     raise IOError("写入 Shapefile 要素失败。")
@@ -165,6 +194,11 @@ class ExportService:
         fields.append(QgsField(FIELD_CLASS_ID, QVariant.Int))
         fields.append(QgsField(FIELD_CLASS_NAME, QVariant.String, "", 80))
         fields.append(QgsField(FIELD_SOURCE_ID, QVariant.Int))
+        types = {"string": QVariant.String, "text": QVariant.String,
+                 "integer": QVariant.Int, "date": QVariant.Date, "float": QVariant.Double}
+        for field in RESULT_FIELDS:
+            fields.append(QgsField(field.name, types[field.kind], "",
+                                   field.shape_width, field.precision))
         return fields
 
     def _writer(self, path, crs, wkb_type, driver_name, fields=None):

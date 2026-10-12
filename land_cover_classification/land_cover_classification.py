@@ -11,7 +11,7 @@
         email                : 819754924@qq.com
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer, Qt
 from qgis.PyQt import sip
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QDockWidget
@@ -171,8 +171,9 @@ class LandCoverClassification:
     def unload(self):
         """从 QGIS GUI 中移除本插件的菜单项与工具栏图标。"""
         if self.dlg is not None and not sip.isdeleted(self.dlg):
-            if not self.dlg.close():
-                return
+            panel = self.dlg._project_panel
+            panel.save_on_exit(host=True)
+            self.dlg.close()
         for action in self.actions:
             self.iface.removePluginMenu(
                 self.tr(u'&地物分类'),
@@ -195,10 +196,20 @@ class LandCoverClassification:
             dock_deleted = True
             dlg_deleted = True
         if not dock_deleted:
-            if not dlg_deleted:
-                dlg.close()
             self.iface.mainWindow().removeDockWidget(dock)
-            dock.deleteLater()
+
+            def dispose():
+                if sip.isdeleted(dock):
+                    return
+                if not dlg_deleted and not sip.isdeleted(dlg):
+                    if dlg._project_panel._close_running:
+                        # 嵌套事件循环中的卸载只能延后销毁，不能删除仍在保存的界面。
+                        QTimer.singleShot(25, dispose)
+                        return
+                    dlg.close()
+                dock.deleteLater()
+
+            dispose()
 
     def _create_dock(self):
         """创建默认停靠在 QGIS 右侧的插件面板。"""
@@ -243,6 +254,7 @@ class LandCoverClassification:
             self._create_dock()
 
         # 非模态:推理过程中用户仍可平移/缩放画布。
+        self.dlg._project_panel.reset_close_state()
         self.dlg.show()
         self.dock.show()
         self.dock.raise_()

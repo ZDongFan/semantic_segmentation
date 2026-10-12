@@ -9,6 +9,10 @@ from shapely.geometry import MultiPolygon, mapping, shape
 from shapely.geometry.polygon import orient
 from shapely.ops import transform
 
+from land_cover_classification.result_attributes import (
+    RESULT_FIELDS, build_result_attributes, result_context,
+)
+
 GEOD = Geod(ellps="WGS84")
 DRAFT_FIELDS = {"feature_uuid", "class_id", "class_name", "source_id", "origin", "run_id"}
 OUTPUT_SCHEMA = {
@@ -17,8 +21,11 @@ OUTPUT_SCHEMA = {
         "feature_id": "str", "class_id": "int", "class_name": "str",
         "source_id": "int", "project_id": "str", "image_id": "str",
         "version_id": "str", "run_id": "str", "created_at": "str",
-        "area_m2": "float", "perimeter_m": "float",
+        "perimeter_m": "float",
         "center_lon": "float", "center_lat": "float",
+        **{field.name: {"string": "str", "text": "str", "integer": "int",
+                       "date": "date", "float": "float"}[field.kind]
+           for field in RESULT_FIELDS},
     },
 }
 
@@ -53,7 +60,7 @@ def final_geometry(geometry, crs):
     if area <= 0 or not all(math.isfinite(v) for v in (area, perimeter, center.x, center.y)):
         raise ValueError("无法计算有效的测地线属性。")
     return polygon, geographic, {
-        "area_m2": area, "perimeter_m": perimeter,
+        "mj": area, "perimeter_m": perimeter,
         "center_lon": center.x, "center_lat": center.y,
     }
 
@@ -82,8 +89,9 @@ def validate_draft(path):
     return sum(1 for _ in draft_features(path))
 
 
-def write_scene(output, draft, project_id, image_id, version_id, created_at):
+def write_scene(output, draft, project_id, image_id, version_id, created_at, ztz=None):
     """按影像建立独立图层，逐条返回与文件完全一致的数据库记录。"""
+    result_context(image_id, ztz)
     with fiona.open(draft, layer="draft", enabled_drivers=["GPKG"]) as source:
         crs_wkt = source.crs_wkt
     with fiona.open(output, "w", driver="GPKG", layer="image_" + image_id.hex,
@@ -94,7 +102,8 @@ def write_scene(output, draft, project_id, image_id, version_id, created_at):
                 "source_id": props["source_id"], "project_id": str(project_id),
                 "image_id": str(image_id), "version_id": str(version_id),
                 "run_id": props["run_id"] or None, "created_at": created_at,
-                **metrics,
+                **{key: value for key, value in metrics.items() if key != "mj"},
+                **build_result_attributes(image_id, ztz, mj=metrics["mj"]),
             }
             destination.write({"geometry": mapping(polygon), "properties": attributes})
             yield feature_id, attributes, geographic.wkb

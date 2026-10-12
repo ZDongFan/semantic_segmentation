@@ -7,19 +7,31 @@ import uuid
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
+
+from land_cover_classification.result_attributes import normalize_cartographer
 
 from .config import Settings
 from .service import Service, ServiceError
 
 
-class ProjectRequest(BaseModel):
+class NamedRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     name: str = Field(min_length=1, max_length=200)
 
 
-class ImageRequest(ProjectRequest):
+class ProjectRequest(NamedRequest):
+    ztz: str | None = None
+
+    @field_validator("ztz")
+    @classmethod
+    def validate_cartographer(cls, value):
+        """与导出共用制图者规范化规则。"""
+        return normalize_cartographer(value)
+
+
+class ImageRequest(NamedRequest):
     image_path: str = Field(min_length=1, max_length=4096)
     dem_path: str | None = Field(default=None, max_length=4096)
 
@@ -70,7 +82,7 @@ def create_app(internal=False, settings=None, service=None):
 
         @app.post("/internal/projects", status_code=201)
         def create_project(payload: ProjectRequest):
-            return service.create_project(payload.name)
+            return service.create_project(payload.name, payload.ztz)
 
         @app.get("/internal/projects/{project_id}/images")
         def images(project_id: uuid.UUID):

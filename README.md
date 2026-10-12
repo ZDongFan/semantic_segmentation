@@ -104,10 +104,13 @@ semantic_segmentation/
 
 选择有效工作影像后，插件只加载并定位底图，不会立即创建草稿图层。首次点击 AI 追加有效 mask 或模型推理融合成功时，才在临时目录创建 GeoPackage 会话草稿。草稿固定使用 `background=0` 和 `landslide=1`：AI mask 与用户手工修改均保存为 `origin=user`，最新模型推理保存为 `origin=inference`，并按“用户区域 ∪ (最新推理区域 - 用户区域)”融合。SAM 负点只约束当前预览，不产生持久化排除区域。
 
-草稿只在当前插件会话中保留。切换影像或关闭插件前，未导出的草稿会提示将丢失。可直接走 AI-only、推理-only 或混合编辑流程；导出时 Raster 写出参考影像网格上的 0/1 tiled BigTIFF，Shapefile 和 DXF 只包含公开字段，不会泄露 `origin`、`run_id` 或 `feature_uuid`。
+临时草稿由当前插件会话管理，关联项目后可通过服务保存并在重开时恢复。手动保存与切换失败保留会话；退出采用最多 5 秒网络等待的尽力保存，失败不阻止关闭并记录磁盘保留路径。可直接走 AI-only、推理-only 或混合编辑流程；导出时 Raster 写出参考影像网格上的 0/1 tiled BigTIFF，Shapefile 和 DXF 只包含公开字段，不会泄露 `origin`、`run_id` 或 `feature_uuid`。
 
 每次 AI 追加、原生编辑提交或模型融合都会先生成并校验新的 GeoPackage generation；只有成功后才复用同一个可见草稿图层切换数据源，失败或取消会保留上一版草稿。
 
 ## 内部项目管理与成果查询
 
 插件以“项目”页为入口：创建或选择项目后，影像与 DEM 自动关联，切换时保存并恢复草稿。“发布项目版本”一次汇总所有已有成果，文件导出独立保留；同仓库 `backend/` 提供内部管理与外部只读服务。插件地址由 INI 配置，后端启动自动读取 `.env`，仅对外查询使用 API Key。部署需要单独准备 PostgreSQL/PostGIS，见 [项目服务部署与接口](docs/project_service.md) 和 [验证记录](docs/project_service_validation.md)。
+
+
+Shapefile 和项目 GeoPackage/API 共用 17 个遥感解译标准字段：自动生成同景稳定 tid，按最终几何计算 WGS84 椭球面积 mj，创建项目可选填制图者 ztz，其余标准字段为空。面积不再双输出 area_m2；class_name 保留。Shapefile 共 20 字段，GeoPackage/API 共 29 项，完整映射见 [成果属性契约](docs/project_service.md#标准成果属性2026-09)。

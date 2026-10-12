@@ -1145,8 +1145,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._draft_layer_id = None
         return True
 
-    def _discard_draft_session(self):
-        """从项目移除旧会话层后清理其临时目录。"""
+    def _discard_draft_session(self, preserve=False):
+        """解除画布引用；退出保存失败时保留磁盘目录供人工恢复。"""
+        if preserve and self._layer_is_usable(self._draft_layer):
+            self._draft_layer.blockSignals(True)
         layer_id = self._draft_layer_id
         if layer_id:
             self._connected_draft_layer_ids.discard(layer_id)
@@ -1162,6 +1164,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             QgsApplication.processEvents()
         except Exception:
             pass
+        if preserve:
+            directory = self._draft_session.directory
+            self._draft_session = DraftSession()
+            panel = getattr(self, "_project_panel", None)
+            if panel and directory:
+                panel.exit_notice("未确认保存成功，已保留草稿目录供人工恢复：{}".format(directory))
+            return
         residue = self._draft_session.close()
         if residue:
             QTimer.singleShot(
@@ -2125,7 +2134,12 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if layer.isEditable():
             if not layer.commitChanges():
                 self._warn("提交草稿层编辑失败:{}".format(layer.commitErrors()))
-                layer.rollBack()
+                panel = getattr(self, "_project_panel", None)
+                if not (panel and panel._close_running):
+                    layer.rollBack()
+                return False
+            if layer is self._draft_layer and not self._draft_commit_completed:
+                self._warn("草稿 generation 发布失败，未确认编辑已保存。")
                 return False
         return True
 
@@ -2525,10 +2539,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._warn("请选择导出目录。")
             return
         try:
-            if output_format == OUTPUT_FORMAT_VECTOR:
-                _remove_existing_shapefile(path)
+            context = (self._project_panel.export_context()
+                       if output_format == OUTPUT_FORMAT_VECTOR else {})
             self._export_service.export(
-                self._draft_session, output_format, path)
+                self._draft_session, output_format, path, **context)
             audit = self._draft_session.last_postprocess_path
             if audit and os.path.isfile(audit):
                 shutil.copy2(audit, path + ".postprocess.json")
@@ -2542,35 +2556,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         except Exception as exc:  # noqa: BLE001
             self._warn("导出失败: {}".format(exc))
     def _export_draft_vector(self, path):
-        layer = self._draft_layer
-        if not self._layer_is_usable(layer):
-            raise IOError("当前没有可导出的草稿图层。")
-        crs = layer.crs()
-        uri = QgsWkbTypes.displayString(layer.wkbType())
-        if crs.isValid() and crs.authid():
-            uri = "{}?crs={}".format(uri, crs.authid())
-        output = QgsVectorLayer(uri, "final_template", "memory")
-        provider = output.dataProvider()
-        provider.addAttributes([
-            QgsField(FIELD_CLASS_ID, QVariant.Int),
-            QgsField(FIELD_CLASS_NAME, QVariant.String, "", 80),
-            QgsField(FIELD_SOURCE_ID, QVariant.Int),
-        ])
-        output.updateFields()
-        for feature in layer.getFeatures():
-            class_id = self._safe_int(feature[FIELD_CLASS_ID], 0)
-            if self._is_background_class_id(class_id):
-                continue
-            new_feature = QgsFeature(output.fields())
-            new_feature.setGeometry(feature.geometry())
-            new_feature.setAttribute(FIELD_CLASS_ID, class_id)
-            new_feature.setAttribute(
-                FIELD_CLASS_NAME, self._class_name(class_id))
-            new_feature.setAttribute(
-                FIELD_SOURCE_ID,
-                self._safe_int(feature[FIELD_SOURCE_ID], feature.id()))
-            provider.addFeature(new_feature)
-        self._write_vector_layer(output, path)
+        """所有 Shapefile 入口共用成果属性和最终几何计算。"""
+        self._export_service.export(
+            self._draft_session, OUTPUT_FORMAT_VECTOR, path,
+            **self._project_panel.export_context())
 
     def _export_draft_dxf(self, path):
         layer = self._draft_layer
@@ -2966,6 +2955,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._active_inference_roi = None
 
     def _warn(self, message):
+        panel = getattr(self, "_project_panel", None)
+        if panel and (panel._close_running or panel._closed or panel._host_closing):
+            panel.exit_notice(message)
+            return
         self.statusLabel.setText(message)
         self.iface.messageBar().pushMessage(
             "地物分类", message,
@@ -2981,32 +2974,45 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def closeEvent(self, event):
         panel = getattr(self, "_project_panel", None)
-        if panel and panel.active:
-            try:
-                if panel.busy or self._process is not None or self._ai_predicting:
-                    raise RuntimeError("请先完成或取消当前操作，再关闭项目。")
-                panel.save()
-            except Exception as exc:
-                self._warn("项目草稿保存失败，已保留当前会话: {}".format(exc))
-                event.ignore()
-                return
-        if self._draft_session.is_dirty and not (panel and panel.active):
+        if panel and panel._close_running:
+            event.accept()
+            return
+        if panel and panel._closed:
+            event.accept()
+            return
+        host_exit = bool(panel and panel._host_closing)
+        if self._draft_session.is_dirty and not (panel and panel.active) and not host_exit:
             answer = QtWidgets.QMessageBox.question(
-                self, "关闭插件",
-                "当前会话草稿尚未导出，关闭后将丢失。是否关闭？")
+                self, "关闭插件", "当前会话草稿尚未导出，关闭后将丢失。是否关闭？")
             if answer != QtWidgets.QMessageBox.Yes:
                 event.ignore()
                 return
+        outcome = panel.save_on_exit() if panel else "empty"
+        preserve = outcome in ("failed", "skipped")
+        if panel:
+            panel._closed = True
+            panel.closing_requested.emit()
+
+        def cleanup(operation):
+            try:
+                operation()
+            except Exception as exc:
+                if panel:
+                    panel.exit_notice("关闭清理未完成：{}".format(exc))
+
         if self._process is not None:
-            self._process.kill()
-        self._stop_ai_editing(silent=True)
-        self._clear_drawn_roi()
-        self._discard_draft_session()
+            cleanup(self._process.kill)
+        cleanup(lambda: self._stop_ai_editing(silent=True))
+        cleanup(self._clear_drawn_roi)
+        cleanup(lambda: self._discard_draft_session(preserve=preserve))
         self._input_adapter_request_id += 1
-        self._input_adapter.close()
-        if panel and panel.active:
+        cleanup(self._input_adapter.close)
+        if panel:
             panel.image = None
-            panel.label.setText("项目草稿已保存；再次打开项目影像可恢复编辑。")
+            cleanup(lambda: panel.label.setText(
+                "项目草稿已保存；重新选择影像可恢复。" if outcome == "saved" else
+                "已关闭；本次未确认保存成功，请查看日志中的保留路径。"))
+        event.accept()
         super().closeEvent(event)
 
     # AI 辅助编辑相关
