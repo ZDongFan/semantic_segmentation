@@ -110,7 +110,7 @@ semantic_segmentation/
 
 ## 内部项目管理与成果查询
 
-插件以“项目”页为入口：创建或选择项目后，影像与 DEM 自动关联，切换时保存并恢复草稿。“发布项目版本”一次汇总所有已有成果，文件导出独立保留；同仓库 `backend/` 提供内部管理与外部只读服务。插件地址由 INI 配置，后端启动自动读取 `.env`，仅对外查询使用 API Key。部署需要单独准备 PostgreSQL/PostGIS，见 [项目服务部署与接口](docs/project_service.md) 和 [验证记录](docs/project_service_validation.md)。
+插件以“项目”页为入口：创建或选择项目后，影像与 DEM 自动关联，切换时保存并恢复草稿。“发布项目版本”一次汇总所有已有成果，文件导出独立保留；同仓库 `backend/` 提供内部管理与外部只读服务。插件地址由 INI 配置，后端启动自动读取 `.env`，仅对外查询使用 API Key。准备好后端环境与数据库后，Windows 双击根目录 `start_backend.bat`，Linux/macOS 执行 `bash start_backend.sh`，即可在一个终端启动两个服务，Ctrl+C 一起停止。部署需要单独准备 PostgreSQL/PostGIS，见 [项目服务部署与接口](docs/project_service.md) 和 [验证记录](docs/project_service_validation.md)。
 
 
 Shapefile 和项目 GeoPackage/API 共用 17 个遥感解译标准字段：自动生成同景稳定 tid，按最终几何计算 WGS84 椭球面积 mj，创建项目可选填制图者 ztz，其余标准字段为空。面积不再双输出 area_m2；class_name 保留。Shapefile 共 20 字段，GeoPackage/API 共 29 项，完整映射见 [成果属性契约](docs/project_service.md#标准成果属性2026-09)。

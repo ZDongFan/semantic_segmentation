@@ -45,11 +45,25 @@ py -3.12 -m venv .venv-backend
 .\.venv-backend\Scripts\python.exe -m backend.api --init-db
 ```
 
-内部进程与对外进程分别运行，以下地址默认只监听本机，由反向代理按网络策略转发：
+日常启动只需双击仓库根目录 `start_backend.bat`，或在 PowerShell 执行：
 
 ```powershell
-.\.venv-backend\Scripts\python.exe -m uvicorn backend.api:internal_app --factory --host 127.0.0.1 --port 8091
-.\.venv-backend\Scripts\python.exe -m uvicorn backend.api:public_app --factory --host 127.0.0.1 --port 8092
+.\start_backend.bat
+```
+
+脚本自动定位仓库中的 `.venv-backend`，无需激活环境，也不依赖终端当前目录。在同一终端启动两个独立服务，按 Ctrl+C 一起停止；任一进程退出会停止另一进程并返回失败状态。端口被占用时直接报错，不会关闭已有服务。Windows 失败时保留窗口供查看日志。
+
+Linux/macOS 准备独立 Python 3.12 环境（`python3.12 -m venv .venv-backend`）、安装同一 requirements 并配置 `.env` 后执行 `bash start_backend.sh`。可通过 `LCC_BACKEND_PYTHON` 指定独立后端 Python 的完整路径。脚本不安装依赖、不启动 PostgreSQL、不建表；首次环境准备和 `--init-db` 仍按上文显式执行。
+
+默认监听 `0.0.0.0:8091` 和 `0.0.0.0:8092`，客户端使用服务器实际 IP 访问。内部端口 8091 无 API Key 验证，必须通过防火墙限制在可信内网；公共服务继续使用 API Key 鉴权。可传入 `--internal-host`、`--internal-port`、`--public-host`、`--public-port`；修改内部端口后同步插件 INI。配置仍由服务加载仓库根 `.env`，支持 `LCC_ENV_FILE` 和已有环境变量优先。需要独立系统账户或不同数据库角色的生产部署，应继续分别配置和托管两个服务。
+
+例如只调整公共端口：`start_backend.bat --public-port 8093`。跨平台也可直接用后端 Python 执行 `backend/start.py`，`--help` 查看参数。日志中的进程启动成功仅表示 HTTP 服务启动，数据库连通性仍需实际接口验证。
+
+需要分别托管时，原有命令继续可用，以下地址监听所有 IPv4 网卡，由防火墙和反向代理按网络策略控制访问：
+
+```powershell
+.\.venv-backend\Scripts\python.exe -m uvicorn backend.api:internal_app --factory --host 0.0.0.0 --port 8091
+.\.venv-backend\Scripts\python.exe -m uvicorn backend.api:public_app --factory --host 0.0.0.0 --port 8092
 ```
 
 服务启停由部署方 Windows 服务管理器负责。本仓库不会自动安装系统服务或修改防火墙。
