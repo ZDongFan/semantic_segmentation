@@ -122,11 +122,25 @@ def create_app(internal=False, settings=None, service=None):
                 path.unlink(missing_ok=True)
 
         @app.get("/internal/projects/{project_id}/images/{image_id}/draft")
-        def draft(project_id: uuid.UUID, image_id: uuid.UUID):
-            row = service.draft(project_id, image_id)
+        def draft(project_id: uuid.UUID, image_id: uuid.UUID, draft_id: uuid.UUID | None = None):
+            row = service.draft(project_id, image_id, draft_id)
             return FileResponse(service.file_path(row["file_path"]),
                                 media_type="application/geopackage+sqlite3",
                                 headers={"X-Draft-ID": str(row["id"]), "ETag": row["sha256"]})
+
+        @app.get("/internal/projects/{project_id}/images/{image_id}/drafts")
+        def drafts(project_id: uuid.UUID, image_id: uuid.UUID,
+                   offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200)):
+            return service.drafts(project_id, image_id, offset, limit)
+
+        @app.get("/internal/projects/{project_id}/versions")
+        def internal_versions(project_id: uuid.UUID):
+            return service.versions(project_id, allow_empty=True)
+
+        @app.get("/internal/projects/{project_id}/compare")
+        def compare(project_id: uuid.UUID, before: uuid.UUID, after: uuid.UUID,
+                    offset: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=200)):
+            return service.compare_versions(project_id, before, after, offset, limit)
 
         @app.post("/internal/projects/{project_id}/publish")
         def publish(project_id: uuid.UUID, payload: PublishRequest):

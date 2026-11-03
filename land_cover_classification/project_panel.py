@@ -11,9 +11,9 @@ import uuid
 
 from qgis.PyQt import QtWidgets, sip
 from qgis.PyQt.QtCore import QEvent, QEventLoop, QSettings, QThread, QTimer, pyqtSignal, Qt
-from qgis.core import Qgis, QgsMessageLog, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsDistanceArea, QgsProject
+from qgis.core import Qgis, QgsMessageLog
 
-from .result_attributes import RESULT_FIELDS, build_result_attributes, normalize_cartographer, result_context
+from .result_attributes import normalize_cartographer, result_context
 
 from .project_client import ProjectClient, ProjectClientError, snapshot_gpkg
 
@@ -129,7 +129,9 @@ class ProjectPanel(QtWidgets.QWidget):
                 ("创建项目", self.create_project),
                 ("保存当前草稿", self.save),
                 ("预览当前成果属性", self.preview),
-                ("发布项目版本", self.publish)]:
+                ("发布项目版本", self.publish),
+                ("版本对比", self.history),
+                ("恢复管理", self.recovery)]:
             button = QtWidgets.QPushButton(text)
             button.clicked.connect(lambda checked=False, fn=action: self.invoke(fn))
             layout.addWidget(button)
@@ -282,6 +284,8 @@ class ProjectPanel(QtWidgets.QWidget):
             "LandCoverClassification/pending_project_publish/{}".format(self.project["id"]), ""))
         publishable = associated or pending or any(row and row.get("draft_id") for row in rows)
         self.buttons["publish"].setEnabled(bool(self.project and publishable and not busy))
+        self.buttons["history"].setEnabled(bool(self.project) and not busy)
+        self.buttons["recovery"].setEnabled(bool(self.active) and not busy)
         self.buttons["create_project"].setEnabled(not busy)
         self.projects.setEnabled(not busy)
         self.images.setEnabled(bool(self.project) and not busy)
@@ -608,104 +612,59 @@ class ProjectPanel(QtWidgets.QWidget):
         ui = getattr(self.dialog, "_workflow_ui", None)
         if ui:
             ui.schedule()
+        self.record_recovery()
         if not exiting:
             self.label.setText("项目草稿已保存，可关闭后重新打开。")
 
     def preview(self):
-        """展示当前草稿的标准成果属性，不写入草稿或发布版本。"""
-        preview = self._create_result_preview()
-        try:
-            preview.exec_()
-        finally:
-            preview.deleteLater()
+        """复用非模态窗口，允许同时点选地图和检查单个滑坡。"""
+        browser = getattr(self, '_attribute_browser', None)
+        if browser is None or sip.isdeleted(browser) or not browser.valid():
+            if browser is not None and not sip.isdeleted(browser):
+                browser.close()
+                browser.deleteLater()
+            browser = self._attribute_browser = self._create_result_preview()
+        browser.refresh()
+        browser.show()
+        browser.raise_()
+        browser.activateWindow()
 
     def _create_result_preview(self):
-        """复用成果字段契约构建只读预览，保留空值及原始测量精度。"""
-        layer = self.dialog._draft_layer
-        if not self.dialog._layer_is_usable(layer):
+        """属性计算和地图联动由独立浏览器管理。"""
+        if not self.dialog._layer_is_usable(self.dialog._draft_layer):
             raise RuntimeError("当前没有草稿。")
-        context = self.export_context()
-        if not layer.crs().isValid():
-            raise ValueError("草稿缺少有效 CRS，无法计算成果面积。")
-        distance = QgsDistanceArea()
-        distance.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
-        distance.setEllipsoid("WGS84")
-        converter = QgsCoordinateTransform(layer.crs(), QgsCoordinateReferenceSystem(4326),
-                                           QgsProject.instance())
-        preview = QtWidgets.QDialog(self)
-        preview.setWindowTitle("当前成果属性预览")
-        layout = QtWidgets.QVBoxLayout(preview)
-        hint = QtWidgets.QLabel(
-            "显示当前草稿的 17 个标准成果字段及分类、几何信息；空白表示未赋值。\n"
-            "常用视图可切换为全部字段。预览只读；面积按 WGS84 椭球计算，发布时重新计算，"
-            "Shapefile 导出合并、拆分后可能与此处要素划分不同。", preview)
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        columns = [("feature_id", "要素编号")] + [
-            (field.name, field.label + (" m²" if field.name == "mj" else ""))
-            for field in RESULT_FIELDS
-        ] + [("class_id", "类别编号"), ("class_name", "类别名称"),
-             ("source_id", "来源编号"), ("perimeter_m", "周长 m"),
-             ("center_lon", "中心经度"), ("center_lat", "中心纬度")]
-        table = QtWidgets.QTableWidget(0, len(columns), preview)
-        table.setObjectName("resultAttributesTable")
-        for col, (name, label) in enumerate(columns):
-            header = QtWidgets.QTableWidgetItem("{}\n{}".format(label, name))
-            header.setData(Qt.UserRole, name)
-            table.setHorizontalHeaderItem(col, header)
-        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        for feature in layer.getFeatures():
-            geometry = feature.geometry()
-            if geometry.isEmpty():
-                continue
-            center = converter.transform(geometry.centroid().asPoint())
-            values = build_result_attributes(**context, mj=distance.measureArea(geometry))
-            values.update(feature_id=str(feature["feature_uuid"]),
-                          **{name: feature[name] for name in ("class_id", "class_name", "source_id")},
-                          perimeter_m=distance.measurePerimeter(geometry),
-                          center_lon=center.x(), center_lat=center.y())
-            row = table.rowCount()
-            table.insertRow(row)
-            for col, (name, _) in enumerate(columns):
-                value = values[name]
-                if value is None:
-                    text = ""
-                elif name in ("mj", "perimeter_m"):
-                    text = "{:.3f}".format(value)
-                elif name in ("center_lon", "center_lat"):
-                    text = "{:.7f}".format(value)
-                else:
-                    text = str(value)
-                item = QtWidgets.QTableWidgetItem(text)
-                item.setData(Qt.UserRole, value)
-                item.setToolTip("未赋值" if value is None else str(value))
-                table.setItem(row, col, item)
-        # 仅调整可见顺序，不改变共享字段契约、原始数值或空值。
-        common = ["class_name", "mj", "perimeter_m", "ztz", "source_id"]
-        names = [name for name, _ in columns]
-        header = table.horizontalHeader()
-        for position, name in enumerate(common):
-            header.moveSection(header.visualIndex(names.index(name)), position)
-        table.resizeColumnsToContents()
-        for col, name in enumerate(names):
-            table.setColumnWidth(col, min(220, max(95, table.columnWidth(col))))
-            if name in ("mj", "perimeter_m", "center_lon", "center_lat"):
-                for row in range(table.rowCount()):
-                    table.item(row, col).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        view = QtWidgets.QComboBox(preview)
-        view.setObjectName("attributeFieldView")
-        view.addItems(["常用字段", "全部字段（含完整编号）"])
-        def show_fields(index):
-            for col, name in enumerate(names):
-                table.setColumnHidden(col, index == 0 and name not in common)
-        view.currentIndexChanged.connect(show_fields)
-        show_fields(0)
-        layout.addWidget(view)
-        layout.addWidget(table)
-        screen = QtWidgets.QApplication.primaryScreen()
-        width = min(1100, screen.availableGeometry().width() - 80) if screen else 1100
-        preview.resize(width, 500)
-        return preview
+        from .attribute_browser import AttributeBrowser
+        return AttributeBrowser(self)
+
+    def history(self):
+        """打开当前项目的只读版本对比窗口。"""
+        from .history_dialogs import VersionBrowser
+        self._show_history_window('_version_browser', VersionBrowser)
+
+    def recovery(self):
+        """浏览当前影像的服务端快照与本地保留草稿。"""
+        from .history_dialogs import RecoveryBrowser
+        self._show_history_window('_recovery_browser', RecoveryBrowser)
+
+    def _show_history_window(self, name, factory):
+        previous = getattr(self, name, None)
+        if previous is not None and not sip.isdeleted(previous):
+            previous.close()
+            previous.deleteLater()
+        window = factory(self)
+        setattr(self, name, window)
+        window.show()
+        window.raise_()
+        window.load()
+
+    def record_recovery(self):
+        """记录失败不得把已成功发布的 generation 误报为失败。"""
+        from .recovery import write_record
+        try:
+            write_record(self)
+        except Exception as exc:
+            QgsMessageLog.logMessage("本地恢复记录写入失败：{}".format(exc),
+                                     "LandCoverClassification", Qgis.Warning)
 
     def publish(self):
         """确认所有已有成果后一次发布，断线时保留整个项目的幂等请求。"""

@@ -134,7 +134,10 @@ Linux/macOS 准备独立 Python 3.12 环境（`python3.12 -m venv .venv-backend`
 | GET /internal/projects/{id}/images | 内部影像、DEM 引用和当前 draft_id |
 | POST /internal/projects/{id}/images | JSON：name、image_path、dem_path（可空） |
 | PUT /internal/projects/{id}/images/{image_id}/draft | GeoPackage 原始请求体，可选 base_draft_id 查询参数 |
-| GET /internal/projects/{id}/images/{image_id}/draft | 当前保存草稿，X-Draft-ID 返回实际快照 |
+| GET /internal/projects/{id}/images/{image_id}/draft | 当前保存草稿或显式 draft_id 历史快照，X-Draft-ID 与 ETag 返回实际快照身份和摘要 |
+| GET /internal/projects/{id}/images/{image_id}/drafts | 影像草稿历史，offset/limit 分页（默认 100，最大 200）；不返回内部文件路径 |
+| GET /internal/projects/{id}/versions | 内部版本列表，未发布项目返回空列表 |
+| GET /internal/projects/{id}/compare | 固定 before/after 版本 ID，offset/limit 分页差异（默认 100，最大 200），含数量摘要和前后几何 |
 | POST /internal/projects/{id}/publish | JSON：drafts=[{image_id,draft_id}, ...]、base_version（首版为 null）、idempotency_key、confirmed=true |
 
 这两个应用互不挂载；公共应用没有内部写入路由。内部应用免 Key，依靠独立监听地址和网络访问范围隔离。文档/OpenAPI 入口默认关闭。
@@ -203,3 +206,6 @@ POST /internal/projects 接受 {"name":"示例项目","ztz":"张三"}。ztz 可�
 本期不迁移旧属性。管理员先停止服务写入并结束旧编辑会话，记录数据库、存储根目录、项目 ID、六表计数及所有关联路径，不输出凭据。在事务中锁定并显式清空 lcc_features、lcc_version_images、lcc_versions、lcc_drafts、lcc_images、lcc_projects，不使用 CASCADE；空表增加 ztz 及约束，新环境使用 schema.sql。
 
 事务成功后仅清理已核实的草稿、版本 GeoPackage 和 audit.json。解析绝对路径，验证位于预期 drafts/versions 子目录，拒绝链接及重解析点；不递归清空存储根目录，不删除未知文件。清除已删除项目对应的 LandCoverClassification/pending_project_publish/<project_id> 设置。输入影像、DEM、模型、runtime、配置、用户另行导出和其他数据库对象保留。清理不纳入初始化、启动或项目创建逻辑。实际执行范围见验证记录。
+
+
+版本对比与草稿恢复的界面操作、身份判定、分页及恢复前备份边界见 [工作区说明](ui_workspaces.md#后续独立功能地图属性版本与恢复)。新增内部路由需重启后端加载，不需要数据库 schema 迁移；恢复仅写入本地新 generation，服务端保存与发布保持原有并发及确认规则。

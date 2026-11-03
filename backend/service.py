@@ -139,11 +139,29 @@ class Service:
             db.execute("UPDATE lcc_images SET draft_id=%s WHERE id=%s", (draft_id, image_id))
             return {"draft_id": draft_id, "sha256": sha}
 
-    def draft(self, project_id, image_id):
+    def drafts(self, project_id, image_id, offset=0, limit=100):
+        """按影像分页列出不可变快照，不向客户端暴露服务端路径。"""
         with self.connection() as db:
-            row = db.execute(
-                """SELECT d.* FROM lcc_drafts d JOIN lcc_images i ON i.draft_id=d.id
-                   WHERE i.id=%s AND i.project_id=%s""", (image_id, project_id)).fetchone()
+            self._project(db, project_id)
+            rows = db.execute(
+                """SELECT d.id,d.created_at,d.sha256,(d.id=i.draft_id) AS is_current
+                   FROM lcc_drafts d JOIN lcc_images i ON i.id=d.image_id
+                   WHERE i.id=%s AND i.project_id=%s ORDER BY d.created_at DESC,d.id
+                   LIMIT %s OFFSET %s""", (image_id, project_id, limit + 1, offset)).fetchall()
+            return {"items": rows[:limit],
+                    "next_offset": offset + limit if len(rows) > limit else None}
+
+    def draft(self, project_id, image_id, draft_id=None):
+        with self.connection() as db:
+            if draft_id is None:
+                row = db.execute(
+                    """SELECT d.* FROM lcc_drafts d JOIN lcc_images i ON i.draft_id=d.id
+                       WHERE i.id=%s AND i.project_id=%s""", (image_id, project_id)).fetchone()
+            else:
+                row = db.execute(
+                    """SELECT d.* FROM lcc_drafts d JOIN lcc_images i ON i.id=d.image_id
+                       WHERE i.id=%s AND i.project_id=%s AND d.id=%s""",
+                    (image_id, project_id, draft_id)).fetchone()
             if not row:
                 raise ServiceError(404, "该影像没有已保存的草稿。")
             return row
@@ -254,9 +272,10 @@ class Service:
                     "current_version": project["current_version"],
                     "version": self._version_summary(db, version)}
 
-    def versions(self, project_id):
+    def versions(self, project_id, allow_empty=False):
         with self.connection() as db:
-            project, _ = self._selected_version(db, project_id, None)
+            project = (self._project(db, project_id) if allow_empty else
+                       self._selected_version(db, project_id, None)[0])
             return [{**self._version_summary(db, row),
                      "is_current": row["id"] == project["current_version"]}
                     for row in db.execute(
@@ -285,3 +304,35 @@ class Service:
         with self.connection() as db:
             _, version = self._selected_version(db, project_id, version_id)
             return version
+
+    def compare_versions(self, project_id, before, after, offset=0, limit=100):
+        """按影像和稳定要素编号比较，忽略发布编号与发布时间的自然变化。"""
+        with self.connection() as db:
+            self._selected_version(db, project_id, before)
+            self._selected_version(db, project_id, after)
+            # 拓扑相同的几何不因顶点顺序变化而被误报；属性比较保留 NULL 语义。
+            query = """WITH a AS (SELECT * FROM lcc_features WHERE version_id=%s),
+                b AS (SELECT * FROM lcc_features WHERE version_id=%s),
+                changes AS (
+                SELECT COALESCE(a.image_id,b.image_id) AS image_id,
+                       COALESCE(a.feature_id,b.feature_id) AS feature_id,
+                       a.properties AS before_properties,b.properties AS after_properties,
+                       a.geom AS before_geom,b.geom AS after_geom,
+                       CASE WHEN a.feature_id IS NULL THEN 'added'
+                            WHEN b.feature_id IS NULL THEN 'removed'
+                            WHEN NOT ST_Equals(a.geom,b.geom)
+                              OR (a.properties - ARRAY['version_id','created_at']) IS DISTINCT FROM
+                                 (b.properties - ARRAY['version_id','created_at']) THEN 'modified'
+                            ELSE 'unchanged' END AS change
+                FROM a FULL JOIN b USING(image_id,feature_id)) """
+            summary = {row['change']: row['n'] for row in db.execute(
+                query + "SELECT change,count(*) AS n FROM changes GROUP BY change", (before, after))}
+            rows = db.execute(query + """SELECT image_id,feature_id,change,
+                before_properties,after_properties,
+                ST_AsGeoJSON(before_geom,15)::json AS before_geometry,
+                ST_AsGeoJSON(after_geom,15)::json AS after_geometry
+                FROM changes WHERE change <> 'unchanged' ORDER BY image_id,feature_id
+                LIMIT %s OFFSET %s""", (before, after, limit + 1, offset)).fetchall()
+            return {"before": before, "after": after, "summary": summary,
+                    "items": rows[:limit],
+                    "next_offset": offset + limit if len(rows) > limit else None}
