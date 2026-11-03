@@ -46,6 +46,8 @@ class _RequestFiles:
 
 def _release_request(worker):
     """仅释放已结束线程，不依赖可能已经销毁的面板。"""
+    if sip.isdeleted(worker) or getattr(worker, "_ui_waiting", False):
+        return
     _LIVE_REQUESTS.discard(worker)
     worker.deleteLater()
 
@@ -60,6 +62,7 @@ class _RequestThread(QThread):
         self.resources = tuple(resources)
         for resource in self.resources:
             resource.retain()
+        self._ui_waiting = True
         self.operation = operation
         self.result = None
         self.error = None
@@ -94,6 +97,9 @@ class ProjectPanel(QtWidgets.QWidget):
         super().__init__(dialog)
         self.dialog = dialog
         self.client = None
+        self._synced_generation = None
+        self._retry_action = None
+        self.buttons = {}
         self.project = None
         self.image = None
         self.settings = QSettings()
@@ -127,9 +133,17 @@ class ProjectPanel(QtWidgets.QWidget):
             button = QtWidgets.QPushButton(text)
             button.clicked.connect(lambda checked=False, fn=action: self.invoke(fn))
             layout.addWidget(button)
+            self.buttons[action.__name__] = button
+        self.action_hint = QtWidgets.QLabel(self)
+        self.action_hint.setWordWrap(True)
+        layout.addWidget(self.action_hint)
         self.label = QtWidgets.QLabel("请选择项目，或创建一个新项目。")
         self.label.setWordWrap(True)
         layout.addWidget(self.label)
+        self.retry_button = QtWidgets.QPushButton("重试刚才的操作", self)
+        self.retry_button.hide()
+        self.retry_button.clicked.connect(self._retry)
+        layout.addWidget(self.retry_button)
         layout.addStretch()
         self.projects.about_to_open.connect(lambda: self.invoke(self.refresh))
         self.projects.currentIndexChanged.connect(lambda: self.invoke(self.select_project))
@@ -148,11 +162,7 @@ class ProjectPanel(QtWidgets.QWidget):
     def _initial_refresh(self):
         if self._closed or sip.isdeleted(self):
             return
-        try:
-            self.refresh()
-        except Exception:
-            if not sip.isdeleted(self) and not self._closed:
-                self.label.setText("暂时无法读取项目。选择项目或创建项目时会自动重试。")
+        self.invoke(self.refresh)
 
     def eventFilter(self, watched, event):
         """宿主关闭始终放行，由 QGIS 自己决定是否退出。"""
@@ -176,6 +186,9 @@ class ProjectPanel(QtWidgets.QWidget):
             self._close_outcome = None
             self._host_closing = False
             self._closed = False
+            ui = getattr(self.dialog, "_workflow_ui", None)
+            if ui:
+                ui.schedule()
 
     def exit_notice(self, message, success=False):
         """退出日志与消息栏均尽力写入，不能因界面销毁再次抛出异常。"""
@@ -198,7 +211,8 @@ class ProjectPanel(QtWidgets.QWidget):
         self._close_running = True
         try:
             self._close_outcome = "skipped"
-            if self.busy or self.dialog._process is not None or self.dialog._ai_predicting:
+            ui = getattr(self.dialog, "_workflow_ui", None)
+            if self.busy or self.dialog._process is not None or self.dialog._ai_predicting or (ui and ui.busy()):
                 self.exit_notice("退出保存已跳过：当前任务忙碌，未确认保存成功。")
                 self.closing_requested.emit()
                 return self._close_outcome
@@ -227,7 +241,8 @@ class ProjectPanel(QtWidgets.QWidget):
         if self._worker is not None and (sip.isdeleted(self._worker) or self._worker.isFinished()):
             self.busy = False
             self._worker = None
-        if self.busy or self.dialog._process is not None or self.dialog._ai_predicting:
+        ui = getattr(self.dialog, "_workflow_ui", None)
+        if self.busy or self.dialog._process is not None or self.dialog._ai_predicting or (ui and ui.busy()):
             raise RuntimeError("请先等待当前操作完成。")
 
     def invoke(self, action):
@@ -235,6 +250,9 @@ class ProjectPanel(QtWidgets.QWidget):
         try:
             self._check_idle()
             action()
+            self._retry_action = None
+            if not sip.isdeleted(self):
+                self.retry_button.hide()
         except _ClosingRequest:
             return
         except Exception as exc:
@@ -242,7 +260,37 @@ class ProjectPanel(QtWidgets.QWidget):
                 return
             self._select_row(self.projects, self.project)
             self._select_row(self.images, self.image)
-            self.dialog._warn(str(exc))
+            self.label.setText("项目操作未完成：{}\n当前操作未确认成功。".format(exc))
+            self._retry_action = action if action in (self.refresh, self.save, self.publish) else None
+            self.retry_button.setVisible(self._retry_action is not None)
+        finally:
+            ui = getattr(self.dialog, "_workflow_ui", None)
+            if ui:
+                ui.schedule()
+
+    def _retry(self):
+        """仅重试明确的原操作；发布仍复用已保存的幂等请求。"""
+        if self._retry_action:
+            self.invoke(self._retry_action)
+
+    def update_actions(self, associated, busy):
+        """有效空草稿也可保存；项目发布不依赖当前影像已打开。"""
+        self.buttons["save"].setEnabled(associated and not busy)
+        self.buttons["preview"].setEnabled(associated and not busy)
+        rows = [self.images.itemData(i) for i in range(self.images.count())]
+        pending = bool(self.project and self.settings.value(
+            "LandCoverClassification/pending_project_publish/{}".format(self.project["id"]), ""))
+        publishable = associated or pending or any(row and row.get("draft_id") for row in rows)
+        self.buttons["publish"].setEnabled(bool(self.project and publishable and not busy))
+        self.buttons["create_project"].setEnabled(not busy)
+        self.projects.setEnabled(not busy)
+        self.images.setEnabled(bool(self.project) and not busy)
+        self.retry_button.setEnabled(not busy)
+        self.action_hint.setText(
+            "请等待当前操作完成。" if busy else
+            "请先选择或创建项目。" if not self.project else
+            "保存与属性预览针对当前影像草稿；发布汇总项目已有草稿。"
+            if associated else "当前无可操作草稿；可打开已有影像或设置工作影像。")
 
     def _client(self):
         if self.client is None:
@@ -285,23 +333,34 @@ class ProjectPanel(QtWidgets.QWidget):
         _LIVE_REQUESTS.add(worker)
         self._worker = worker
         self.busy = True
+        ui = getattr(self.dialog, "_workflow_ui", None)
+        if ui:
+            ui.refresh()
         try:
-            worker.start()
-            progress.show()
-            if not worker.isFinished():
-                loop.exec_()
+            try:
+                worker.start()
+                progress.show()
+                if not worker.isFinished():
+                    loop.exec_()
+            finally:
+                progress.close()
+                progress.deleteLater()
+                if not sip.isdeleted(self):
+                    self.closing_requested.disconnect(loop.quit)
+                self.busy = worker.isRunning()
+            if self._closed or self._host_closing or sip.isdeleted(self) or not worker.isFinished():
+                raise _ClosingRequest("界面已关闭，原网络请求将在后台结束。")
+            self._worker = None
+            if ui:
+                ui.schedule()
+            if worker.error:
+                raise worker.error
+            return worker.result
         finally:
-            progress.close()
-            progress.deleteLater()
-            if not sip.isdeleted(self):
-                self.closing_requested.disconnect(loop.quit)
-            self.busy = worker.isRunning()
-        if self._closed or self._host_closing or sip.isdeleted(self) or not worker.isFinished():
-            raise _ClosingRequest("界面已关闭，原网络请求将在后台结束。")
-        self._worker = None
-        if worker.error:
-            raise worker.error
-        return worker.result
+            # 调用栈读完状态和结果后才交出所有权；退出后的后台线程仍自行释放。
+            worker._ui_waiting = False
+            if not worker.isRunning():
+                _release_request(worker)
 
     def refresh(self):
         self._check_idle()
@@ -318,6 +377,7 @@ class ProjectPanel(QtWidgets.QWidget):
         finally:
             self.projects.blockSignals(False)
         self._select_row(self.projects, self.project)
+        self.label.setText("项目服务已响应，可继续操作。")
         if self.project:
             self.refresh_images()
         else:
@@ -434,14 +494,15 @@ class ProjectPanel(QtWidgets.QWidget):
 
     def bind_input(self, path):
         """正常输入选择即完成登记；先保存旧景，再恢复目标影像草稿。"""
-        self._check_idle()
         project = self.selected_project()
         dem = self.dialog._resolve_dem_path()
         if dem is False:
             raise RuntimeError("请选择有效的 DEM 文件。")
         same = self.image and os.path.normcase(path) == os.path.normcase(self.image["image_path"])
         if same and (dem or None) == self.image["dem_path"]:
+            # AI 追加只确认已有绑定，不触发登记或切换，不应拦截自身操作。
             return
+        self._check_idle()
         self.save()
         row = self.call(lambda: self._client().request(
             "POST", "/internal/projects/{}/images".format(project["id"]),
@@ -503,7 +564,12 @@ class ProjectPanel(QtWidgets.QWidget):
                 self.switching = False
         self.dialog._suggest_output_paths()
         self._freeze_inputs(False)
-        self.label.setText("当前影像：{}。切换影像或关闭时自动保存草稿。".format(row["name"]))
+        self._synced_generation = ((row["id"], self.dialog._draft_session.generation_path)
+                                   if row["draft_id"] else None)
+        self.label.setText("当前影像：{}。切换前保存草稿；关闭时尽力保存，结果请查看提示。".format(row["name"]))
+        ui = getattr(self.dialog, "_workflow_ui", None)
+        if ui:
+            ui.schedule()
 
     def export_context(self):
         """确保成果属性来自当前草稿所属的项目与影像。"""
@@ -538,6 +604,10 @@ class ProjectPanel(QtWidgets.QWidget):
             result = (client.request_on_exit(path, snapshot) if exiting else
                       self.call(lambda: client.request("PUT", path, upload=snapshot)))
         self.image["draft_id"] = result["draft_id"]
+        self._synced_generation = (self.image["id"], session.generation_path)
+        ui = getattr(self.dialog, "_workflow_ui", None)
+        if ui:
+            ui.schedule()
         if not exiting:
             self.label.setText("项目草稿已保存，可关闭后重新打开。")
 
@@ -567,7 +637,7 @@ class ProjectPanel(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(preview)
         hint = QtWidgets.QLabel(
             "显示当前草稿的 17 个标准成果字段及分类、几何信息；空白表示未赋值。\n"
-            "向右滚动可查看全部字段。面积按 WGS84 椭球计算；发布时重新校验计算，"
+            "常用视图可切换为全部字段。预览只读；面积按 WGS84 椭球计算，发布时重新计算，"
             "Shapefile 导出合并、拆分后可能与此处要素划分不同。", preview)
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -610,9 +680,31 @@ class ProjectPanel(QtWidgets.QWidget):
                 item.setData(Qt.UserRole, value)
                 item.setToolTip("未赋值" if value is None else str(value))
                 table.setItem(row, col, item)
+        # 仅调整可见顺序，不改变共享字段契约、原始数值或空值。
+        common = ["class_name", "mj", "perimeter_m", "ztz", "source_id"]
+        names = [name for name, _ in columns]
+        header = table.horizontalHeader()
+        for position, name in enumerate(common):
+            header.moveSection(header.visualIndex(names.index(name)), position)
         table.resizeColumnsToContents()
+        for col, name in enumerate(names):
+            table.setColumnWidth(col, min(220, max(95, table.columnWidth(col))))
+            if name in ("mj", "perimeter_m", "center_lon", "center_lat"):
+                for row in range(table.rowCount()):
+                    table.item(row, col).setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        view = QtWidgets.QComboBox(preview)
+        view.setObjectName("attributeFieldView")
+        view.addItems(["常用字段", "全部字段（含完整编号）"])
+        def show_fields(index):
+            for col, name in enumerate(names):
+                table.setColumnHidden(col, index == 0 and name not in common)
+        view.currentIndexChanged.connect(show_fields)
+        show_fields(0)
+        layout.addWidget(view)
         layout.addWidget(table)
-        preview.resize(1100, 500)
+        screen = QtWidgets.QApplication.primaryScreen()
+        width = min(1100, screen.availableGeometry().width() - 80) if screen else 1100
+        preview.resize(width, 500)
         return preview
 
     def publish(self):

@@ -38,7 +38,8 @@ class AiSegmentMapTool(QgsMapTool):
 
         self._preview_band = QgsRubberBand(canvas, QgsWkbTypes.PolygonGeometry)
         self._preview_band.setColor(QColor(30, 30, 30, 220))
-        self._preview_band.setFillColor(QColor(255, 255, 0, 95))
+        self._preview_band.setFillColor(QColor(0, 200, 255, 70))
+        self._preview_band.setLineStyle(Qt.DashLine)
         self._preview_band.setWidth(1)
 
         self._positive_band = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)

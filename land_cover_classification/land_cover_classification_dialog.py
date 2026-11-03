@@ -9,7 +9,6 @@ import os
 import shutil
 import sys
 import tempfile
-import textwrap
 import uuid
 
 from qgis.PyQt import sip, uic
@@ -63,6 +62,7 @@ from .draft_session import (
 )
 from .export_service import ExportService
 from .project_panel import ProjectPanel
+from .workflow_ui import WorkflowUi, refresh_workflow
 from .inference_controller import BundleContractError, InferenceController
 from .pytorch_inference_core import GEOTIFF_CREATION_OPTIONS, is_georeferenced
 from .pytorch_inference_runner import BoundedDiagnostics, decode_process_line
@@ -106,7 +106,6 @@ DRAFT_LAYER_NAME = "地物分类草稿"
 DRAFT_LAYER_MARKER = "land_cover_classification/session_draft"
 DRAFT_LAYER_MARKER_VALUE = "1"
 DIALOG_PANEL_WIDTH = 400
-STATUS_WRAP_WIDTH = 50
 FUSION_MAX_ATTEMPTS = 3
 
 INFERENCE_STAGE_LABELS = {
@@ -447,53 +446,10 @@ class RuntimeInstallDialog(QtWidgets.QDialog):
             event.accept()
 
 
-class _MirroredLabel:
-
-    def __init__(self, *widgets, wrap_width=STATUS_WRAP_WIDTH):
-        self._widgets = widgets
-        self._wrap_width = wrap_width
-        self._text = ""
-
-    def setText(self, text):
-        self._text = "" if text is None else str(text)
-        display_text = self._wrapped_text(self._text)
-        for widget in self._widgets:
-            widget.setText(display_text)
-            widget.setToolTip(self._text)
-
-    def text(self):
-        return self._text
-
-    def _wrapped_text(self, text):
-        lines = text.splitlines() or [""]
-        return "\n".join(
-            textwrap.fill(
-                line,
-                width=self._wrap_width,
-                break_long_words=True,
-                break_on_hyphens=False,
-                replace_whitespace=False,
-            )
-            for line in lines
-        )
-
-class _MirroredProgressBar:
-
-    def __init__(self, *widgets):
-        self._widgets = widgets
-
-    def setValue(self, value):
-        for widget in self._widgets:
-            widget.setValue(value)
-
-    def value(self):
-        return self._widgets[0].value()
-
 class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
     def _configure_layout_constraints(self):
-        self.setMinimumWidth(DIALOG_PANEL_WIDTH)
-        self.setMaximumWidth(DIALOG_PANEL_WIDTH)
+        self.setMinimumWidth(340)
         self.resize(DIALOG_PANEL_WIDTH, self.height())
 
         ignored = QtWidgets.QSizePolicy.Ignored
@@ -546,10 +502,10 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.setupUi(self)
         self._configure_workflow_tabs()
         self._configure_layout_constraints()
-        self.statusLabel = _MirroredLabel(
-            self.statusLabel, self.exportStatusLabel)
-        self.progressBar = _MirroredProgressBar(
-            self.progressBar, self.exportProgressBar)
+        self._adapter_busy = False
+        self._export_busy = False
+        self._cancel_requested = False
+        self._fusion_undo_available = False
         self.iface = iface
         self._process = None
         self._active_inference_roi = None
@@ -616,6 +572,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.mainTabWidget.removeTab(self.mainTabWidget.indexOf(self.inferenceTab))
         self.mainTabWidget.insertTab(1, self.inferenceTab, "模型推理")
         self.mainTabWidget.setCurrentIndex(0)
+        self._workflow_ui = WorkflowUi(self)
 
     def _configure_workflow_tabs(self):
         """把界面组织为当前草稿、推理和导出三个独立工作区。"""
@@ -659,6 +616,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.inferenceLayout.insertLayout(
             max(0, buttons_index), self.roiButtonsLayout)
 
+        self.modelStatusLabel = QtWidgets.QLabel(self.modelGroup)
+        self.modelStatusLabel.setWordWrap(True)
+        self.modelLayout.addWidget(self.modelStatusLabel)
         self.draftLayout.addStretch(1)
         self.mainTabWidget.insertTab(0, self.draftTab, "草稿编辑")
         self.mainTabWidget.setTabText(
@@ -796,6 +756,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         for key, value in pytorch_deps_check.runtime_environment().items():
             env.insert(key, value)
         return env
+    @refresh_workflow
     def _refresh_models(self):
         self.modelCombo.blockSignals(True)
         self.modelCombo.clear()
@@ -803,19 +764,19 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if not root or not os.path.isdir(root):
             self.modelCombo.blockSignals(False)
             self._set_postprocess_parameter_defaults(0.5, 500.0)
-            self.statusLabel.setText("模型根目录不存在:{}".format(root))
+            self.modelStatusLabel.setText("模型根目录不存在:{}".format(root))
             return
         models = scan_models(root)
         if not models:
             self.modelCombo.blockSignals(False)
             self._set_postprocess_parameter_defaults(0.5, 500.0)
-            self.statusLabel.setText("目录 {} 下未发现可用的分割模型".format(root))
+            self.modelStatusLabel.setText("目录 {} 下未发现可用的分割模型".format(root))
             return
         for entry in models:
             self.modelCombo.addItem(entry["name"], entry)
         self.modelCombo.blockSignals(False)
         self._on_model_changed()
-        self.statusLabel.setText("已发现 {} 个模型".format(len(models)))
+        self.modelStatusLabel.setText("已发现 {} 个模型".format(len(models)))
 
     @staticmethod
     def _finite_float(value, fallback):
@@ -839,6 +800,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.thresholdSlider.setValue(int(round(threshold * 10)))
         self._on_threshold_slider_changed(self.thresholdSlider.value())
         self.minAreaSpinBox.setValue(min_area_m2)
+        self._parameter_defaults = (self.thresholdSlider.value(), self.minAreaSpinBox.value())
 
     def _model_postprocess_defaults(self, entry):
         """按 postprocess.json、manifest.json 的优先级读取界面默认值。"""
@@ -865,6 +827,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         return (0.5 if threshold is None else threshold), (500.0 if
                 min_area_m2 is None else min_area_m2)
 
+    @refresh_workflow
     def _on_model_changed(self, *args):
         """模型切换或刷新后恢复该 bundle 的默认后处理参数。"""
         entry = self.modelCombo.currentData()
@@ -1026,8 +989,12 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         finally:
             self._stale_cleanup_scheduled = False
 
+    @refresh_workflow
     def _on_working_image_changed(self, *args, **kwargs):
         """影像通过基础校验后只加载或切换底图，不创建草稿层。"""
+        ui = getattr(self, "_workflow_ui", None)
+        if ui and ui.busy():
+            return
         sender = self.sender()
         if sender is self.layerCombo and not self.layerRadio.isChecked():
             return
@@ -1145,6 +1112,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._draft_layer_id = None
         return True
 
+    @refresh_workflow
     def _discard_draft_session(self, preserve=False):
         """解除画布引用；退出保存失败时保留磁盘目录供人工恢复。"""
         if preserve and self._layer_is_usable(self._draft_layer):
@@ -1284,6 +1252,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             raise
         return layer
 
+    @refresh_workflow
     def _publish_draft_generation(self, generation):
         """校验并发布 generation，始终复用同一个可见草稿层。"""
         generation = self._validate_draft_generation(generation)
@@ -1330,6 +1299,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 SETTINGS_GROUP,
                 Qgis.Warning,
             )
+        ui = getattr(self, "_workflow_ui", None)
+        if ui:
+            try:
+                ui.bind_layer(layer)
+            except Exception as exc:
+                QgsMessageLog.logMessage(
+                    "草稿已发布，但显示控制刷新失败: {}".format(exc), SETTINGS_GROUP, Qgis.Warning)
         return layer
 
     def _attach_session_draft_layer(self, generation):
@@ -1363,15 +1339,19 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         finally:
             self._draft_session.clear_edit_snapshot()
 
+    @refresh_workflow
     def _on_draft_editing_stopped(self):
         if not self._draft_commit_completed:
             self._draft_session.clear_edit_snapshot()
 
+    @refresh_workflow
     def _invalidate_fusion_undo(self):
         """后续编辑或新 generation 会使一次性融合回退失效。"""
         self._draft_session.fusion_snapshot_path = None
+        self._fusion_undo_available = False
         self.undoFusionBtn.setEnabled(False)
 
+    @refresh_workflow
     def _on_undo_fusion(self):
         """仅在未发生后续修改时回到最近一次融合前的 generation。"""
         snapshot = self._draft_session.fusion_snapshot_path
@@ -1382,12 +1362,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         try:
             self._publish_draft_generation(snapshot)
             self._draft_session.fusion_snapshot_path = None
+            self._fusion_undo_available = False
             self.undoFusionBtn.setEnabled(False)
             self.statusLabel.setText("已撤销上次模型推理。")
         except Exception as exc:  # noqa: BLE001
             self._warn("撤销上次模型推理失败: {}".format(exc))
     def _switch_to_draft_tab(self):
-        index = self.mainTabWidget.indexOf(self.draftTab)
+        index = self.mainTabWidget.indexOf(self.draftTab.property("workflow_scroll") or self.draftTab)
         if index >= 0:
             self.mainTabWidget.setCurrentIndex(index)
 
@@ -1438,17 +1419,14 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 runtime_metadata.get("rasterio_version") or ""),
         }
 
+    @refresh_workflow
     def _set_adapter_busy(self, busy, message=None):
         """同步输入转换期间的按钮和状态。"""
-        self.runBtn.setEnabled(not busy)
-        self.canvasInferenceBtn.setEnabled(not busy)
-        self.drawRoiBtn.setEnabled(not busy)
-        has_roi = self._drawn_roi_geometry is not None
-        self.clearRoiBtn.setEnabled(not busy and has_roi)
-        self.runDrawnRoiBtn.setEnabled(not busy and has_roi)
-        self.cancelBtn.setEnabled(bool(busy))
+        self._adapter_busy = bool(busy)
         if message:
             self.statusLabel.setText(message)
+        if getattr(self, "_workflow_ui", None):
+            self._workflow_ui.refresh()
 
     def _prepare_runtime_input(self, source_path, on_ready):
         """探测统一 runtime；必要时异步转换为会话级 BigTIFF。"""
@@ -1524,6 +1502,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             lambda value: self.progressBar.setValue(int(value)))
         QgsApplication.taskManager().addTask(task)
 
+    @refresh_workflow
     def _start_inference_process(
             self, model_path, input_path, dem_path, georef, roi=None,
             postprocess_overrides=None, runtime_input_path=None,
@@ -1572,6 +1551,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.runDrawnRoiBtn.setEnabled(False)
         self.cancelBtn.setEnabled(True)
         self.exportRasterBtn.setEnabled(False)
+        self._cancel_requested = False
+        self.progressBar.setRange(0, 100)
         self.progressBar.setValue(0)
         mode_label = "当前画布范围" if roi else (
             "带地理坐标" if georef else "普通图像")
@@ -1681,6 +1662,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         return self._launcher_file
 
     def _on_cancel(self):
+        self._cancel_requested = True
         if self._input_adapter.active_task is not None:
             self._input_adapter.cancel()
             self.statusLabel.setText("正在取消输入影像转换...")
@@ -1720,7 +1702,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         event = payload.get("event")
         if event == "progress":
             value = max(0, min(100, int(payload.get("value", 0))))
-            self.progressBar.setValue(value)
+            self.progressBar.setValue(min(value, 99))
             stage = str(payload.get("stage", ""))
             status = payload.get("status") or INFERENCE_STAGE_LABELS.get(stage)
             if status:
@@ -1761,7 +1743,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return
         self._on_process_output()
         self._consume_process_output(b"", final=True)
-        if exit_code == 0 and exit_status == QProcess.NormalExit:
+        if self._cancel_requested:
+            self.statusLabel.setText("推理已取消，原草稿保持不变。")
+        elif exit_code == 0 and exit_status == QProcess.NormalExit:
             self._on_process_completed()
         else:
             msg = self._inference_error_text(exit_code)
@@ -1815,6 +1799,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._label_path + ".postprocess.json" if self._label_path else None)
         self.exportRasterBtn.setEnabled(True)
         self.undoFusionBtn.setEnabled(True)
+        self._fusion_undo_available = True
         self._switch_to_draft_tab()
         usage = self._dem_usage or {}
         mode = usage.get("mode")
@@ -1828,6 +1813,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         else:
             dem_text = "DEM 使用情况未知"
         message = "推理结果已融合到会话草稿；{}。".format(dem_text)
+        self.progressBar.setRange(0, 100)
+        self.progressBar.setValue(100)
         self.statusLabel.setText(message)
         self.iface.messageBar().pushSuccess(
             "地物分类", "{} 人工和 AI 草稿区域保持优先。".format(message))
@@ -1862,7 +1849,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         candidate = None
         try:
             self.statusLabel.setText("正在将最新推理融合到会话草稿...")
-            self.progressBar.setValue(100)
+            self.progressBar.setRange(0, 0)
             self._load_reference_input_layer()
             if not self._draft_session.is_active:
                 raise RuntimeError("当前工作影像的会话草稿已失效。")
@@ -1875,7 +1862,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
         except Exception as exc:  # noqa: BLE001
 
-            self._warn("准备模型推理融合失败，原草稿未改变: {}".format(exc))
+            self._warn("准备模型推理融合失败，原草稿未改变: {}".format(exc), scope="inference")
             return
 
         try:
@@ -1885,11 +1872,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
 
             self._warn(
                 "模型推理融合自动尝试 {} 次后仍失败，原草稿未改变: {}".format(
-                    FUSION_MAX_ATTEMPTS, exc))
+                    FUSION_MAX_ATTEMPTS, exc), scope="inference")
 
     def _switch_to_export_tab(self):
         try:
-            export_index = self.mainTabWidget.indexOf(self.exportTab)
+            export_index = self.mainTabWidget.indexOf(self.exportTab.property("workflow_scroll") or self.exportTab)
             if export_index >= 0:
                 self.mainTabWidget.setCurrentIndex(export_index)
         except AttributeError:
@@ -2337,6 +2324,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         band.setWidth(2)
         band.setToGeometry(geometry, crs)
         self._roi_preview_band = band
+    @refresh_workflow
     def _clear_drawn_roi(self, restore_tool=True):
         tool, previous = self._roi_tool, self._roi_previous_tool
         self._roi_tool = self._roi_previous_tool = None
@@ -2391,11 +2379,13 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         canvas.setMapTool(self._roi_tool)
         self.statusLabel.setText("正在绘制推理范围，Esc 可取消并保留原范围。")
 
+    @refresh_workflow
     def _on_drawn_roi_cancelled(self):
         self._finish_roi_tool()
         self.statusLabel.setText(
             "已取消重画。" if self._drawn_roi_geometry else "已取消绘制范围。")
 
+    @refresh_workflow
     def _on_drawn_roi_finished(self, canvas_geometry):
         input_path = os.path.abspath(self._resolve_input_path() or "")
         layer = QgsRasterLayer(input_path, "drawn_roi_reference")
@@ -2521,7 +2511,12 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             context.get("roi"), context.get("postprocess_overrides"),
             runtime_input_path=runtime_path,
             input_adapter=adapter_info)
+    @refresh_workflow
     def _on_export_raster(self):
+        ui = getattr(self, "_workflow_ui", None)
+        if ui and ui.busy():
+            self.exportStatusLabel.setText("请等待当前操作完成后导出。")
+            return
         if not self._draft_session.is_active or not self._layer_is_usable(
                 self._draft_layer):
             self._warn("当前没有可导出的草稿。")
@@ -2538,6 +2533,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if not path:
             self._warn("请选择导出目录。")
             return
+        self._export_busy = True
+        self.exportStatusLabel.setText("正在导出当前影像草稿…")
         try:
             context = (self._project_panel.export_context()
                        if output_format == OUTPUT_FORMAT_VECTOR else {})
@@ -2551,10 +2548,15 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 self.rasterFileWidget.setFilePath(path)
                 self.iface.addRasterLayer(
                     path, os.path.splitext(os.path.basename(path))[0])
-            self.statusLabel.setText("当前会话草稿已导出: {}".format(path))
+            self.exportStatusLabel.setText("当前影像草稿已导出: {}".format(path))
+            if ui:
+                ui.last_export = path
             self.iface.messageBar().pushSuccess("地物分类", "导出成功: {}".format(path))
         except Exception as exc:  # noqa: BLE001
+            self.exportStatusLabel.setText("导出失败: {}".format(exc))
             self._warn("导出失败: {}".format(exc))
+        finally:
+            self._export_busy = False
     def _export_draft_vector(self, path):
         """所有 Shapefile 入口共用成果属性和最终几何计算。"""
         self._export_service.export(
@@ -2929,14 +2931,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.iface.messageBar().pushCritical("地物分类", msg)
         self._cleanup_process()
 
+    @refresh_workflow
     def _cleanup_process(self):
-        self.runBtn.setEnabled(True)
-        self.canvasInferenceBtn.setEnabled(True)
-        self.drawRoiBtn.setEnabled(True)
-        has_roi = self._drawn_roi_geometry is not None
-        self.clearRoiBtn.setEnabled(has_roi)
-        self.runDrawnRoiBtn.setEnabled(has_roi)
-        self.cancelBtn.setEnabled(False)
+        self.progressBar.setRange(0, 100)
         if self._params_file and os.path.exists(self._params_file):
             try:
                 os.remove(self._params_file)
@@ -2954,12 +2951,18 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._process = None
         self._active_inference_roi = None
 
-    def _warn(self, message):
+    def _warn(self, message, scope=None):
         panel = getattr(self, "_project_panel", None)
         if panel and (panel._close_running or panel._closed or panel._host_closing):
             panel.exit_notice(message)
             return
-        self.statusLabel.setText(message)
+        current = self.mainTabWidget.currentWidget()
+        if scope == "export" or (scope is None and current is self.exportTab.property("workflow_scroll")):
+            self.exportStatusLabel.setText(message)
+        elif scope == "ai" or (scope is None and current is self.draftTab.property("workflow_scroll")):
+            self.aiStatusLabel.setText(message)
+        else:
+            self.statusLabel.setText(message)
         self.iface.messageBar().pushMessage(
             "地物分类", message,
             level=Qgis.Warning, duration=5)
@@ -3018,6 +3021,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     # AI 辅助编辑相关
     # ------------------------------------------------------------------
 
+    @refresh_workflow
     def _on_ai_start(self):
         image_path = self._input_path or self._resolve_input_path()
         message = self._ai_controller.startable(self._draft_session, image_path)
@@ -3071,7 +3075,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             except Exception:
                 pass
         if not sam_deps_check.venv_ready():
-            self.statusLabel.setText("缺少插件运行环境，请重新打开插件完成安装。")
+            self.aiStatusLabel.setText("缺少插件运行环境，请重新打开插件完成安装。")
             return
         ok, message = sam_deps_check.ensure_ready()
         if not ok:
@@ -3098,6 +3102,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return None
         return preprocess.get("sam_rgb_bands")
 
+    @refresh_workflow
     def _start_ai_with_runtime_input(
             self, source_path, runtime_path, _adapter_info):
         """使用已探测或转换的 runtime 输入启动 SAM worker。"""
@@ -3148,7 +3153,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.aiUndoPointBtn.setEnabled(True)
         self.aiClearPointsBtn.setEnabled(True)
         self.aiAppendDraftBtn.setEnabled(False)
-        self.aiStatusLabel.setText("AI 编辑已启动。左键添加正点，右键添加负点，按 E 确认追加。")
+        self.aiStatusLabel.setText("AI 编辑已启动，预览满意后可添加到滑坡草稿。")
         self.iface.messageBar().pushInfo(
             "地物分类", "AI 编辑已启动，请在画布中标注正负样本点。")
     def _on_ai_stop(self):
@@ -3166,6 +3171,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             canvas.setMapTool(self._ai_tool)
         self.aiStatusLabel.setText(
             "已回到 AI 点选模式。左键添加正点，右键添加负点，按 E 确认追加。")
+    @refresh_workflow
     def _stop_ai_editing(self, silent=False):
         canvas = self.iface.mapCanvas() if self.iface else None
         self._clear_ai_preview()
@@ -3238,6 +3244,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.aiAppendDraftBtn.setEnabled(False)
         self.aiStatusLabel.setText("已清空提示点。")
 
+    @refresh_workflow
     def _on_ai_append_draft(self):
         if self._ai_predicting:
             self.aiStatusLabel.setText("正在生成预览，请稍候。")
@@ -3411,6 +3418,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             QgsApplication.messageLog().logMessage(
                 data, "LandCoverClassification", Qgis.Warning)
 
+    @refresh_workflow
     def _handle_ai_message(self, message):
         if message.get("event") == "ready":
             return
@@ -3446,14 +3454,18 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 self.aiStatusLabel.setText("已生成 mask 预览。")
             else:
                 self.aiStatusLabel.setText("当前点提示未生成有效 mask。")
+    @refresh_workflow
     def _on_ai_worker_finished(self, exit_code, exit_status):
         self._ai_worker_ready = False
         self._ai_image_loaded = False
+        self._ai_preview_geometry = None
+        self.aiStatusLabel.setText("AI 进程已结束；停止 AI 编辑后可重新启动。")
         if exit_status != QProcess.NormalExit or exit_code != 0:
             QgsApplication.messageLog().logMessage(
                 "SAM worker exited with code {}".format(exit_code),
                 "LandCoverClassification", Qgis.Warning)
 
+    @refresh_workflow
     def _on_ai_worker_error(self, error):
         if self._ai_worker is None:
             return
@@ -3922,6 +3934,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 geometry = QgsGeometry.fromPolygonXY(parts[0])
         return geometry
 
+    @refresh_workflow
     def _on_ai_points_changed(self, positive_points, negative_points):
         if not positive_points and not negative_points:
             if self._ai_predicting:

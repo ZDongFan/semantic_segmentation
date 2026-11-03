@@ -29,6 +29,12 @@ DOCK_PANEL_WIDTH = 400
 class _ProjectDockWidget(QDockWidget):
     """停靠面板关闭也必须通过草稿保存检查。"""
 
+    def resizeEvent(self, event):
+        """记住逻辑像素宽度，不限制用户拖动或浮动窗口。"""
+        super().resizeEvent(event)
+        if self.isVisible():
+            QSettings().setValue("LandCoverClassification/dock_width", self.width())
+
     def closeEvent(self, event):
         dialog = self.widget()
         if dialog is not None and not dialog.close():
@@ -216,8 +222,7 @@ class LandCoverClassification:
         dock = _ProjectDockWidget(self.tr(u'地物分类'), self.iface.mainWindow())
         dock.setObjectName("LandCoverClassificationDock")
         dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
-        dock.setMinimumWidth(DOCK_PANEL_WIDTH)
-        dock.setMaximumWidth(DOCK_PANEL_WIDTH)
+        dock.setMinimumWidth(340)
         dock.setFeatures(
             QDockWidget.DockWidgetClosable |
             QDockWidget.DockWidgetMovable |
@@ -226,17 +231,19 @@ class LandCoverClassification:
 
         self.dlg = LandCoverClassificationDialog(self.iface, parent=dock)
         self.dlg.setWindowFlags(Qt.Widget)
-        self.dlg.setMinimumWidth(DOCK_PANEL_WIDTH)
-        self.dlg.setMaximumWidth(DOCK_PANEL_WIDTH)
+        self.dlg.setMinimumWidth(340)
         try:
             self.dlg.closeBtn.clicked.disconnect()
         except TypeError:
             pass
         self.dlg.closeBtn.clicked.connect(dock.close)
 
+        width = QSettings().value("LandCoverClassification/dock_width", 440, type=int)
         dock.setWidget(self.dlg)
         self.iface.mainWindow().addDockWidget(Qt.RightDockWidgetArea, dock)
         self.dock = dock
+        width = max(340, min(width, max(440, self.iface.mainWindow().width() // 2)))
+        self.iface.mainWindow().resizeDocks([dock], [width], Qt.Horizontal)
 
     def run(self):
         """打开插件主对话框。"""

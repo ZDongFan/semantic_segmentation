@@ -86,17 +86,17 @@
             <item>
              <widget class="QLabel" name="thresholdLabel">
               <property name="text">
-               <string>概率阈值（值越大越严格）</string>
+               <string>概率阈值</string>
               </property>
               <property name="toolTip">
-               <string>概率阈值范围为 0–1，值越大越严格。</string>
+               <string>提高阈值会收紧候选区域，也可能增加漏检。</string>
               </property>
              </widget>
             </item>
             <item>
              <widget class="QSlider" name="thresholdSlider">
               <property name="toolTip">
-               <string>概率阈值范围为 0–1，值越大越严格。</string>
+               <string>提高阈值会收紧候选区域，也可能增加漏检。</string>
               </property>
               <property name="maximum">
                <number>10</number>
@@ -260,7 +260,7 @@
          <item>
           <widget class="QPushButton" name="runBtn">
            <property name="text">
-            <string>全图推理</string>
+            <string>开始推理</string>
            </property>
           </widget>
          </item>
@@ -337,17 +337,17 @@
            <widget class="QComboBox" name="outputFormatCombo">
             <item>
              <property name="text">
-              <string>Raster (GeoTIFF)</string>
+              <string>栅格影像（GeoTIFF）</string>
              </property>
             </item>
             <item>
              <property name="text">
-              <string>Vector (Shapefile)</string>
+              <string>矢量面（Shapefile）</string>
              </property>
             </item>
             <item>
              <property name="text">
-              <string>Vector (DXF / CAD)</string>
+              <string>CAD 边界（DXF）</string>
              </property>
             </item>
            </widget>
@@ -365,7 +365,7 @@
           <item row="2" column="0" colspan="2">
            <widget class="QLabel" name="workflowHintLabel">
             <property name="text">
-             <string>推理后会生成草稿矢量，请直接编辑草稿层，编辑完成后导出所选格式。</string>
+             <string>从当前影像草稿导出成果。草稿可来自模型推理、AI 编辑或人工修改。</string>
             </property>
             <property name="wordWrap">
              <bool>true</bool>
@@ -398,7 +398,7 @@
           <item row="0" column="0" colspan="4">
            <widget class="QLabel" name="aiHintLabel">
             <property name="text">
-             <string>左键添加正样本点，右键添加负样本点；预览满意后按 E 确认追加为新的 landslide 草稿对象。</string>
+             <string>在地图上左键标记目标内点、右键标记排除点。有效预览可添加到滑坡草稿。</string>
             </property>
             <property name="wordWrap">
              <bool>true</bool>
@@ -428,7 +428,7 @@
              <bool>false</bool>
             </property>
             <property name="text">
-             <string>撤销点</string>
+             <string>撤销上一个提示点</string>
             </property>
            </widget>
           </item>
@@ -438,7 +438,7 @@
              <bool>false</bool>
             </property>
             <property name="text">
-             <string>清除点</string>
+             <string>清空提示点</string>
             </property>
            </widget>
           </item>
@@ -448,7 +448,7 @@
              <bool>false</bool>
             </property>
             <property name="text">
-             <string>追加 landslide 草稿对象（E）</string>
+             <string>添加到滑坡草稿 · E</string>
             </property>
            </widget>
           </item>
@@ -478,7 +478,7 @@
        <item>
         <widget class="QGroupBox" name="exportProgressGroup">
          <property name="title">
-          <string>编辑与导出状态</string>
+          <string>文件导出状态</string>
          </property>
          <layout class="QVBoxLayout" name="exportProgressLayout">
           <item>
