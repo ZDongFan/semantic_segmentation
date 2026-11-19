@@ -75,6 +75,68 @@ class HistoryWindow(QtWidgets.QDialog):
         super().closeEvent(event)
 
 
+class ImageManager(HistoryWindow):
+    """管理项目影像关联，显示失效路径和已移除记录，不加载栅格。"""
+
+    def __init__(self, panel):
+        super().__init__(panel, '管理项目影像')
+        self.rows = []
+        hint = QtWidgets.QLabel('移除保留原始文件、草稿与发布历史；重新加入后接续原草稿。\n'
+                                '移除不会立即改变对外版本；全部成果移除后不能发布空版本。')
+        hint.setWordWrap(True)
+        self.layout.addWidget(hint)
+        self.table = QtWidgets.QTableWidget(0, 4, self)
+        self.table.setObjectName('projectImageManagementTable')
+        self.table.setHorizontalHeaderLabels(['影像名称', '影像路径', '草稿', '关联状态'])
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.layout.addWidget(self.table)
+        buttons = QtWidgets.QHBoxLayout()
+        self.remove = self.button(buttons, '移除所选影像', lambda: self.change(True))
+        self.rejoin = self.button(buttons, '重新加入所选影像', lambda: self.change(False))
+        self.button(buttons, '重新读取列表', self._load)
+        self.table.itemSelectionChanged.connect(self.update_actions)
+        self.layout.addLayout(buttons)
+        self.layout.addWidget(self.status)
+        self.update_actions()
+
+    def load(self):
+        self.run(self._load)
+
+    def _load(self):
+        rows = self.panel.call(lambda: self.panel._client().request(
+            'GET', '/internal/projects/{}/images?status=all'.format(self.project_id)))
+        self.check_context()
+        self.rows = rows
+        self.table.setRowCount(0)
+        self.table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = (row['name'], row['image_path'], '有草稿' if row['draft_id'] else '未生成成果',
+                      '已移除' if row.get('removed_at') else '项目中')
+            for column, value in enumerate(values):
+                self.table.setItem(index, column, QtWidgets.QTableWidgetItem(value))
+        self.table.setColumnWidth(0, 180)
+        self.update_actions()
+        self.status.setText('已读取 {} 景影像。选择记录后移除或重新加入。'.format(len(rows)))
+
+    def update_actions(self):
+        index = self.table.currentRow()
+        row = self.rows[index] if 0 <= index < len(self.rows) else None
+        self.remove.setEnabled(bool(row and not row.get('removed_at')))
+        self.rejoin.setEnabled(bool(row and row.get('removed_at')))
+
+    def change(self, removed):
+        index = self.table.currentRow()
+        if not 0 <= index < len(self.rows):
+            raise ValueError('请先选择影像。')
+        if self.panel.change_image_membership(self.rows[index], removed):
+            self.check_context()
+            self._load()
+            self.status.setText(self.panel.label.text())
+
+
 class VersionBrowser(HistoryWindow):
     """仅比较已发布版本，地图展示当前所选变化的前后边界。"""
 

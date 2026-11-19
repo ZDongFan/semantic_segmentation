@@ -123,7 +123,14 @@ class ProjectPanel(QtWidgets.QWidget):
         self.images = QtWidgets.QComboBox()
         self.images.addItem("已关联影像", None)
         form.addRow("当前项目", self.projects)
-        form.addRow("项目影像", self.images)
+        image_row = QtWidgets.QHBoxLayout()
+        image_row.addWidget(self.images, 1)
+        manage = QtWidgets.QPushButton("管理影像…", self)
+        manage.setObjectName("manageProjectImages")
+        manage.clicked.connect(lambda: self.invoke(self.manage_images))
+        self.buttons["manage_images"] = manage
+        image_row.addWidget(manage)
+        form.addRow("项目影像", image_row)
         layout.addLayout(form)
         for text, action in [
                 ("创建项目", self.create_project),
@@ -289,6 +296,7 @@ class ProjectPanel(QtWidgets.QWidget):
         self.buttons["create_project"].setEnabled(not busy)
         self.projects.setEnabled(not busy)
         self.images.setEnabled(bool(self.project) and not busy)
+        self.buttons["manage_images"].setEnabled(bool(self.project) and not busy)
         self.retry_button.setEnabled(not busy)
         self.action_hint.setText(
             "请等待当前操作完成。" if busy else
@@ -477,6 +485,83 @@ class ProjectPanel(QtWidgets.QWidget):
         return "/internal/projects/{}/images/{}{}".format(
             self.project["id"], self.image["id"], suffix)
 
+    def manage_images(self):
+        """独立列表管理关联，无需打开影像，也不切换当前编辑对象。"""
+        from .history_dialogs import ImageManager
+        self._show_history_window('_image_manager', ImageManager)
+
+    def change_image_membership(self, row, removed):
+        """确认、保存和服务提交依次进行；结果未知时查询后再解除本地会话。"""
+        self._check_idle()
+        project = self.selected_project()
+        if row['project_id'] != project['id']:
+            raise ValueError('影像不属于当前项目。')
+        key = "LandCoverClassification/pending_project_publish/{}".format(project['id'])
+        if self.settings.value(key, ''):
+            raise RuntimeError('项目有待确认的发布请求，请先点击“发布项目版本”确认结果，再管理影像。')
+        current = bool(self.image and self.image['id'] == row['id'])
+        if removed:
+            message = ('将从项目工作列表移除“{}”。\n{}\n'
+                       '原始影像、DEM、草稿及发布历史均保留；后续发布不再包含该影像。\n'
+                       '当前对外版本不会立即变化；若全部成果移除，不能发布空版本。\n'
+                       '可从管理影像列表重新加入并接续原草稿。').format(row['name'], row['image_path'])
+            if QtWidgets.QMessageBox.question(
+                    self, '移除项目影像', message, QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
+                return False
+            if current:
+                self.save()
+                row = self.image.copy()
+                if self.dialog._draft_session.is_active:
+                    from .recovery import backup_current
+                    backup_current(self, '移除影像前备份')
+        path = '/internal/projects/{}/images/{}'.format(project['id'], row['id'])
+        client = self._client()
+        try:
+            result = self.call(lambda: client.request(
+                'DELETE' if removed else 'POST', path if removed else path + '/restore',
+                {'base_draft_id': row['draft_id']} if removed else None))
+        except ProjectClientError as exc:
+            if exc.status is not None:
+                raise
+            rows = self.call(lambda: client.request(
+                'GET', '/internal/projects/{}/images?status=all'.format(project['id'])))
+            result = next((item for item in rows if item['id'] == row['id']), None)
+            if result is None or bool(result.get('removed_at')) != removed:
+                raise exc
+        if result['id'] != row['id'] or result['project_id'] != project['id'] or bool(result.get('removed_at')) != removed:
+            raise RuntimeError('影像管理响应与请求不一致，本地会话未清理，请重新读取。')
+        if removed and current:
+            self._detach_removed_image()
+        self.refresh_images()
+        self.label.setText('影像已移除，历史仍保留；当前对外版本不变，全部移除后不能发布空版本。'
+                           if removed else '影像已重新加入，原草稿保留；选择该影像可继续编辑或使用恢复管理。')
+        return True
+
+    def _detach_removed_image(self):
+        """只解除插件工作状态，保留用户的原始影像图层及已保存历史。"""
+        for name in ('_recovery_browser', '_attribute_browser'):
+            window = getattr(self, name, None)
+            if window is not None and not sip.isdeleted(window):
+                window.close()
+        self.switching = True
+        try:
+            dialog = self.dialog
+            dialog._stop_ai_editing(silent=True)
+            dialog._clear_drawn_roi()
+            dialog._discard_draft_session()
+            dialog._input_adapter_request_id += 1
+            dialog._input_adapter.clear()
+            dialog._input_path = dialog._input_layer = dialog._label_path = None
+            dialog._invalidate_fusion_undo()
+            self.image = None
+            self._synced_generation = None
+            self._set_inputs('', None)
+            dialog.exportRasterBtn.setEnabled(False)
+            dialog.undoFusionBtn.setEnabled(False)
+        finally:
+            self.switching = False
+
     def _freeze_inputs(self, frozen):
         self.dialog.inputGroup.setEnabled(not frozen)
         self.dialog.mDemFile.setEnabled(not frozen)
@@ -517,6 +602,8 @@ class ProjectPanel(QtWidgets.QWidget):
         else:
             self._activate_image(row, preserve_input=True)
         self.refresh_images()
+        if row.get('rejoined'):
+            self.label.setText('已将此前移除的影像重新加入项目，并接续原草稿。')
 
     def open_image(self):
         row = self.images.currentData()

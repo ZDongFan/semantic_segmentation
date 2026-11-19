@@ -73,6 +73,14 @@ class _ServiceClient:
         self.requests.append((method, path, payload))
         if self.failure:
             raise ProjectClientError("服务不可用")
+        if method == 'DELETE':
+            self.image['removed_at'] = '2026-11-19T00:00:00Z'
+            return self.image.copy()
+        if path.endswith('/restore'):
+            self.image['removed_at'] = None
+            return self.image.copy()
+        if path.endswith('/images?status=all'):
+            return [self.image.copy()]
         if method == "PUT":
             self.saved = os.path.join(self.directory, "saved.gpkg")
             snapshot_gpkg(upload, self.saved)
@@ -87,7 +95,7 @@ class _ServiceClient:
             if method == "POST":
                 self.image["dem_path"] = payload["dem_path"]
                 return self.image.copy()
-            return [self.image.copy()]
+            return [] if self.image.get('removed_at') else [self.image.copy()]
         if path == "/internal/projects":
             return [self.project.copy()]
         return []

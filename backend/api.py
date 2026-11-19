@@ -4,6 +4,7 @@ import hmac
 import logging
 import os
 import uuid
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -40,6 +41,11 @@ class DraftReference(BaseModel):
     model_config = ConfigDict(extra="forbid")
     image_id: uuid.UUID
     draft_id: uuid.UUID
+
+
+class RemoveImageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_draft_id: uuid.UUID | None
 
 
 class PublishRequest(BaseModel):
@@ -85,8 +91,16 @@ def create_app(internal=False, settings=None, service=None):
             return service.create_project(payload.name, payload.ztz)
 
         @app.get("/internal/projects/{project_id}/images")
-        def images(project_id: uuid.UUID):
-            return service.images(project_id)
+        def images(project_id: uuid.UUID, status: Literal["active", "removed", "all"] = "active"):
+            return service.images(project_id, status)
+
+        @app.delete("/internal/projects/{project_id}/images/{image_id}")
+        def remove_image(project_id: uuid.UUID, image_id: uuid.UUID, payload: RemoveImageRequest):
+            return service.remove_image(project_id, image_id, payload.base_draft_id)
+
+        @app.post("/internal/projects/{project_id}/images/{image_id}/restore")
+        def restore_image(project_id: uuid.UUID, image_id: uuid.UUID):
+            return service.restore_image(project_id, image_id)
 
         @app.post("/internal/projects/{project_id}/images", status_code=201)
         def register_image(project_id: uuid.UUID, payload: ImageRequest):

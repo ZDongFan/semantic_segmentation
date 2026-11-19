@@ -99,6 +99,17 @@ def validate_source(panel, source):
     return count
 
 
+def backup_current(panel, reason):
+    """持久保存当前已提交草稿及身份，供移除或恢复后的管理入口使用。"""
+    root = recovery_root()
+    root.mkdir(parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix='lcc_recovery_', dir=str(root)))
+    saved = backup / 'draft.gpkg'
+    snapshot_gpkg(panel.dialog._draft_session.generation_path, saved)
+    write_record(panel, backup, saved, reason)
+    return str(backup)
+
+
 def restore_source(panel, source):
     """复制并验证候选，备份当前草稿后原子切换；失败保留原 generation。"""
     panel._check_idle()
@@ -115,12 +126,7 @@ def restore_source(panel, source):
     candidate = session.next_generation_path('recovered')
     snapshot_gpkg(source, candidate)
     validate_source(panel, candidate)
-    root = recovery_root()
-    root.mkdir(parents=True, exist_ok=True)
-    backup = Path(tempfile.mkdtemp(prefix='lcc_recovery_', dir=str(root)))
-    saved = backup / 'draft.gpkg'
-    snapshot_gpkg(session.generation_path, saved)
-    write_record(panel, backup, saved, '恢复前自动备份')
+    backup = backup_current(panel, '恢复前自动备份')
     dialog._stop_ai_editing(silent=True)
     dialog._publish_draft_generation(candidate)
     dialog._invalidate_fusion_undo()

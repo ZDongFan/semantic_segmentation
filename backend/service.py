@@ -85,11 +85,14 @@ class Service:
                 + ("" if internal else "WHERE p.current_version IS NOT NULL ")
                 + "ORDER BY p.created_at,p.id").fetchall()
 
-    def images(self, project_id):
+    def images(self, project_id, status="active"):
+        filters = {"active": " AND removed_at IS NULL", "removed": " AND removed_at IS NOT NULL", "all": ""}
+        if status not in filters:
+            raise ServiceError(422, "无效的影像状态。")
         with self.connection() as db:
             self._project(db, project_id)
             return db.execute(
-                "SELECT * FROM lcc_images WHERE project_id=%s ORDER BY name,id",
+                "SELECT * FROM lcc_images WHERE project_id=%s" + filters[status] + " ORDER BY name,id",
                 (project_id,)).fetchall()
 
     def register_image(self, project_id, name, image_path, dem_path):
@@ -101,13 +104,43 @@ class Service:
                 "SELECT * FROM lcc_images WHERE project_id=%s AND image_path=%s",
                 (project_id, image_path)).fetchone()
             if existing:
-                return db.execute(
-                    "UPDATE lcc_images SET dem_path=%s WHERE id=%s RETURNING *",
+                result = db.execute(
+                    "UPDATE lcc_images SET dem_path=%s,removed_at=NULL WHERE id=%s RETURNING *",
                     (dem_path, existing["id"])).fetchone()
+                result['rejoined'] = existing['removed_at'] is not None
+                return result
             return db.execute(
                 """INSERT INTO lcc_images(id,project_id,name,image_path,dem_path)
                    VALUES (%s,%s,%s,%s,%s) RETURNING *""",
                 (uuid.uuid4(), project_id, name, image_path, dem_path)).fetchone()
+
+    def remove_image(self, project_id, image_id, base_draft_id):
+        """只移除工作关联，保留全部历史引用；项目锁防止并发保存与发布。"""
+        with self.connection() as db:
+            self._project(db, project_id, lock=True)
+            image = db.execute(
+                "SELECT * FROM lcc_images WHERE id=%s AND project_id=%s FOR UPDATE",
+                (image_id, project_id)).fetchone()
+            if not image:
+                raise ServiceError(404, "项目影像不存在。")
+            if image["removed_at"] is not None:
+                return image
+            if image["draft_id"] != base_draft_id:
+                raise ServiceError(409, "影像草稿已变化，请重新读取并确认后移除。")
+            return db.execute(
+                "UPDATE lcc_images SET removed_at=now() WHERE id=%s RETURNING *",
+                (image_id,)).fetchone()
+
+    def restore_image(self, project_id, image_id):
+        """重新加入原影像，沿用身份与草稿，不要求原始文件当前可读。"""
+        with self.connection() as db:
+            self._project(db, project_id, lock=True)
+            image = db.execute(
+                "UPDATE lcc_images SET removed_at=NULL WHERE id=%s AND project_id=%s RETURNING *",
+                (image_id, project_id)).fetchone()
+            if not image:
+                raise ServiceError(404, "项目影像不存在。")
+            return image
 
     def save_draft(self, project_id, image_id, upload, base_draft_id):
         """草稿以内容摘要支持断线重试，以基础草稿标识防止覆盖他人编辑。"""
@@ -121,6 +154,8 @@ class Service:
                 (image_id, project_id)).fetchone()
             if not image:
                 raise ServiceError(404, "项目影像不存在。")
+            if image["removed_at"] is not None:
+                raise ServiceError(409, "影像已移除，请重新加入项目后再保存草稿。")
             previous = None
             if image["draft_id"]:
                 previous = db.execute("SELECT * FROM lcc_drafts WHERE id=%s",
@@ -186,7 +221,7 @@ class Service:
             if project["current_version"] != base_version:
                 raise ServiceError(409, "项目已有新版本，请刷新项目后重新确认发布。")
             current = {row["id"]: row["draft_id"] for row in db.execute(
-                "SELECT id,draft_id FROM lcc_images WHERE project_id=%s AND draft_id IS NOT NULL",
+                "SELECT id,draft_id FROM lcc_images WHERE project_id=%s AND removed_at IS NULL AND draft_id IS NOT NULL",
                 (project_id,))}
             if scenes != current:
                 raise ServiceError(409, "项目草稿已变化，请重新确认全部影像后发布。")
