@@ -1116,7 +1116,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def _discard_draft_session(self, preserve=False):
         """解除画布引用；退出保存失败时保留磁盘目录供人工恢复。"""
         if preserve and getattr(self, "_project_panel", None):
-            self._project_panel.record_recovery()
+            self._project_panel.record_recovery('退出保存未完成')
         if preserve and self._layer_is_usable(self._draft_layer):
             self._draft_layer.blockSignals(True)
         layer_id = self._draft_layer_id

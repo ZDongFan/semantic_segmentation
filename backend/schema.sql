@@ -10,12 +10,16 @@ CREATE TABLE IF NOT EXISTS lcc_images (
     draft_id uuid, UNIQUE(project_id, image_path)
 );
 -- 显式初始化也用于已有数据库的无损升级，日常启动不执行。
-ALTER TABLE lcc_images ADD COLUMN IF NOT EXISTS removed_at timestamptz;
+ALTER TABLE  ADD COLUMN IF NOT EXISTS removed_at timestamptz;
 CREATE TABLE IF NOT EXISTS lcc_drafts (
     id uuid PRIMARY KEY, image_id uuid NOT NULL REFERENCES lcc_images(id),
     file_path text NOT NULL, sha256 text NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+-- 旧记录无法证明保存来源，只保留为历史资产，不推断为手动保存。
+ALTER TABLE lcc_drafts ADD COLUMN IF NOT EXISTS save_kind text NOT NULL DEFAULT 'legacy'
+    CHECK (save_kind IN ('legacy', 'manual', 'automatic'));
+ALTER TABLE lcc_drafts ADD COLUMN IF NOT EXISTS save_reason text NOT NULL DEFAULT '';
 CREATE TABLE IF NOT EXISTS lcc_versions (
     id uuid PRIMARY KEY, project_id uuid NOT NULL REFERENCES lcc_projects(id),
     base_version uuid REFERENCES lcc_versions(id),

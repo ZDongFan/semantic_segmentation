@@ -238,6 +238,36 @@ class ProjectWorkflowTest(unittest.TestCase):
         self.assertTrue(self.dialog.inputGroup.isEnabled())
         self.assertEqual(self.dialog._draft_layer.getFeature(1)["origin"], "user")
 
+    def test_manual_button_and_exit_use_distinct_save_sources(self):
+        from urllib.parse import parse_qs, urlsplit
+        self.add_feature()
+        self.dialog._workflow_ui.refresh()
+        self.panel.buttons['save'].click()
+        saves = [parse_qs(urlsplit(path).query) for method, path, _ in self.client.requests if method == 'PUT']
+        self.assertEqual(saves[-1]['save_kind'], ['manual'])
+        self.assertEqual(saves[-1]['save_reason'], ['手动保存'])
+        record = Path(self.dialog._draft_session.directory) / 'recovery.json'
+        import json
+        self.assertFalse(json.loads(record.read_text('utf-8'))['pending'])
+        self.client.requests.clear()
+        self.panel.save(manual=False, reason='切换影像前自动保存')
+        self.assertFalse(any(method == 'PUT' for method, _, _ in self.client.requests))
+        self.add_feature()
+        self.panel._synced_generation = None
+        self.assertEqual(self.panel.save_on_exit(), 'saved')
+        saves = [parse_qs(urlsplit(path).query) for method, path, _ in self.client.requests if method == 'PUT']
+        self.assertEqual(saves[-1]['save_kind'], ['automatic'])
+        self.assertEqual(saves[-1]['save_reason'], ['退出前自动保存'])
+
+    def test_publish_save_is_automatic(self):
+        from urllib.parse import parse_qs, urlsplit
+        self.add_feature()
+        self.panel.publish()
+        saves = [parse_qs(urlsplit(path).query) for method, path, _ in self.client.requests if method == 'PUT']
+        self.assertEqual(len(saves), 1)
+        self.assertEqual(saves[0]['save_kind'], ['automatic'])
+        self.assertEqual(saves[0]['save_reason'], ['发布前自动保存'])
+
     def test_close_failure_keeps_generation(self):
         self.add_feature()
         path = self.dialog._draft_session.generation_path
@@ -268,7 +298,7 @@ class ProjectWorkflowTest(unittest.TestCase):
         import json
         draft_id = json.loads(self.panel.settings.value(pending))["drafts"][0]["draft_id"]
         original_save = self.panel.save
-        self.panel.save = lambda: (self.panel.image.update(draft_id=draft_id), self.client.image.update(draft_id=draft_id))
+        self.panel.save = lambda **kwargs: (self.panel.image.update(draft_id=draft_id), self.client.image.update(draft_id=draft_id))
         self.panel.publish()
         self.panel.save = original_save
         self.assertEqual(attempted[0]["idempotency_key"], attempted[1]["idempotency_key"])
@@ -348,6 +378,17 @@ class ProjectWorkflowTest(unittest.TestCase):
         self.panel.eventFilter(host, event)
         event.ignore()
         self.panel._host_close_settled()
+        unchanged = QCloseEvent()
+        self.panel.eventFilter(host, unchanged)
+        self.assertEqual(sum(method == "PUT" for method, _, _ in self.client.requests), 1)
+        unchanged.ignore()
+        self.panel._host_close_settled()
+        layer = self.dialog._draft_layer
+        self.assertTrue(layer.startEditing())
+        feature = next(layer.getFeatures())
+        geometry = feature.geometry()
+        geometry.translate(1, 0)
+        self.assertTrue(layer.changeGeometry(feature.id(), geometry))
         self.panel.eventFilter(host, QCloseEvent())
         self.assertEqual(sum(method == "PUT" for method, _, _ in self.client.requests), 2)
         host.hide()

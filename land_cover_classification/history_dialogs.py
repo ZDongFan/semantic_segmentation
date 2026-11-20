@@ -4,6 +4,8 @@
 import json
 import hashlib
 import os
+import tempfile
+from pathlib import Path
 from urllib.parse import urlencode
 
 from qgis.PyQt import QtWidgets, sip
@@ -323,7 +325,7 @@ class RecoveryBrowser(HistoryWindow):
         self.rows = []
         self.offset = 0
         self.next_offset = None
-        self.layout.addWidget(QtWidgets.QLabel('恢复到当前影像的本地草稿；恢复前自动备份，不自动保存或发布。'))
+        self.layout.addWidget(QtWidgets.QLabel('仅显示手动保存历史和最新一份自动恢复草稿；恢复将替换当前本地草稿，不另建备份。'))
         self.list = QtWidgets.QListWidget()
         self.layout.addWidget(self.list)
         buttons = QtWidgets.QHBoxLayout()
@@ -334,8 +336,8 @@ class RecoveryBrowser(HistoryWindow):
         self.layout.addLayout(buttons)
         navigation = QtWidgets.QHBoxLayout()
         self.button(navigation, '重新读取记录', self._load)
-        self.next = self.button(navigation, '更多服务端快照', self.more)
-        self.button(navigation, '打开本地备份目录', self.open_folder)
+        self.next = self.button(navigation, '更多手动保存历史', self.more)
+        self.button(navigation, '打开本地草稿目录', self.open_folder)
         self.layout.addLayout(navigation)
         self.layout.addWidget(self.status)
 
@@ -343,11 +345,19 @@ class RecoveryBrowser(HistoryWindow):
         self.run(self._load)
 
     def append(self, rows):
-        for row in rows:
-            self.rows.append(row)
-            self.list.addItem('{} · {} · {}{}'.format(
-                '本地' if row['kind'] == 'local' else '服务端', row['created_at'],
-                row.get('reason', row.get('id', '')), '（当前保存）' if row.get('is_current') else ''))
+        combined = self.rows + rows
+        automatic = [row for row in combined if row.get('save_kind') == 'automatic' or row['kind'] == 'local']
+        manual = [row for row in combined if row.get('save_kind') != 'automatic' and row['kind'] != 'local']
+        latest = max(automatic, key=lambda row: recovery.record_time(row['created_at']), default=None)
+        self.rows = ([latest] if latest else []) + manual
+        self.list.clear()
+        for row in self.rows:
+            automatic = row.get('save_kind') == 'automatic' or row['kind'] == 'local'
+            self.list.addItem('{} · {} · {} · {}{}'.format(
+                '最近自动恢复草稿' if automatic else '手动保存', row['created_at'],
+                '本地' if row['kind'] == 'local' else '服务端',
+                row.get('reason', row.get('save_reason', '手动保存')),
+                '（当前保存）' if row.get('is_current') else ''))
 
     def _load(self):
         self.rows = []
@@ -363,7 +373,12 @@ class RecoveryBrowser(HistoryWindow):
             result = self.panel.call(lambda: self.panel._client().request(
                 'GET', self.panel._image_path('/drafts') + '?offset={}&limit=100'.format(self.offset)))
             self.check_context(True)
-            self.append([{**row, 'kind': 'server'} for row in result['items']])
+            manual_at = result.get('manual_saved_at')
+            if manual_at:
+                self.rows = [row for row in self.rows if row['kind'] != 'local'
+                             or recovery.record_time(row['created_at']) > recovery.record_time(manual_at)]
+            self.append([{**row, 'kind': 'server'} for row in result['items']
+                         if row.get('save_kind') in ('manual', 'automatic')])
             self.next_offset = result['next_offset']
             self.next.setEnabled(self.next_offset is not None)
             self.status.setText('已读取 {} 条记录。旧版未登记的保留文件可通过“导入旧草稿文件”选择。'.format(len(self.rows)))
@@ -412,12 +427,12 @@ class RecoveryBrowser(HistoryWindow):
     def confirm_restore(self, path):
         count = recovery.validate_source(self.panel, path)
         message = ('将用这份含 {} 个滑坡的草稿替换当前本地草稿。\n'
-                   '当前编辑先提交到本地并自动备份；服务端草稿和发布版本不变。\n是否继续？').format(count)
+                   '当前编辑先提交到本地，替换时不另建恢复前备份；服务端草稿和发布版本不变。\n是否继续？').format(count)
         if QtWidgets.QMessageBox.question(self, '确认恢复', message) != QtWidgets.QMessageBox.Yes:
             return
         self.check_context(True)
-        backup = recovery.restore_source(self.panel, path)
-        self.status.setText('已恢复到本地，待您保存。恢复前备份：' + backup)
+        recovery.restore_source(self.panel, path)
+        self.status.setText('已恢复到本地，待您保存。')
 
     def restore(self):
         self.with_source(self.confirm_restore)
@@ -441,6 +456,6 @@ class RecoveryBrowser(HistoryWindow):
             self.confirm_restore(path)
 
     def open_folder(self):
-        root = recovery.recovery_root()
-        root.mkdir(parents=True, exist_ok=True)
+        row = next((row for row in self.rows if row['kind'] == 'local'), None)
+        root = Path(row['record']).parent if row else Path(tempfile.gettempdir())
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(root)))

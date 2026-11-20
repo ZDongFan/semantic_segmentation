@@ -2,22 +2,28 @@
 """登记本地已发布 generation，并安全恢复到当前影像的新 generation。"""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import tempfile
 from datetime import datetime, timezone
 import uuid
 
-from qgis.PyQt.QtCore import QStandardPaths
 from qgis.core import QgsVectorLayer, QgsRasterLayer, QgsWkbTypes
 
 from .draft_session import layer_uri
 from .project_client import snapshot_gpkg
 
 
-def recovery_root():
-    """恢复前备份位于应用数据目录，不依赖系统临时目录长期保留。"""
-    return Path(QStandardPaths.writableLocation(QStandardPaths.AppLocalDataLocation)) / 'LandCoverClassification' / 'recovery'
+def manual_save_key(panel):
+    """按服务、项目及影像隔离本机手动保存时间，供离线恢复筛选使用。"""
+    identity = json.dumps([panel._client().base_url, panel.project['id'], panel.image['id']])
+    return 'LandCoverClassification/manual_draft_save/' + hashlib.sha256(identity.encode('utf-8')).hexdigest()
+
+
+def mark_manual_saved(panel):
+    """手动保存成功后记录本机时间，抑制已被确认保存的旧本地恢复状态。"""
+    panel.settings.setValue(manual_save_key(panel), datetime.now(timezone.utc).isoformat())
 
 
 def write_record(panel, directory=None, generation=None, reason='编辑会话'):
@@ -34,7 +40,8 @@ def write_record(panel, directory=None, generation=None, reason='编辑会话'):
             'project_id': panel.project['id'], 'image_id': panel.image['id'],
             'image_path': os.path.realpath(panel.image['image_path']),
             'base_draft_id': panel.image.get('draft_id'), 'generation': generation.name,
-            'created_at': datetime.now(timezone.utc).isoformat(), 'reason': reason}
+            'created_at': datetime.now(timezone.utc).isoformat(), 'reason': reason,
+            'pending': panel._synced_generation != (panel.image['id'], session.generation_path)}
     temporary = directory / 'recovery.json.tmp'
     temporary.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
     os.replace(temporary, directory / 'recovery.json')
@@ -58,19 +65,32 @@ def read_record(path, panel):
 
 
 def local_records(panel):
-    """仅枚举带身份记录的会话和备份；无法关联的旧文件需由用户显式导入。"""
+    """仅保留最新的未同步编辑会话；独立备份不再作为恢复入口。"""
     candidates = list(Path(tempfile.gettempdir()).glob('lcc_draft_session_*/recovery.json'))
-    candidates += list(recovery_root().glob('lcc_recovery_*/recovery.json'))
     active = os.path.realpath(panel.dialog._draft_session.directory or '.')
     rows = []
     for path in candidates:
         if os.path.realpath(path.parent) == active:
             continue
         try:
-            rows.append(read_record(path, panel))
+            row = read_record(path, panel)
+            if row.get('reason') not in ('恢复前自动备份', '移除影像前备份'):
+                rows.append(row)
         except (ValueError, OSError, KeyError, TypeError):
             continue
-    return sorted(rows, key=lambda row: row['created_at'], reverse=True)
+    rows.sort(key=lambda row: record_time(row['created_at']), reverse=True)
+    manual_at = record_time(panel.settings.value(manual_save_key(panel), ''))
+    if not rows or not rows[0].get('pending', True) or record_time(rows[0]['created_at']) <= manual_at:
+        return []
+    return [{**rows[0], 'save_kind': 'automatic'}]
+
+
+def record_time(value):
+    """统一比较服务端与本地记录的带时区时间。"""
+    try:
+        return datetime.fromisoformat(value).astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def validate_source(panel, source):
@@ -99,19 +119,8 @@ def validate_source(panel, source):
     return count
 
 
-def backup_current(panel, reason):
-    """持久保存当前已提交草稿及身份，供移除或恢复后的管理入口使用。"""
-    root = recovery_root()
-    root.mkdir(parents=True, exist_ok=True)
-    backup = Path(tempfile.mkdtemp(prefix='lcc_recovery_', dir=str(root)))
-    saved = backup / 'draft.gpkg'
-    snapshot_gpkg(panel.dialog._draft_session.generation_path, saved)
-    write_record(panel, backup, saved, reason)
-    return str(backup)
-
-
 def restore_source(panel, source):
-    """复制并验证候选，备份当前草稿后原子切换；失败保留原 generation。"""
+    """复制并验证候选后原子切换，不另建备份；失败保留原 generation。"""
     panel._check_idle()
     if not panel.active or panel.image.get('project_id') != panel.project['id']:
         raise ValueError('请先打开恢复记录所属的项目影像。')
@@ -126,11 +135,9 @@ def restore_source(panel, source):
     candidate = session.next_generation_path('recovered')
     snapshot_gpkg(source, candidate)
     validate_source(panel, candidate)
-    backup = backup_current(panel, '恢复前自动备份')
     dialog._stop_ai_editing(silent=True)
     dialog._publish_draft_generation(candidate)
     dialog._invalidate_fusion_undo()
     panel._synced_generation = None
     dialog._switch_to_draft_tab()
-    panel.label.setText('草稿已恢复到本地，尚未保存到服务端；当前草稿的恢复前副本已保留。')
-    return str(backup)
+    panel.label.setText('草稿已恢复到本地，尚未保存到服务端。')

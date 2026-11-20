@@ -112,7 +112,9 @@ def create_app(internal=False, settings=None, service=None):
 
         @app.put("/internal/projects/{project_id}/images/{image_id}/draft")
         async def save_draft(project_id: uuid.UUID, image_id: uuid.UUID, request: Request,
-                             base_draft_id: uuid.UUID | None = None):
+                             base_draft_id: uuid.UUID | None = None,
+                             save_kind: Literal['manual', 'automatic'] = 'automatic',
+                             save_reason: str = Query(default='自动保存', max_length=80)):
             staging = service.root / "uploads"
             staging.mkdir(parents=True, exist_ok=True)
             path = staging / (str(uuid.uuid4()) + ".gpkg")
@@ -128,7 +130,8 @@ def create_app(internal=False, settings=None, service=None):
                     os.fsync(stream.fileno())
                 try:
                     return await run_in_threadpool(
-                        service.save_draft, project_id, image_id, path, base_draft_id)
+                        service.save_draft, project_id, image_id, path, base_draft_id,
+                        save_kind, save_reason)
                 except (ValueError, RuntimeError) as exc:
                     logging.getLogger("lcc").warning("草稿校验失败: %s", exc)
                     raise ServiceError(422, "草稿几何、字段或 GeoPackage 格式不符合契约。")

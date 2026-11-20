@@ -102,34 +102,98 @@ class IndependentWorkspacesTest(fixtures.unittest.TestCase):
         self.iface.mapCanvas().setMapTool(QgsMapToolPan(self.iface.mapCanvas()))
         QgsApplication.processEvents()
 
-    def test_restore_creates_backup_and_keeps_service_pointer(self):
+    def test_restore_without_backup_keeps_service_pointer(self):
         self.add_feature()
         source = str(Path(self.root) / 'old.gpkg')
         snapshot_gpkg(self.dialog._draft_session.generation_path, source)
         self.add_feature()
         previous = self.dialog._draft_session.generation_path
         pointer = self.panel.image['draft_id']
-        with patch.object(recovery, 'recovery_root', return_value=Path(self.root) / 'recovery'):
-            backup = recovery.restore_source(self.panel, source)
-            record = recovery.read_record(Path(backup) / 'recovery.json', self.panel)
-            self.assertEqual(recovery.validate_source(self.panel, record['path']), 2)
+        requests = list(self.client.requests)
+        with patch.object(recovery.tempfile, 'mkdtemp', side_effect=AssertionError('恢复不应创建独立备份')):
+            recovery.restore_source(self.panel, source)
         self.assertEqual(self.dialog._draft_layer.featureCount(), 1)
         self.assertNotEqual(self.dialog._draft_session.generation_path, previous)
         self.assertEqual(self.panel.image['draft_id'], pointer)
         self.assertIsNone(self.panel._synced_generation)
+        self.assertEqual(self.client.requests, requests)
+        self.assertEqual(recovery.validate_source(self.panel, source), 1)
+        record = Path(self.dialog._draft_session.directory) / 'recovery.json'
+        self.assertEqual(recovery.read_record(record, self.panel)['path'],
+                         self.dialog._draft_session.generation_path)
 
-    def test_restore_publish_failure_preserves_generation_and_backup(self):
+    def test_restore_publish_failure_preserves_generation_without_backup(self):
         self.add_feature()
         source = str(Path(self.root) / 'old.gpkg')
         snapshot_gpkg(self.dialog._draft_session.generation_path, source)
         previous = self.dialog._draft_session.generation_path
-        with patch.object(recovery, 'recovery_root', return_value=Path(self.root) / 'recovery'), \
+        record = Path(self.dialog._draft_session.directory) / 'recovery.json'
+        original_record = record.read_bytes()
+        with patch.object(recovery.tempfile, 'mkdtemp', side_effect=AssertionError('恢复不应创建独立备份')), \
                 patch.object(self.dialog, '_publish_draft_generation', side_effect=RuntimeError('模拟切换失败')):
             with self.assertRaisesRegex(RuntimeError, '模拟切换失败'):
                 recovery.restore_source(self.panel, source)
         self.assertEqual(self.dialog._draft_session.generation_path, previous)
         self.assertEqual(self.dialog._draft_layer.featureCount(), 1)
-        self.assertEqual(len(list((Path(self.root) / 'recovery').glob('*/recovery.json'))), 1)
+        self.assertEqual(record.read_bytes(), original_record)
+        self.assertEqual(recovery.validate_source(self.panel, source), 1)
+
+    def test_local_records_keep_latest_session_and_ignore_standalone_backups(self):
+        self.add_feature()
+        directories = []
+        for name, reason in [('lcc_recovery_old', '恢复前自动备份'),
+                             ('lcc_recovery_removed', '移除影像前备份'),
+                             ('lcc_draft_session_old', '编辑中断'),
+                             ('lcc_draft_session_latest', '编辑中断')]:
+            directory = Path(self.root) / name
+            directory.mkdir()
+            snapshot_gpkg(self.dialog._draft_session.generation_path, directory / 'draft.gpkg')
+            recovery.write_record(self.panel, directory, directory / 'draft.gpkg', reason)
+            directories.append(directory)
+        with patch.object(recovery.tempfile, 'gettempdir', return_value=self.root):
+            rows = recovery.local_records(self.panel)
+            self.assertEqual([Path(row['record']).parent for row in rows], [directories[-1]])
+            recovery.mark_manual_saved(self.panel)
+            self.assertEqual(recovery.local_records(self.panel), [])
+            self.panel.settings.remove(recovery.manual_save_key(self.panel))
+            self.panel._synced_generation = (self.panel.image['id'], self.dialog._draft_session.generation_path)
+            recovery.write_record(self.panel, directories[-1], directories[-1] / 'draft.gpkg')
+            self.assertEqual(recovery.local_records(self.panel), [])
+        self.assertTrue(all((directory / 'draft.gpkg').is_file() for directory in directories))
+
+    def test_browser_combines_local_and_server_into_one_latest_automatic(self):
+        self.add_feature()
+        browser = RecoveryBrowser(self.panel)
+        self.addCleanup(browser.close)
+        local = {'kind': 'local', 'save_kind': 'automatic', 'created_at': '2026-11-20T02:00:00+00:00',
+                 'reason': '编辑中断'}
+        server = {'id': 'auto', 'save_kind': 'automatic', 'created_at': '2026-11-20T11:00:00+08:00',
+                  'save_reason': '退出前自动保存'}
+        manual = {'id': 'manual', 'save_kind': 'manual', 'created_at': '2026-11-20T01:00:00+00:00'}
+        self.client.request = lambda *args, **kwargs: {'items': [server, manual], 'next_offset': None,
+                                                     'manual_saved_at': manual['created_at']}
+        with patch.object(recovery, 'local_records', return_value=[local]):
+            browser.load()
+        self.assertEqual([row['id'] for row in browser.rows], ['auto', 'manual'])
+        self.assertIn('退出前自动保存', browser.list.item(0).text())
+        self.client.request = lambda *args, **kwargs: {'items': [manual], 'next_offset': None,
+                                                     'manual_saved_at': '2026-11-20T04:00:00+00:00'}
+        with patch.object(recovery, 'local_records', return_value=[local]):
+            browser.load()
+        self.assertEqual([row['id'] for row in browser.rows], ['manual'])
+
+    def test_confirm_restore_replaces_without_backup_message(self):
+        self.add_feature()
+        source = str(Path(self.root) / 'old.gpkg')
+        snapshot_gpkg(self.dialog._draft_session.generation_path, source)
+        self.add_feature()
+        browser = RecoveryBrowser(self.panel)
+        self.addCleanup(browser.close)
+        with patch.object(QtWidgets.QMessageBox, 'question', return_value=QtWidgets.QMessageBox.Yes) as question:
+            browser.confirm_restore(source)
+        self.assertIn('不另建恢复前备份', question.call_args.args[2])
+        self.assertEqual(browser.status.text(), '已恢复到本地，待您保存。')
+        self.assertEqual(self.dialog._draft_layer.featureCount(), 1)
 
     def test_recovery_record_rejects_wrong_project_and_path_escape(self):
         self.add_feature()
@@ -235,8 +299,7 @@ class IndependentWorkspacesTest(fixtures.unittest.TestCase):
         self.add_feature()
         browser.refresh()
         self.assertEqual(browser.table.rowCount(), 2)
-        with patch.object(recovery, 'recovery_root', return_value=Path(self.root) / 'recovery'):
-            recovery.restore_source(self.panel, source)
+        recovery.restore_source(self.panel, source)
         QTest.qWait(120)
         self.assertEqual(browser.table.rowCount(), 1)
 

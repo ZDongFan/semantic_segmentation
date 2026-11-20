@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from backend.api import create_app
 from backend.service import ServiceError
 from .test_postgis import create_scene, publish, add_image
+from .conftest import make_draft
 
 
 def test_history_routes_are_internal_and_validate_ids(settings):
@@ -99,6 +100,61 @@ def test_draft_history_is_scoped_and_keeps_current_pointer(postgis, draft, tmp_p
     with pytest.raises(ServiceError):
         postgis.draft(other['id'], image['id'], original)
     assert postgis.drafts(other['id'], image['id'])['items'] == []
+
+
+def test_only_manual_history_and_latest_automatic_are_recoverable(postgis, draft, tmp_path):
+    project, image = create_scene(postgis, draft)
+    original = image['draft_id']
+    first = postgis.save_draft(project['id'], image['id'], make_draft(tmp_path / 'auto1.gpkg'),
+                               original, 'automatic', '切换影像前自动保存')
+    # 已发布快照仍保持不可变，但不因此变成一条手动保存历史。
+    image['draft_id'] = first['draft_id']
+    version = publish(postgis, project, image)
+    second = postgis.save_draft(project['id'], image['id'], make_draft(tmp_path / 'auto2.gpkg'),
+                                first['draft_id'], 'automatic', '退出前自动保存')
+    rows = postgis.drafts(project['id'], image['id'])['items']
+    assert [row['id'] for row in rows] == [second['draft_id'], original]
+    assert rows[0]['save_reason'] == '退出前自动保存'
+    assert postgis.draft(project['id'], image['id'], first['draft_id'])['id'] == first['draft_id']
+    assert postgis.file_path(postgis.draft(project['id'], image['id'], first['draft_id'])['file_path']).is_file()
+    assert postgis.versions(project['id'])[0]['id'] == version['id']
+
+    confirmed = tmp_path / 'confirmed.gpkg'
+    shutil.copy2(postgis.file_path(postgis.draft(project['id'], image['id'])['file_path']), confirmed)
+    manual = postgis.save_draft(project['id'], image['id'], confirmed, second['draft_id'], 'manual', '手动保存')
+    assert manual['draft_id'] == second['draft_id']
+    rows = postgis.drafts(project['id'], image['id'])['items']
+    assert len(rows) == 2 and all(row['save_kind'] == 'manual' for row in rows)
+    unchanged = tmp_path / 'unchanged.gpkg'
+    shutil.copy2(postgis.file_path(postgis.draft(project['id'], image['id'])['file_path']), unchanged)
+    postgis.save_draft(project['id'], image['id'], unchanged, manual['draft_id'], 'automatic', '退出前自动保存')
+    assert all(row['save_kind'] == 'manual' for row in postgis.drafts(project['id'], image['id'])['items'])
+
+
+def test_save_kind_http_and_legacy_upgrade(postgis, draft, tmp_path):
+    project, image = create_scene(postgis, draft)
+    original = image['draft_id']
+    # 模拟升级前的草稿表，显式升级不得猜测旧数据来源或删除草稿。
+    with postgis.connection() as db:
+        db.execute('ALTER TABLE lcc_drafts DROP COLUMN save_kind, DROP COLUMN save_reason')
+    postgis.initialize()
+    assert postgis.drafts(project['id'], image['id'])['items'] == []
+    assert postgis.draft(project['id'], image['id'])['id'] == original
+    client = TestClient(create_app(True, postgis.settings, postgis))
+    path = '/internal/projects/{}/images/{}/draft'.format(project['id'], image['id'])
+    data = make_draft(tmp_path / 'http.gpkg').read_bytes()
+    params = {'base_draft_id': str(original), 'save_kind': 'automatic', 'save_reason': '退出前自动保存'}
+    result = client.put(path, params=params, content=data)
+    assert result.status_code == 200
+    row = client.get(path + 's').json()['items'][0]
+    assert row['save_kind'] == 'automatic' and row['save_reason'] == '退出前自动保存'
+    params.update(base_draft_id=result.json()['draft_id'], save_kind='manual', save_reason='手动保存')
+    assert client.put(path, params=params, content=data).status_code == 200
+    history = client.get(path + 's').json()
+    assert history['manual_saved_at'] and len(history['items']) == 1
+    assert history['items'][0]['save_kind'] == 'manual'
+    assert client.put(path, params={'save_kind': 'backup'}, content=data).status_code == 422
+    assert client.put(path, params={'save_reason': 'x' * 81}, content=data).status_code == 422
 
 
 def test_history_http_download_and_comparison(postgis, draft):

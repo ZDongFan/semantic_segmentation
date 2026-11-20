@@ -231,7 +231,7 @@ class ProjectPanel(QtWidgets.QWidget):
             if not self.active:
                 self.exit_notice("退出保存已跳过：草稿未关联项目。")
                 return self._close_outcome
-            self.save(exiting=True)
+            self.save(exiting=True, manual=False, reason='退出前自动保存')
             self._close_outcome = "saved"
             self.exit_notice("退出前项目草稿已保存。", success=True)
         except Exception as exc:
@@ -442,7 +442,7 @@ class ProjectPanel(QtWidgets.QWidget):
         if self.project and row and row["id"] == self.project["id"]:
             return
         self._check_idle()
-        self.save()
+        self.save(manual=False, reason='切换项目前自动保存')
         if self.dialog._draft_session.is_active and not self.active:
             raise RuntimeError("当前有未关联的草稿，请先导出并关闭插件，避免覆盖编辑。")
         # 先读取目标项目；服务失败时保留旧项目和草稿。
@@ -510,11 +510,8 @@ class ProjectPanel(QtWidgets.QWidget):
                     QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
                 return False
             if current:
-                self.save()
+                self.save(manual=False, reason='移除影像前自动保存')
                 row = self.image.copy()
-                if self.dialog._draft_session.is_active:
-                    from .recovery import backup_current
-                    backup_current(self, '移除影像前备份')
         path = '/internal/projects/{}/images/{}'.format(project['id'], row['id'])
         client = self._client()
         try:
@@ -592,7 +589,7 @@ class ProjectPanel(QtWidgets.QWidget):
             # AI 追加只确认已有绑定，不触发登记或切换，不应拦截自身操作。
             return
         self._check_idle()
-        self.save()
+        self.save(manual=False, reason='切换输入前自动保存')
         row = self.call(lambda: self._client().request(
             "POST", "/internal/projects/{}/images".format(project["id"]),
             {"name": os.path.basename(path), "image_path": path, "dem_path": dem or None}))
@@ -611,7 +608,7 @@ class ProjectPanel(QtWidgets.QWidget):
             return
         if self.image and row["id"] == self.image["id"]:
             return
-        self.save()
+        self.save(manual=False, reason='切换影像前自动保存')
         rows = self.refresh_images()
         row = next((item for item in rows if item["id"] == row["id"]), None)
         if row is None:
@@ -673,7 +670,7 @@ class ProjectPanel(QtWidgets.QWidget):
         result_context(self.image["id"], self.project.get("ztz"))
         return {"image_id": self.image["id"], "ztz": self.project.get("ztz")}
 
-    def save(self, exiting=False):
+    def save(self, exiting=False, manual=True, reason='手动保存'):
         """提交并快照当前草稿，退出专用传输不影响普通保存的超时。"""
         if not self.active:
             return
@@ -685,21 +682,28 @@ class ProjectPanel(QtWidgets.QWidget):
                 raise RuntimeError("请解决草稿编辑提交失败后重试保存。")
         if os.path.normcase(session.input_path) != os.path.normcase(self.image["image_path"]):
             raise RuntimeError("当前草稿与项目影像不一致，保存已拒绝。")
+        if not manual and self._synced_generation == (self.image['id'], session.generation_path):
+            return
         with self.request_directory("lcc_save_") as directory:
             snapshot = os.path.join(directory, "draft.gpkg")
             snapshot_gpkg(session.generation_path, snapshot)
-            path = self._image_path("/draft")
+            from urllib.parse import urlencode
+            path = self._image_path("/draft") + '?' + urlencode({
+                'save_kind': 'manual' if manual else 'automatic', 'save_reason': reason})
             if self.image["draft_id"]:
-                path += "?base_draft_id=" + self.image["draft_id"]
+                path += "&base_draft_id=" + self.image["draft_id"]
             client = self._client()
             result = (client.request_on_exit(path, snapshot) if exiting else
                       self.call(lambda: client.request("PUT", path, upload=snapshot)))
         self.image["draft_id"] = result["draft_id"]
         self._synced_generation = (self.image["id"], session.generation_path)
+        if manual:
+            from .recovery import mark_manual_saved
+            mark_manual_saved(self)
         ui = getattr(self.dialog, "_workflow_ui", None)
         if ui:
             ui.schedule()
-        self.record_recovery()
+        self.record_recovery(reason)
         if not exiting:
             self.label.setText("项目草稿已保存，可关闭后重新打开。")
 
@@ -744,11 +748,11 @@ class ProjectPanel(QtWidgets.QWidget):
         window.raise_()
         window.load()
 
-    def record_recovery(self):
+    def record_recovery(self, reason='编辑中断'):
         """记录失败不得把已成功发布的 generation 误报为失败。"""
         from .recovery import write_record
         try:
-            write_record(self)
+            write_record(self, reason=reason)
         except Exception as exc:
             QgsMessageLog.logMessage("本地恢复记录写入失败：{}".format(exc),
                                      "LandCoverClassification", Qgis.Warning)
@@ -756,7 +760,7 @@ class ProjectPanel(QtWidgets.QWidget):
     def publish(self):
         """确认所有已有成果后一次发布，断线时保留整个项目的幂等请求。"""
         project = self.selected_project()
-        self.save()
+        self.save(manual=False, reason='发布前自动保存')
         key = "LandCoverClassification/pending_project_publish/{}".format(project["id"])
         raw = self.settings.value(key, "")
         if raw:

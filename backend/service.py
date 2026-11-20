@@ -142,8 +142,11 @@ class Service:
                 raise ServiceError(404, "项目影像不存在。")
             return image
 
-    def save_draft(self, project_id, image_id, upload, base_draft_id):
+    def save_draft(self, project_id, image_id, upload, base_draft_id,
+                   save_kind='manual', save_reason='手动保存'):
         """草稿以内容摘要支持断线重试，以基础草稿标识防止覆盖他人编辑。"""
+        if save_kind not in ('manual', 'automatic') or not isinstance(save_reason, str) or len(save_reason) > 80:
+            raise ServiceError(422, '无效的草稿保存来源。')
         validate_draft(upload)
         sha = digest(upload)
         with self.connection() as db:
@@ -161,6 +164,10 @@ class Service:
                 previous = db.execute("SELECT * FROM lcc_drafts WHERE id=%s",
                                       (image["draft_id"],)).fetchone()
             if previous and previous["sha256"] == sha:
+                # 手动保存可确认当前自动快照；自动保存不能将手动历史降级。
+                if save_kind == 'manual' and previous['save_kind'] != 'manual':
+                    db.execute("UPDATE lcc_drafts SET save_kind='manual',save_reason=%s,created_at=clock_timestamp() WHERE id=%s",
+                               (save_reason, previous['id']))
                 return {"draft_id": previous["id"], "sha256": sha}
             if image["draft_id"] != base_draft_id:
                 raise ServiceError(409, "草稿已被其他客户端更新，请先另存本地草稿再重新打开。")
@@ -169,22 +176,32 @@ class Service:
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(upload, destination)
-            db.execute("INSERT INTO lcc_drafts(id,image_id,file_path,sha256) VALUES(%s,%s,%s,%s)",
-                       (draft_id, image_id, relative.as_posix(), sha))
+            db.execute("INSERT INTO lcc_drafts(id,image_id,file_path,sha256,save_kind,save_reason,created_at) VALUES(%s,%s,%s,%s,%s,%s,clock_timestamp())",
+                       (draft_id, image_id, relative.as_posix(), sha, save_kind, save_reason))
             db.execute("UPDATE lcc_images SET draft_id=%s WHERE id=%s", (draft_id, image_id))
             return {"draft_id": draft_id, "sha256": sha}
 
     def drafts(self, project_id, image_id, offset=0, limit=100):
-        """按影像分页列出不可变快照，不向客户端暴露服务端路径。"""
+        """仅列出手动历史及最后一次手动保存后的最新自动恢复草稿。"""
         with self.connection() as db:
             self._project(db, project_id)
+            manual_at = db.execute(
+                """SELECT max(d.created_at) AS saved_at FROM lcc_drafts d
+                   JOIN lcc_images i ON i.id=d.image_id
+                   WHERE i.id=%s AND i.project_id=%s AND d.save_kind='manual'""",
+                (image_id, project_id)).fetchone()['saved_at']
             rows = db.execute(
-                """SELECT d.id,d.created_at,d.sha256,(d.id=i.draft_id) AS is_current
+                """SELECT d.id,d.created_at,d.sha256,d.save_kind,d.save_reason,
+                   (d.id=i.draft_id) AS is_current
                    FROM lcc_drafts d JOIN lcc_images i ON i.id=d.image_id
-                   WHERE i.id=%s AND i.project_id=%s ORDER BY d.created_at DESC,d.id
-                   LIMIT %s OFFSET %s""", (image_id, project_id, limit + 1, offset)).fetchall()
+                   WHERE i.id=%s AND i.project_id=%s AND (d.save_kind='manual' OR
+                       (d.save_kind='automatic' AND d.id=i.draft_id
+                        AND (%s::timestamptz IS NULL OR d.created_at>%s)))
+                   ORDER BY d.created_at DESC,d.id LIMIT %s OFFSET %s""",
+                (image_id, project_id, manual_at, manual_at, limit + 1, offset)).fetchall()
             return {"items": rows[:limit],
-                    "next_offset": offset + limit if len(rows) > limit else None}
+                    "next_offset": offset + limit if len(rows) > limit else None,
+                    "manual_saved_at": manual_at}
 
     def draft(self, project_id, image_id, draft_id=None):
         with self.connection() as db:
