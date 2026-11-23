@@ -28,10 +28,12 @@ def layer_uri(path):
     return "{}|layername={}".format(path, LAYER_NAME)
 
 class DraftSession:
-    """仅在当前插件会话有效的草稿 generation。"""
+    """管理工作 generation，明确区分项目持久目录与临时会话。"""
 
     def __init__(self):
         self.directory = None
+        self.persistent = False
+        self.revision = None
         self.input_path = None
         self.generation_path = None
         self.generation_index = 0
@@ -50,10 +52,12 @@ class DraftSession:
     def is_dirty(self):
         return self.is_active and self.generation_path != self.exported_generation
 
-    def begin(self, input_path, create_empty):
+    def begin(self, input_path, create_empty, directory=None):
         """为工作影像创建新的空草稿会话。"""
         self.close()
-        self.directory = tempfile.mkdtemp(prefix="lcc_draft_session_")
+        self.persistent = directory is not None
+        self.directory = directory or tempfile.mkdtemp(prefix="lcc_draft_session_")
+        os.makedirs(self.directory, exist_ok=True)
         self.input_path = os.path.abspath(input_path)
         self.generation_index = 0
         path = self._generation_path(self.generation_index)
@@ -146,22 +150,25 @@ class DraftSession:
                 pass
 
     def close(self):
-        """销毁会话临时文件；关闭插件后草稿不恢复。"""
+        """释放会话；只有明确拥有的临时目录才允许递归清理。"""
         self.layer = None
         self.generation_path = None
         self.input_path = None
         self.exported_generation = None
         self.edit_snapshot_path = None
         self.fusion_snapshot_path = None
+        self.revision = None
 
         directory = self.directory
-        if directory and os.path.isdir(directory):
+        persistent = self.persistent
+        self.persistent = False
+        if not persistent and directory and os.path.isdir(directory):
             shutil.rmtree(directory, ignore_errors=True)
         self.directory = None
-        return directory if directory and os.path.isdir(directory) else None
+        return directory if not persistent and directory and os.path.isdir(directory) else None
 
     def _generation_path(self, index, prefix="generation"):
-        return os.path.join(self.directory, "{}_{:04d}.gpkg".format(prefix, index))
+        return os.path.join(self.directory, "{}_{:04d}_{}.gpkg".format(prefix, index, uuid.uuid4().hex))
 
 class DraftComposer:
     """使用磁盘型 QGIS Processing 管线合成用户与推理草稿。"""

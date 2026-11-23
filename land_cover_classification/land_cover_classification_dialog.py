@@ -73,6 +73,7 @@ from .raster_input_adapter import (
     inspect_with_qgis_gdal,
     probe_runtime,
     resolve_source_path,
+    same_source_path,
 )
 from .model_scan import get_model_info
 from .model_scan import scan as scan_models
@@ -1031,7 +1032,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self._remove_stale_session_draft_layers(defer=True)
 
         if self._draft_session.is_active and (
-                self._draft_session.input_path == input_path):
+                same_source_path(self._draft_session.input_path, input_path)):
             self._input_path = input_path
             self._input_layer = self._resolve_input_layer()
             if self._load_reference_input_layer() is None:
@@ -1039,7 +1040,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return
 
         if (not self._draft_session.is_active
-                and self._input_path == input_path):
+                and same_source_path(self._input_path, input_path)):
             self._input_layer = self._resolve_input_layer()
             if self._load_reference_input_layer() is None:
                 self._warn("无法将工作影像加载到 QGIS 画布。")
@@ -1067,7 +1068,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             self._label_path = None
             self.exportRasterBtn.setEnabled(False)
             self.undoFusionBtn.setEnabled(False)
-            self._switch_to_draft_tab()
             self.statusLabel.setText(
                 "工作影像已加载，可启动 AI 编辑或运行模型推理。")
         except Exception as exc:  # noqa: BLE001
@@ -1090,7 +1090,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
                 return False
 
         if self._draft_session.is_active:
-            if self._draft_session.input_path == path:
+            if same_source_path(self._draft_session.input_path, path):
                 return True
             self._warn("当前会话草稿属于另一张影像，请先切换工作影像。")
             return False
@@ -1100,7 +1100,9 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return False
         try:
             generation = self._draft_session.begin(
-                path, self._draft_composer.create_empty)
+                path, self._draft_composer.create_empty,
+                directory=(panel.store.working_directory(panel.image['id'])
+                           if panel and panel.active else None))
         except Exception as exc:  # noqa: BLE001
             self._warn("创建会话草稿失败: {}".format(exc))
             return False
@@ -1169,7 +1171,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         return generation
 
     def _draft_layer_belongs_to_current_session(self, layer):
-        """判断已加载草稿层是否来自当前 DraftSession 临时目录。"""
+        """判断已加载草稿层是否来自当前 DraftSession 工作目录。"""
         source_path = self._draft_layer_source_path(layer)
         directory = self._draft_session.directory
         if not source_path or not directory:
@@ -1805,7 +1807,6 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         self.exportRasterBtn.setEnabled(True)
         self.undoFusionBtn.setEnabled(True)
         self._fusion_undo_available = True
-        self._switch_to_draft_tab()
         usage = self._dem_usage or {}
         mode = usage.get("mode")
         if mode == "not_provided":
@@ -2238,7 +2239,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
             return None
         input_path = os.path.abspath(input_path)
         self._on_working_image_changed()
-        if self._input_path != input_path:
+        if not same_source_path(self._input_path, input_path):
             self._warn("当前工作影像未成功加载。")
             return None
         dem_path = self._resolve_dem_path()
@@ -2439,7 +2440,7 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         if not context:
             return
         if (not self._drawn_roi_geometry
-                or self._drawn_roi_input_path != context["input_path"]):
+                or not same_source_path(self._drawn_roi_input_path, context["input_path"])):
             self._clear_drawn_roi()
             self._warn("绘制范围不属于当前输入影像，请重新绘制。")
             return
@@ -3013,6 +3014,8 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         cleanup(lambda: self._stop_ai_editing(silent=True))
         cleanup(self._clear_drawn_roi)
         cleanup(lambda: self._discard_draft_session(preserve=preserve))
+        if panel:
+            cleanup(panel.release_project)
         self._input_adapter_request_id += 1
         cleanup(self._input_adapter.close)
         if panel:

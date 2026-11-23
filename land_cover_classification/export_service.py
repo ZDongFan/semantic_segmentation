@@ -133,9 +133,8 @@ class ExportService:
                     count += 1
         finally:
             del writer
-        if count == 0:
-            raise IOError("草稿层没有可导出的边界线。")
-        self._fit_dxf_initial_view(path, layer.extent())
+        if count:
+            self._fit_dxf_initial_view(path, layer.extent())
 
     def export_raster(self, session, path):
         """按照参考影像网格写出 0/1 二值 tiled BigTIFF。"""

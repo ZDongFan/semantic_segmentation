@@ -1,24 +1,20 @@
 # -*- coding: utf-8 -*-
-"""验证非模态地图属性联动、版本叠加及恢复原子性。"""
+"""验证非模态地图属性联动及本地草稿历史。"""
 
-import json
-from pathlib import Path
 from unittest.mock import patch
 
 from qgis.PyQt import QtWidgets, sip
 from qgis.PyQt.QtCore import Qt, QPoint, QEvent
 from qgis.PyQt.QtTest import QTest
-from qgis.core import QgsApplication, QgsFeature, QgsGeometry, QgsProject
+from qgis.core import QgsApplication
 from qgis.gui import QgsMapToolPan
 
 from . import test_project_workflow as fixtures
-from land_cover_classification import recovery
-from land_cover_classification.history_dialogs import VersionBrowser, RecoveryBrowser
-from land_cover_classification.project_client import snapshot_gpkg
+from land_cover_classification.history_dialogs import RecoveryBrowser
 
 
 class IndependentWorkspacesTest(fixtures.unittest.TestCase):
-    """使用真实 QGIS 图层，隔离服务和用户数据。"""
+    """使用真实 QGIS 图层与本地项目，隔离用户数据。"""
 
     setUpClass = classmethod(fixtures.ProjectWorkflowTest.setUpClass.__func__)
     setUp = fixtures.ProjectWorkflowTest.setUp
@@ -102,223 +98,36 @@ class IndependentWorkspacesTest(fixtures.unittest.TestCase):
         self.iface.mapCanvas().setMapTool(QgsMapToolPan(self.iface.mapCanvas()))
         QgsApplication.processEvents()
 
-    def test_restore_without_backup_keeps_service_pointer(self):
-        self.add_feature()
-        source = str(Path(self.root) / 'old.gpkg')
-        snapshot_gpkg(self.dialog._draft_session.generation_path, source)
-        self.add_feature()
-        previous = self.dialog._draft_session.generation_path
-        pointer = self.panel.image['draft_id']
-        requests = list(self.client.requests)
-        with patch.object(recovery.tempfile, 'mkdtemp', side_effect=AssertionError('恢复不应创建独立备份')):
-            recovery.restore_source(self.panel, source)
-        self.assertEqual(self.dialog._draft_layer.featureCount(), 1)
-        self.assertNotEqual(self.dialog._draft_session.generation_path, previous)
-        self.assertEqual(self.panel.image['draft_id'], pointer)
-        self.assertIsNone(self.panel._synced_generation)
-        self.assertEqual(self.client.requests, requests)
-        self.assertEqual(recovery.validate_source(self.panel, source), 1)
-        record = Path(self.dialog._draft_session.directory) / 'recovery.json'
-        self.assertEqual(recovery.read_record(record, self.panel)['path'],
-                         self.dialog._draft_session.generation_path)
-
-    def test_restore_publish_failure_preserves_generation_without_backup(self):
-        self.add_feature()
-        source = str(Path(self.root) / 'old.gpkg')
-        snapshot_gpkg(self.dialog._draft_session.generation_path, source)
-        previous = self.dialog._draft_session.generation_path
-        record = Path(self.dialog._draft_session.directory) / 'recovery.json'
-        original_record = record.read_bytes()
-        with patch.object(recovery.tempfile, 'mkdtemp', side_effect=AssertionError('恢复不应创建独立备份')), \
-                patch.object(self.dialog, '_publish_draft_generation', side_effect=RuntimeError('模拟切换失败')):
-            with self.assertRaisesRegex(RuntimeError, '模拟切换失败'):
-                recovery.restore_source(self.panel, source)
-        self.assertEqual(self.dialog._draft_session.generation_path, previous)
-        self.assertEqual(self.dialog._draft_layer.featureCount(), 1)
-        self.assertEqual(record.read_bytes(), original_record)
-        self.assertEqual(recovery.validate_source(self.panel, source), 1)
-
-    def test_local_records_keep_latest_session_and_ignore_standalone_backups(self):
-        self.add_feature()
-        directories = []
-        for name, reason in [('lcc_recovery_old', '恢复前自动备份'),
-                             ('lcc_recovery_removed', '移除影像前备份'),
-                             ('lcc_draft_session_old', '编辑中断'),
-                             ('lcc_draft_session_latest', '编辑中断')]:
-            directory = Path(self.root) / name
-            directory.mkdir()
-            snapshot_gpkg(self.dialog._draft_session.generation_path, directory / 'draft.gpkg')
-            recovery.write_record(self.panel, directory, directory / 'draft.gpkg', reason)
-            directories.append(directory)
-        with patch.object(recovery.tempfile, 'gettempdir', return_value=self.root):
-            rows = recovery.local_records(self.panel)
-            self.assertEqual([Path(row['record']).parent for row in rows], [directories[-1]])
-            recovery.mark_manual_saved(self.panel)
-            self.assertEqual(recovery.local_records(self.panel), [])
-            self.panel.settings.remove(recovery.manual_save_key(self.panel))
-            self.panel._synced_generation = (self.panel.image['id'], self.dialog._draft_session.generation_path)
-            recovery.write_record(self.panel, directories[-1], directories[-1] / 'draft.gpkg')
-            self.assertEqual(recovery.local_records(self.panel), [])
-        self.assertTrue(all((directory / 'draft.gpkg').is_file() for directory in directories))
-
-    def test_browser_combines_local_and_server_into_one_latest_automatic(self):
-        self.add_feature()
-        browser = RecoveryBrowser(self.panel)
-        self.addCleanup(browser.close)
-        local = {'kind': 'local', 'save_kind': 'automatic', 'created_at': '2026-11-20T02:00:00+00:00',
-                 'reason': '编辑中断'}
-        server = {'id': 'auto', 'save_kind': 'automatic', 'created_at': '2026-11-20T11:00:00+08:00',
-                  'save_reason': '退出前自动保存'}
-        manual = {'id': 'manual', 'save_kind': 'manual', 'created_at': '2026-11-20T01:00:00+00:00'}
-        self.client.request = lambda *args, **kwargs: {'items': [server, manual], 'next_offset': None,
-                                                     'manual_saved_at': manual['created_at']}
-        with patch.object(recovery, 'local_records', return_value=[local]):
-            browser.load()
-        self.assertEqual([row['id'] for row in browser.rows], ['auto', 'manual'])
-        self.assertIn('退出前自动保存', browser.list.item(0).text())
-        self.client.request = lambda *args, **kwargs: {'items': [manual], 'next_offset': None,
-                                                     'manual_saved_at': '2026-11-20T04:00:00+00:00'}
-        with patch.object(recovery, 'local_records', return_value=[local]):
-            browser.load()
-        self.assertEqual([row['id'] for row in browser.rows], ['manual'])
-
-    def test_confirm_restore_replaces_without_backup_message(self):
-        self.add_feature()
-        source = str(Path(self.root) / 'old.gpkg')
-        snapshot_gpkg(self.dialog._draft_session.generation_path, source)
-        self.add_feature()
-        browser = RecoveryBrowser(self.panel)
-        self.addCleanup(browser.close)
-        with patch.object(QtWidgets.QMessageBox, 'question', return_value=QtWidgets.QMessageBox.Yes) as question:
-            browser.confirm_restore(source)
-        self.assertIn('不另建恢复前备份', question.call_args.args[2])
-        self.assertEqual(browser.status.text(), '已恢复到本地，待您保存。')
-        self.assertEqual(self.dialog._draft_layer.featureCount(), 1)
-
-    def test_recovery_record_rejects_wrong_project_and_path_escape(self):
-        self.add_feature()
-        record = Path(self.dialog._draft_session.directory) / 'recovery.json'
-        original = json.loads(record.read_text('utf-8'))
-        for replacement in ({'project_id': 'wrong'}, {'generation': '../outside.gpkg'}):
-            record.write_text(json.dumps({**original, **replacement}), 'utf-8')
-            with self.assertRaises(ValueError):
-                recovery.read_record(record, self.panel)
-        record.write_text(json.dumps(original), 'utf-8')
-
-    def test_duplicate_uuid_and_wrong_crs_rejected(self):
-        self.add_feature()
-        layer = self.dialog._draft_layer
-        feature = QgsFeature(next(layer.getFeatures()))
-        feature.setId(-1)
-        feature["fid"] = None
-        self.assertTrue(layer.dataProvider().addFeatures([feature])[0])
-        with self.assertRaisesRegex(ValueError, '重复'):
-            recovery.validate_source(self.panel, self.dialog._draft_session.generation_path)
-
-    def test_recovery_offline_still_displays_local_records(self):
-        self.add_feature()
-        browser = RecoveryBrowser(self.panel)
-        self.addCleanup(lambda: browser.close() if not sip.isdeleted(browser) else None)
-        self.client.failure = True
-        with patch.object(recovery, 'local_records', return_value=[{'kind':'local', 'created_at':'today', 'reason':'备份'}]):
-            browser.load()
-        self.assertEqual(browser.list.count(), 1)
-        self.assertIn('本地记录仍可使用', browser.status.text())
-
-    def test_cancel_restore_and_context_switch_never_replace(self):
-        self.add_feature()
-        browser = RecoveryBrowser(self.panel)
-        self.addCleanup(lambda: browser.close() if not sip.isdeleted(browser) else None)
-        previous = self.dialog._draft_session.generation_path
-        with patch.object(QtWidgets.QMessageBox, 'question', return_value=QtWidgets.QMessageBox.No):
-            browser.confirm_restore(previous)
-        self.assertEqual(previous, self.dialog._draft_session.generation_path)
-        self.panel.project = dict(self.panel.project, id='other')
-        with self.assertRaisesRegex(RuntimeError, '项目已切换'):
-            browser.check_context(True)
-
-    def test_version_map_overlay_and_cleanup(self):
-        self.add_feature()
-        browser = VersionBrowser(self.panel)
-        self.addCleanup(lambda: browser.close() if not sip.isdeleted(browser) else None)
-        polygon = {'type':'MultiPolygon', 'coordinates':[[[[117,27],[117.01,27],[117.01,27.01],[117,27.01],[117,27]]]]}
-        browser.rows = [{'change':'modified', 'before_geometry':polygon, 'after_geometry':polygon,
-                         'before_properties':{'mj':1}, 'after_properties':{'mj':2}}]
-        browser.table.setRowCount(1)
-        browser.table.setItem(0, 0, QtWidgets.QTableWidgetItem('修改'))
-        browser.table.selectRow(0)
-        self.assertEqual(len(browser.bands), 2)
-        self.assertIn('mj', browser.details.toPlainText())
-        self.iface.mapCanvas().setDestinationCrs(self.dialog._draft_layer.crs())
-        browser.locate()
-        browser.close()
-        self.assertEqual(browser.bands, [])
-
-    def test_hundreds_of_features_keep_bounded_page_and_offpage_selection(self):
-        import uuid
-        self.add_feature()
-        layer = self.dialog._draft_layer
-        template = next(layer.getFeatures())
-        rows = []
-        for _ in range(420):
-            feature = QgsFeature(template)
-            feature.setId(-1)
-            feature['fid'] = None
-            feature['feature_uuid'] = str(uuid.uuid4())
-            rows.append(feature)
-        self.assertTrue(layer.dataProvider().addFeatures(rows)[0])
-        browser = self.browser()
-        self.assertEqual(browser.table.rowCount(), 200)
-        browser.next_page()
-        self.assertEqual(browser.table.rowCount(), 200)
-        browser.next_page()
-        self.assertEqual(browser.table.rowCount(), 21)
-        target = browser.fids[-1]
-        browser.previous_page()
-        layer.selectByIds([target])
-        browser.selected.setChecked(True)
-        self.assertEqual(browser.fids, [target])
-
-    def test_server_download_checksum_failure_never_restores(self):
+    def test_local_history_restore_cancel_and_context(self):
         self.add_feature()
         self.panel.save()
         browser = RecoveryBrowser(self.panel)
-        self.addCleanup(browser.close)
-        row = {'id': self.image['draft_id'], 'sha256': 'incorrect', 'kind': 'server',
-               'created_at': 'today'}
-        browser.append([row])
+        browser.load()
+        self.assertEqual(len(browser.rows), 1)
         browser.list.setCurrentRow(0)
-        with self.assertRaisesRegex(ValueError, '完整性'):
-            browser.with_source(lambda source: self.fail('校验失败不能进入恢复'))
+        before = self.dialog._draft_session.generation_path
+        with patch.object(QtWidgets.QMessageBox, 'question', return_value=QtWidgets.QMessageBox.No):
+            browser.restore()
+        self.assertEqual(before, self.dialog._draft_session.generation_path)
+        self.panel.image = None
+        with self.assertRaises(RuntimeError):
+            browser.source()
+        browser.close()
+        browser.deleteLater()
 
-    def test_layer_source_replacement_refreshes_open_browser(self):
+    def test_local_history_checks_sha_and_identity(self):
         self.add_feature()
-        browser = self.browser()
-        source = str(Path(self.root) / 'one.gpkg')
-        snapshot_gpkg(self.dialog._draft_session.generation_path, source)
-        self.add_feature()
-        browser.refresh()
-        self.assertEqual(browser.table.rowCount(), 2)
-        recovery.restore_source(self.panel, source)
-        QTest.qWait(120)
-        self.assertEqual(browser.table.rowCount(), 1)
+        self.panel.save()
+        browser = RecoveryBrowser(self.panel)
+        browser.load()
+        browser.list.setCurrentRow(0)
+        browser.inspect()
+        self.assertIn('检查通过', browser.status.text())
+        with self.assertRaises(ValueError):
+            self.panel.store.snapshot('wrong-image', browser.rows[0]['id'])
+        browser.close()
+        browser.deleteLater()
 
-    def test_recovery_rejects_busy_and_invalid_crs_without_replacing(self):
-        from qgis.core import QgsCoordinateReferenceSystem, QgsVectorLayer
-        from land_cover_classification.draft_session import layer_uri
-        self.add_feature()
-        previous = self.dialog._draft_session.generation_path
-        self.panel.busy = True
-        with self.assertRaisesRegex(RuntimeError, '等待'):
-            recovery.restore_source(self.panel, previous)
-        self.panel.busy = False
-        # 用模拟图层 CRS 验证拒绝路径，真实源文件不变。
-        original = recovery.QgsVectorLayer
-        def wrong_crs(*args):
-            layer = original(*args)
-            layer.setCrs(QgsCoordinateReferenceSystem('EPSG:4326'))
-            return layer
-        with patch.object(recovery, 'QgsVectorLayer', side_effect=wrong_crs):
-            with self.assertRaisesRegex(ValueError, 'CRS'):
-                recovery.validate_source(self.panel, previous)
-        self.assertEqual(previous, self.dialog._draft_session.generation_path)
+
+if __name__ == '__main__':
+    fixtures.unittest.main()

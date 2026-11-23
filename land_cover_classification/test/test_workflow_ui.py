@@ -2,6 +2,7 @@
 """使用真实 QGIS 控件验证工作区状态和交互边界。"""
 
 import os
+import shutil
 import unittest
 from unittest.mock import Mock, patch
 
@@ -12,7 +13,7 @@ from . import test_project_workflow as fixtures
 
 
 class WorkflowUiTest(unittest.TestCase):
-    """复用合成影像和模拟服务，不启动推理或修改用户项目。"""
+    """复用合成影像和真实本地项目，不启动推理或修改用户项目。"""
 
     setUpClass = classmethod(fixtures.ProjectWorkflowTest.setUpClass.__func__)
     setUp = fixtures.ProjectWorkflowTest.setUp
@@ -24,17 +25,21 @@ class WorkflowUiTest(unittest.TestCase):
         self.dialog._publish_draft_generation(self.dialog._draft_session.generation_path)
         self.dialog._workflow_ui.refresh()
         self.assertEqual(self.dialog._draft_layer.featureCount(), 0)
-        for name in ("save", "preview", "publish"):
+        for name in ("save", "preview"):
             self.assertTrue(self.panel.buttons[name].isEnabled(), name)
+        self.assertFalse(self.panel.buttons['upload_results'].isEnabled())
+        self.panel.save()
+        ui = self.dialog._workflow_ui
+        ui.refresh()
+        self.assertTrue(self.panel.buttons['upload_results'].isEnabled())
         self.assertTrue(self.dialog.exportRasterBtn.isEnabled())
 
     def test_missing_draft_disables_only_current_draft_actions(self):
         self.panel.image = None
-        self.panel.images.setItemData(1, dict(self.image, draft_id="saved"))
         self.dialog._workflow_ui.refresh()
         self.assertFalse(self.panel.buttons["save"].isEnabled())
         self.assertFalse(self.panel.buttons["preview"].isEnabled())
-        self.assertTrue(self.panel.buttons["publish"].isEnabled())
+        self.assertFalse(self.panel.buttons['upload_results'].isEnabled())
         self.assertFalse(self.dialog.aiStartBtn.isEnabled())
 
     def test_busy_blocks_mutations_and_recovers_from_real_conditions(self):
@@ -79,7 +84,7 @@ class WorkflowUiTest(unittest.TestCase):
         self.panel.save()
         ui = self.dialog._workflow_ui
         ui.refresh()
-        self.assertIn("已同步服务端", ui.summary.text())
+        self.assertIn("已本地保存", ui.summary.text())
         layer = self.dialog._draft_layer
         layer.startEditing()
         feature = next(layer.getFeatures())
@@ -89,7 +94,7 @@ class WorkflowUiTest(unittest.TestCase):
         self.assertIn("尚未提交", ui.summary.text())
         layer.commitChanges()
         ui.refresh()
-        self.assertIn("待同步", ui.summary.text())
+        self.assertIn("待保存", ui.summary.text())
 
     def test_single_run_dispatch_and_drawn_roi_guard(self):
         d = self.dialog
@@ -159,6 +164,37 @@ class WorkflowUiTest(unittest.TestCase):
             self.assertFalse(any(table.isColumnHidden(i) for i in range(24)))
         finally:
             preview.deleteLater()
+
+    def test_selecting_image_keeps_current_tab(self):
+        """通过真实文件输入信号切换影像，项目页和推理页均保持当前位置。"""
+        d = self.dialog
+        for index in range(2):
+            if index == 0:
+                d.mainTabWidget.setCurrentIndex(0)
+            else:
+                d.mainTabWidget.setCurrentWidget(d.inferenceTab.property('workflow_scroll') or d.inferenceTab)
+            current = d.mainTabWidget.currentWidget()
+            path = os.path.join(self.root, 'selected_{}.tif'.format(index))
+            shutil.copyfile(self.image_path, path)
+            d.inputFileWidget.setFilePath(path)
+            QgsApplication.processEvents()
+            self.assertEqual(os.path.normcase(d._input_path), os.path.normcase(path))
+            self.assertIs(d.mainTabWidget.currentWidget(), current)
+
+    def test_successful_fusion_keeps_current_tab(self):
+        """融合完成仍更新进度和撤销状态，但不切换用户所在页签。"""
+        self.add_feature()
+        d = self.dialog
+        d.mainTabWidget.setCurrentWidget(d.inferenceTab.property('workflow_scroll') or d.inferenceTab)
+        current = d.mainTabWidget.currentWidget()
+        d._dem_usage = {'mode': 'not_provided'}
+        with patch.object(d, '_merge_inference_candidate_with_retry') as merge:
+            d._finish_inference_fusion('candidate.gpkg', 'test-run')
+        merge.assert_called_once_with('candidate.gpkg', 'test-run')
+        self.assertIs(d.mainTabWidget.currentWidget(), current)
+        self.assertEqual(d.progressBar.value(), 100)
+        self.assertTrue(d._fusion_undo_available)
+        self.assertIn('已融合', d.statusLabel.text())
 
     def test_tab_navigation_and_narrow_layout(self):
         self.add_feature()
@@ -279,19 +315,12 @@ class WorkflowUiTest(unittest.TestCase):
             self.dialog._ai_appending = False
 
 
-    def test_request_result_survives_deferred_deletion_during_dialog_close(self):
-        """进度框关闭时处理延迟删除，线程仍须存活到结果被读取。"""
-        from qgis.PyQt.QtCore import QCoreApplication, QEvent
-        from land_cover_classification.project_panel import ProjectPanel
-        original = QtWidgets.QProgressDialog.close
-        def close_and_drain(progress):
-            result = original(progress)
-            QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
-            return result
-        with patch.object(QtWidgets.QProgressDialog, "close", close_and_drain):
-            for value in range(3):
-                self.assertEqual(ProjectPanel.call(self.panel, lambda value=value: value), value)
-        self.assertFalse(self.panel.busy)
+    def test_placeholder_has_no_remote_actions(self):
+        """项目页不再暴露远程发布、对比或请求线程入口。"""
+        self.assertNotIn('publish', self.panel.buttons)
+        self.assertNotIn('history', self.panel.buttons)
+        self.assertFalse(hasattr(self.panel, '_client'))
+        self.assertFalse(hasattr(self.panel, 'call'))
 
 
 if __name__ == "__main__":

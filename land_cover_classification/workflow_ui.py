@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""工作区展示与按钮条件；不改变推理、草稿和服务的数据契约。"""
+"""工作区展示与按钮条件，使用本地项目保存状态。"""
 
 import os
 from functools import wraps
@@ -12,6 +12,7 @@ from qgis.core import QgsProject
 
 from . import pytorch_deps_check
 from .inference_controller import BundleContractError, landslide_class_id
+from .raster_input_adapter import same_source_path
 
 
 def refresh_workflow(method):
@@ -211,12 +212,12 @@ class WorkflowUi(QObject):
         busy = self.busy()
         path = d._input_path
         image_ready = bool(p.active and path and os.path.isfile(path)
-                           and os.path.normcase(path) == os.path.normcase(p.image["image_path"]))
+                           and same_source_path(path, p.image["image_path"]))
         layer = d._draft_layer
         draft = bool(d._draft_session.is_active and d._layer_is_usable(layer))
         associated = bool(image_ready and draft
                           and p.image.get("project_id") == p.project["id"]
-                          and os.path.normcase(d._draft_session.input_path) == os.path.normcase(path))
+                          and same_source_path(d._draft_session.input_path, path))
         count = layer.featureCount() if draft else 0
         project_name = (p.project or {}).get("name", "未选择项目")
         image_name = os.path.basename(path) if path else "未选择影像"
@@ -224,9 +225,9 @@ class WorkflowUi(QObject):
         state = "无草稿"
         if draft:
             modified = layer.isModified()
-            synced = p._synced_generation == (p.image["id"], d._draft_session.generation_path) if p.image else False
             state = ("编辑尚未提交" if modified else
-                     "当前草稿已同步服务端" if synced else "本地草稿待同步")
+                     "保存失败，工作文件已保留" if p._save_error else
+                     "当前草稿已本地保存" if p.is_saved else "当前草稿待保存")
         self.summary.setText("项目：{}\n影像：{}\n{} · {}".format(project_name, image_name, dem, state))
         self.summary.setToolTip(path or "")
         image_key = ((p.project or {}).get("id"), (p.image or {}).get("id"), path)
@@ -258,7 +259,8 @@ class WorkflowUi(QObject):
                   "缺少运行环境，请重新打开插件完成安装。" if not runtime else
                   "请选择满足滑坡类别契约的模型。" if not model_ready else "")
         drawn = self.scope.currentData() == "drawn"
-        has_roi = d._drawn_roi_geometry is not None and d._drawn_roi_input_path == path
+        has_roi = (d._drawn_roi_geometry is not None
+                   and same_source_path(d._drawn_roi_input_path, path))
         if not reason and drawn and not has_roi:
             reason = "请先绘制有效推理范围。"
         self.run_hint.setText(reason or "准备就绪，运行后将融合到当前草稿。")

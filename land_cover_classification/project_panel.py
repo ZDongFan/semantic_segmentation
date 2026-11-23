@@ -1,166 +1,108 @@
-# -*- coding: utf-8 -*-
-"""以项目为入口，自动关联输入并发布整个项目的成果版本。"""
+"""本地项目、影像关联、持久草稿及上传占位入口。"""
 
 import json
 import os
-import shutil
-import threading
-from contextlib import contextmanager
-import tempfile
-import uuid
+from pathlib import Path
 
 from qgis.PyQt import QtWidgets, sip
-from qgis.PyQt.QtCore import QEvent, QEventLoop, QSettings, QThread, QTimer, pyqtSignal, Qt
+from qgis.PyQt.QtCore import QEvent, QLockFile, QSettings, QTimer, pyqtSignal
 from qgis.core import Qgis, QgsMessageLog
 
+from .local_project import LocalProject, input_fingerprint, snapshot_gpkg
 from .result_attributes import normalize_cartographer, result_context
 
-from .project_client import ProjectClient, ProjectClientError, snapshot_gpkg
 
-
-_LIVE_REQUESTS = set()
-
-
-class _ClosingRequest(RuntimeError):
-    """界面已关闭，停止原调用栈继续操作控件。"""
-
-
-class _RequestFiles:
-    """快照由界面调用栈和网络线程共同持有，双方结束后才清理。"""
-
-    def __init__(self, prefix):
-        self.path = tempfile.mkdtemp(prefix=prefix)
-        self.owners = 1
-        self.lock = threading.Lock()
-
-    def retain(self):
-        with self.lock:
-            self.owners += 1
-
-    def release(self):
-        with self.lock:
-            self.owners -= 1
-            if not self.owners:
-                shutil.rmtree(self.path, ignore_errors=True)
-
-
-def _release_request(worker):
-    """仅释放已结束线程，不依赖可能已经销毁的面板。"""
-    if sip.isdeleted(worker) or getattr(worker, "_ui_waiting", False):
-        return
-    _LIVE_REQUESTS.discard(worker)
-    worker.deleteLater()
-
-
-class _RequestThread(QThread):
-    """工作线程只执行网络与文件任务，不访问 QGIS 对象。"""
-
-    result_ready = pyqtSignal()
-
-    def __init__(self, operation, resources=()):
-        super().__init__()
-        self.resources = tuple(resources)
-        for resource in self.resources:
-            resource.retain()
-        self._ui_waiting = True
-        self.operation = operation
-        self.result = None
-        self.error = None
-
-    def run(self):
-        try:
-            self.result = self.operation()
-        except Exception as exc:
-            self.error = exc
-        finally:
-            for resource in self.resources:
-                resource.release()
-        self.result_ready.emit()
-
-
-class _ProjectCombo(QtWidgets.QComboBox):
-    """展开列表时自动读取服务端项目，不需要连接或刷新按钮。"""
-
-    about_to_open = pyqtSignal()
-
-    def showPopup(self):
-        self.about_to_open.emit()
-        super().showPopup()
+def reference_grid(path):
+    """只读取元数据，使用 QGIS 自带 GDAL。"""
+    from osgeo import gdal
+    from qgis.core import QgsCoordinateReferenceSystem
+    from .raster_input_adapter import inspect_with_qgis_gdal
+    raster = gdal.Open(inspect_with_qgis_gdal(path)['source_path'])
+    if raster is None:
+        raise ValueError('无法读取影像。')
+    crs = QgsCoordinateReferenceSystem(raster.GetProjection())
+    if not crs.isValid():
+        raise ValueError('影像缺少有效 CRS。')
+    return dict(width=raster.RasterXSize, height=raster.RasterYSize, bands=raster.RasterCount,
+                crs=crs.authid() or crs.toWkt(), transform=list(raster.GetGeoTransform()))
 
 
 class ProjectPanel(QtWidgets.QWidget):
-    """项目选择、输入自动登记、草稿恢复和整项目发布。"""
+    """项目锁覆盖完整编辑会话；所有日常操作只访问本地文件。"""
 
     closing_requested = pyqtSignal()
 
     def __init__(self, dialog):
         super().__init__(dialog)
         self.dialog = dialog
-        self.client = None
-        self._synced_generation = None
-        self._retry_action = None
-        self.buttons = {}
-        self.project = None
-        self.image = None
+        self.store = self.project = self.image = None
         self.settings = QSettings()
-        self.busy = False
-        self.switching = False
-        self._started = False
-        self._leases = []
-        self._worker = None
-        self._close_running = False
-        self._close_outcome = None
-        self._host_closing = False
-        self._closed = False
+        self.buttons = {}
+        self.busy = self.switching = self._started = False
+        self._close_running = self._host_closing = self._closed = self._save_error = False
+        self._close_outcome = self._retry_action = self._opening_revision = None
         layout = QtWidgets.QVBoxLayout(self)
-        hint = QtWidgets.QLabel("创建或选择项目，然后在输入区选择影像和 DEM。\n"
-                                "完成推理和草稿编辑后，发布整个项目的成果版本。")
+        hint = QtWidgets.QLabel('创建或打开本地项目，然后选择影像和可选 DEM。\n草稿、历史及恢复状态保存在项目目录中。')
         hint.setWordWrap(True)
         layout.addWidget(hint)
         form = QtWidgets.QFormLayout()
-        self.projects = _ProjectCombo()
-        self.projects.addItem("请选择项目", None)
-        self.images = QtWidgets.QComboBox()
-        self.images.addItem("已关联影像", None)
-        form.addRow("当前项目", self.projects)
-        image_row = QtWidgets.QHBoxLayout()
-        image_row.addWidget(self.images, 1)
-        manage = QtWidgets.QPushButton("管理影像…", self)
-        manage.setObjectName("manageProjectImages")
+        self.projects, self.images = QtWidgets.QComboBox(), QtWidgets.QComboBox()
+        self.projects.addItem('选择最近项目', None)
+        self.images.addItem('选择项目影像', None)
+        project_row = QtWidgets.QHBoxLayout()
+        project_row.addWidget(self.projects, 1)
+        open_project = QtWidgets.QPushButton('…')
+        open_project.setFixedWidth(32)
+        open_project.setToolTip('选择项目文件夹')
+        open_project.setAccessibleName('选择项目文件夹')
+        open_project.clicked.connect(lambda: self.invoke(self.open_project))
+        self.buttons['open_project'] = open_project
+        project_row.addWidget(open_project)
+        form.addRow('选择项目', project_row)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.images, 1)
+        manage = QtWidgets.QPushButton('管理影像…')
+        manage.setObjectName('manageProjectImages')
         manage.clicked.connect(lambda: self.invoke(self.manage_images))
-        self.buttons["manage_images"] = manage
-        image_row.addWidget(manage)
-        form.addRow("项目影像", image_row)
+        self.buttons['manage_images'] = manage
+        row.addWidget(manage)
+        form.addRow('项目影像', row)
         layout.addLayout(form)
-        for text, action in [
-                ("创建项目", self.create_project),
-                ("保存当前草稿", self.save),
-                ("预览当前成果属性", self.preview),
-                ("发布项目版本", self.publish),
-                ("版本对比", self.history),
-                ("恢复管理", self.recovery)]:
-            button = QtWidgets.QPushButton(text)
-            button.clicked.connect(lambda checked=False, fn=action: self.invoke(fn))
+        for title, fn in [('新建项目', self.create_project),
+                          ('保存当前草稿', self.save), ('预览当前成果属性', self.preview),
+                          ('恢复管理', self.recovery), ('上传成果', self.upload_results)]:
+            button = QtWidgets.QPushButton(title)
+            button.clicked.connect(lambda checked=False, action=fn: self.invoke(action))
             layout.addWidget(button)
-            self.buttons[action.__name__] = button
-        self.action_hint = QtWidgets.QLabel(self)
+            self.buttons[fn.__name__] = button
+        self.action_hint = QtWidgets.QLabel()
         self.action_hint.setWordWrap(True)
         layout.addWidget(self.action_hint)
-        self.label = QtWidgets.QLabel("请选择项目，或创建一个新项目。")
+        self.label = QtWidgets.QLabel('请创建或打开本地项目。')
         self.label.setWordWrap(True)
         layout.addWidget(self.label)
-        self.retry_button = QtWidgets.QPushButton("重试刚才的操作", self)
+        self.retry_button = QtWidgets.QPushButton('重试刚才的操作')
         self.retry_button.hide()
-        self.retry_button.clicked.connect(self._retry)
+        self.retry_button.clicked.connect(lambda: self.invoke(self._retry_action) if self._retry_action else None)
         layout.addWidget(self.retry_button)
         layout.addStretch()
-        self.projects.about_to_open.connect(lambda: self.invoke(self.refresh))
-        self.projects.currentIndexChanged.connect(lambda: self.invoke(self.select_project))
+        self.projects.activated.connect(lambda: self.invoke(self.select_project))
         self.images.activated.connect(lambda: self.invoke(self.open_image))
-        self.host_window = dialog.iface.mainWindow() if hasattr(dialog.iface, "mainWindow") else None
+        self.host_window = dialog.iface.mainWindow() if hasattr(dialog.iface, 'mainWindow') else None
         if self.host_window:
             self.host_window.installEventFilter(self)
         self._freeze_inputs(True)
+
+    @property
+    def active(self):
+        return bool(self.store and self.project and self.image and not self.image.get('removed_at'))
+
+    @property
+    def is_saved(self):
+        """修订身份持久化，不以本进程路径标记判断保存结果。"""
+        session = self.dialog._draft_session
+        return bool(self.active and session.is_active and session.revision and not self._save_error
+                    and self.image.get('saved_revision') == session.revision)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -169,19 +111,17 @@ class ProjectPanel(QtWidgets.QWidget):
             QTimer.singleShot(0, self._initial_refresh)
 
     def _initial_refresh(self):
-        if self._closed or sip.isdeleted(self):
-            return
-        self.invoke(self.refresh)
+        if not sip.isdeleted(self) and not self._closed:
+            self.invoke(self.refresh)
 
     def eventFilter(self, watched, event):
-        """宿主关闭始终放行，由 QGIS 自己决定是否退出。"""
-        if watched is getattr(self, "host_window", None) and event.type() == QEvent.Close:
+        """退出确认由 QGIS 处理，保存失败仍保留项目文件。"""
+        if watched is getattr(self, 'host_window', None) and event.type() == QEvent.Close:
             self.save_on_exit(host=True)
             QTimer.singleShot(0, self._host_close_settled)
         return False
 
     def _host_close_settled(self):
-        """宿主取消退出后解除本轮防重入状态，不干预其保存确认。"""
         if sip.isdeleted(self) or self._closed:
             return
         if QtWidgets.QApplication.activeModalWidget() is not None:
@@ -190,372 +130,247 @@ class ProjectPanel(QtWidgets.QWidget):
             self.reset_close_state()
 
     def reset_close_state(self):
-        """重新打开插件或宿主取消退出后允许新的保存尝试。"""
+        """重新打开或取消退出后允许再次保存。"""
         if not self._close_running:
             self._close_outcome = None
-            self._host_closing = False
-            self._closed = False
-            ui = getattr(self.dialog, "_workflow_ui", None)
-            if ui:
-                ui.schedule()
+            self._host_closing = self._closed = False
+            if self.project and self.store is None:
+                directory = self.project['directory']
+                self.project = self.image = None
+                self.open_directory(directory)
 
     def exit_notice(self, message, success=False):
-        """退出日志与消息栏均尽力写入，不能因界面销毁再次抛出异常。"""
+        """退出诊断不得因界面销毁再抛异常。"""
         try:
-            QgsMessageLog.logMessage(message, "LandCoverClassification",
-                                     Qgis.Info if success else Qgis.Warning)
-        except Exception:
-            pass
-        try:
-            self.dialog.iface.messageBar().pushMessage(
-                "地物分类", message, level=Qgis.Info if success else Qgis.Warning, duration=5)
+            QgsMessageLog.logMessage(message, 'LandCoverClassification', Qgis.Info if success else Qgis.Warning)
+            self.dialog.iface.messageBar().pushMessage('地物分类', message,
+                level=Qgis.Info if success else Qgis.Warning, duration=5)
         except Exception:
             pass
 
     def save_on_exit(self, host=False):
-        """一次关闭流程只尽力保存一次，失败和忙碌均允许退出。"""
+        """同轮退出仅尽力保存一次，失败和忙碌均保留文件。"""
         self._host_closing = self._host_closing or host
         if self._close_running or self._close_outcome is not None:
-            return self._close_outcome or "skipped"
+            return self._close_outcome or 'skipped'
         self._close_running = True
         try:
-            self._close_outcome = "skipped"
-            ui = getattr(self.dialog, "_workflow_ui", None)
+            self._close_outcome = 'skipped'
+            ui = getattr(self.dialog, '_workflow_ui', None)
             if self.busy or self.dialog._process is not None or self.dialog._ai_predicting or (ui and ui.busy()):
-                self.exit_notice("退出保存已跳过：当前任务忙碌，未确认保存成功。")
-                self.closing_requested.emit()
-                return self._close_outcome
-            if not self.dialog._draft_session.is_active:
-                self._close_outcome = "empty"
-                return self._close_outcome
-            if not self.active:
-                self.exit_notice("退出保存已跳过：草稿未关联项目。")
-                return self._close_outcome
-            self.save(exiting=True, manual=False, reason='退出前自动保存')
-            self._close_outcome = "saved"
-            self.exit_notice("退出前项目草稿已保存。", success=True)
+                self.exit_notice('任务忙碌，退出保存已跳过；已登记草稿仍保存在本地项目。')
+            elif not self.dialog._draft_session.is_active:
+                self._close_outcome = 'empty'
+            elif self.active:
+                self.save(exiting=True, manual=False, reason='退出前自动保存')
+                self._close_outcome = 'saved'
+                self.exit_notice('当前草稿已本地保存。', success=True)
         except Exception as exc:
-            self._close_outcome = "failed"
-            self.exit_notice("退出保存未确认成功：{}；将保留磁盘 generation。"
-                             "若编辑提交失败，磁盘文件不包含未提交缓冲。".format(exc))
+            self._close_outcome = 'failed'
+            self.exit_notice('保存失败：{}；文件保留在 {}。未提交编辑缓冲不承诺恢复。'.format(
+                exc, self.dialog._draft_session.directory))
         finally:
             self._close_running = False
         return self._close_outcome
 
-    @property
-    def active(self):
-        return self.project is not None and self.image is not None
+    def release_project(self):
+        """图层和写入操作结束后释放锁，不删除持久数据。"""
+        if self.store:
+            self.store.close()
+            self.store = None
 
     def _check_idle(self):
-        if self._worker is not None and (sip.isdeleted(self._worker) or self._worker.isFinished()):
-            self.busy = False
-            self._worker = None
-        ui = getattr(self.dialog, "_workflow_ui", None)
+        ui = getattr(self.dialog, '_workflow_ui', None)
         if self.busy or self.dialog._process is not None or self.dialog._ai_predicting or (ui and ui.busy()):
-            raise RuntimeError("请先等待当前操作完成。")
+            raise RuntimeError('请先等待当前操作完成。')
 
     def invoke(self, action):
-        """统一报告 Qt 回调错误，并把选择恢复到仍然有效的会话。"""
+        """失败恢复仍然有效的项目、影像选择。"""
         try:
             self._check_idle()
             action()
             self._retry_action = None
-            if not sip.isdeleted(self):
-                self.retry_button.hide()
-        except _ClosingRequest:
-            return
+            self.retry_button.hide()
         except Exception as exc:
             if self._closed or sip.isdeleted(self):
                 return
             self._select_row(self.projects, self.project)
             self._select_row(self.images, self.image)
-            self.label.setText("项目操作未完成：{}\n当前操作未确认成功。".format(exc))
-            self._retry_action = action if action in (self.refresh, self.save, self.publish) else None
+            self.label.setText('项目操作未完成：{}'.format(exc))
+            self._retry_action = action if action == self.save else None
             self.retry_button.setVisible(self._retry_action is not None)
         finally:
-            ui = getattr(self.dialog, "_workflow_ui", None)
+            ui = getattr(self.dialog, '_workflow_ui', None)
             if ui:
                 ui.schedule()
-
-    def _retry(self):
-        """仅重试明确的原操作；发布仍复用已保存的幂等请求。"""
-        if self._retry_action:
-            self.invoke(self._retry_action)
-
-    def update_actions(self, associated, busy):
-        """有效空草稿也可保存；项目发布不依赖当前影像已打开。"""
-        self.buttons["save"].setEnabled(associated and not busy)
-        self.buttons["preview"].setEnabled(associated and not busy)
-        rows = [self.images.itemData(i) for i in range(self.images.count())]
-        pending = bool(self.project and self.settings.value(
-            "LandCoverClassification/pending_project_publish/{}".format(self.project["id"]), ""))
-        publishable = associated or pending or any(row and row.get("draft_id") for row in rows)
-        self.buttons["publish"].setEnabled(bool(self.project and publishable and not busy))
-        self.buttons["history"].setEnabled(bool(self.project) and not busy)
-        self.buttons["recovery"].setEnabled(bool(self.active) and not busy)
-        self.buttons["create_project"].setEnabled(not busy)
-        self.projects.setEnabled(not busy)
-        self.images.setEnabled(bool(self.project) and not busy)
-        self.buttons["manage_images"].setEnabled(bool(self.project) and not busy)
-        self.retry_button.setEnabled(not busy)
-        self.action_hint.setText(
-            "请等待当前操作完成。" if busy else
-            "请先选择或创建项目。" if not self.project else
-            "保存与属性预览针对当前影像草稿；发布汇总项目已有草稿。"
-            if associated else "当前无可操作草稿；可打开已有影像或设置工作影像。")
-
-    def _client(self):
-        if self.client is None:
-            self.client = ProjectClient.from_config()
-        return self.client
 
     @staticmethod
     def _select_row(combo, row):
         combo.blockSignals(True)
         try:
-            index = next((i for i in range(combo.count())
-                          if combo.itemData(i) and row and
-                          combo.itemData(i)["id"] == row["id"]), 0)
-            combo.setCurrentIndex(index)
+            combo.setCurrentIndex(next((i for i in range(combo.count()) if combo.itemData(i) and row
+                and combo.itemData(i)['id'] == row['id']), 0))
         finally:
             combo.blockSignals(False)
 
-    @contextmanager
-    def request_directory(self, prefix):
-        """退出中仍运行的请求持有文件，完成后自行释放。"""
-        lease = _RequestFiles(prefix)
-        self._leases.append(lease)
-        try:
-            yield lease.path
-        finally:
-            self._leases.remove(lease)
-            lease.release()
+    def update_actions(self, associated, busy):
+        for name in ('save', 'preview'):
+            self.buttons[name].setEnabled(associated and not busy)
+        self.buttons['recovery'].setEnabled(self.active and not busy)
+        uploadable = bool(self.store and any(self.store.has_saved_snapshot(row) for row in self.store.images()))
+        self.buttons['upload_results'].setEnabled(uploadable and not busy)
+        self.buttons['upload_results'].setToolTip('功能尚未接入' if uploadable else '请先保存项目中的有效草稿。')
+        for name in ('create_project', 'open_project'):
+            self.buttons[name].setEnabled(not busy)
+        self.projects.setEnabled(not busy)
+        self.images.setEnabled(bool(self.project) and not busy)
+        self.buttons['manage_images'].setEnabled(bool(self.project) and not busy)
+        self.retry_button.setEnabled(not busy)
+        self.action_hint.setText('请等待当前操作完成。' if busy else
+            '请创建或打开本地项目。' if not self.project else '草稿及历史保存在项目目录；导出与本地保存分别操作。')
 
-    def call(self, operation):
-        """普通请求维持原超时；关闭界面时停止等待，线程独立完成。"""
-        progress = QtWidgets.QProgressDialog("正在访问内部项目服务…", "", 0, 0, None)
-        progress.setCancelButton(None)
-        progress.setWindowModality(Qt.ApplicationModal)
-        progress.setWindowFlags(progress.windowFlags() & ~Qt.WindowCloseButtonHint)
-        worker = _RequestThread(operation, self._leases)
-        loop = QEventLoop()
-        worker.finished.connect(loop.quit)
-        worker.finished.connect(lambda worker=worker: _release_request(worker))
-        self.closing_requested.connect(loop.quit)
-        _LIVE_REQUESTS.add(worker)
-        self._worker = worker
-        self.busy = True
-        ui = getattr(self.dialog, "_workflow_ui", None)
-        if ui:
-            ui.refresh()
+    def _recent(self):
         try:
-            try:
-                worker.start()
-                progress.show()
-                if not worker.isFinished():
-                    loop.exec_()
-            finally:
-                progress.close()
-                progress.deleteLater()
-                if not sip.isdeleted(self):
-                    self.closing_requested.disconnect(loop.quit)
-                self.busy = worker.isRunning()
-            if self._closed or self._host_closing or sip.isdeleted(self) or not worker.isFinished():
-                raise _ClosingRequest("界面已关闭，原网络请求将在后台结束。")
-            self._worker = None
-            if ui:
-                ui.schedule()
-            if worker.error:
-                raise worker.error
-            return worker.result
-        finally:
-            # 调用栈读完状态和结果后才交出所有权；退出后的后台线程仍自行释放。
-            worker._ui_waiting = False
-            if not worker.isRunning():
-                _release_request(worker)
+            return json.loads(self.settings.value('LandCoverClassification/local_projects', '[]'))
+        except (ValueError, TypeError):
+            return []
 
     def refresh(self):
-        self._check_idle()
-        client = self._client()
-        rows = self.call(lambda: client.request("GET", "/internal/projects"))
+        """最近记录只用于导航，打开及恢复不依赖这些记录。"""
         self.projects.blockSignals(True)
         try:
             self.projects.clear()
-            self.projects.addItem("请选择项目", None)
-            for row in rows:
-                self.projects.addItem(row["name"], row)
-                if self.project and row["id"] == self.project["id"]:
-                    self.project = row
+            self.projects.addItem('选择最近项目', None)
+            for row in self._recent():
+                self.projects.addItem(row['name'], row)
         finally:
             self.projects.blockSignals(False)
         self._select_row(self.projects, self.project)
-        self.label.setText("项目服务已响应，可继续操作。")
-        if self.project:
+        if self.store:
             self.refresh_images()
-        else:
-            self.label.setText("请选择项目，或创建一个新项目。")
+            self.label.setText('已读取本地项目：{}。'.format(self.project['name']))
 
     def selected_project(self):
-        if not self.project:
-            raise RuntimeError("请先在项目页创建或选择项目。")
+        if not self.store:
+            raise RuntimeError('请先创建或打开本地项目。')
         return self.project
 
     def create_project(self):
         form = QtWidgets.QDialog(self)
-        form.setWindowTitle("创建项目")
+        form.setWindowTitle('创建本地项目')
         layout = QtWidgets.QFormLayout(form)
-        name = QtWidgets.QLineEdit(form)
-        cartographer = QtWidgets.QLineEdit(form)
-        cartographer.setPlaceholderText("选填，最多 32 个字符")
-        layout.addRow("项目名称（必填）", name)
-        layout.addRow("制图者", cartographer)
-        error = QtWidgets.QLabel(form)
-        layout.addRow(error)
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel, parent=form)
-        layout.addRow(buttons)
-        payload = {}
-
-        def accept():
-            try:
-                text = name.text().strip()
-                if not text or len(text) > 200:
-                    raise ValueError("项目名称须为 1–200 个字符。")
-                payload.update(name=text, ztz=normalize_cartographer(cartographer.text()))
-            except ValueError as exc:
-                error.setText(str(exc))
-                return
-            form.accept()
-
-        buttons.accepted.connect(accept)
+        name, cartographer = QtWidgets.QLineEdit(form), QtWidgets.QLineEdit(form)
+        layout.addRow('项目名称', name)
+        layout.addRow('制图者（选填，最多 32 字符）', cartographer)
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(form.accept)
         buttons.rejected.connect(form.reject)
+        layout.addRow(buttons)
         if form.exec_() != QtWidgets.QDialog.Accepted:
             return
-        client = self._client()
-        row = self.call(lambda: client.request("POST", "/internal/projects", payload))
-        self.refresh()
-        self._select_row(self.projects, row)
-        self.select_project()
+        ztz = normalize_cartographer(cartographer.text())
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, '选择空目录创建本地项目')
+        if directory:
+            self.open_directory(directory, create=(name.text(), ztz))
+
+    def open_project(self):
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, '打开本地项目目录')
+        if directory:
+            self.open_directory(directory)
 
     def select_project(self):
         row = self.projects.currentData()
-        if self.project and row and row["id"] == self.project["id"]:
-            return
+        if row:
+            self.open_directory(row['directory'])
+
+    def open_directory(self, directory, create=None):
+        """先锁定并验证目标，失败不解除当前草稿。"""
         self._check_idle()
-        self.save(manual=False, reason='切换项目前自动保存')
-        if self.dialog._draft_session.is_active and not self.active:
-            raise RuntimeError("当前有未关联的草稿，请先导出并关闭插件，避免覆盖编辑。")
-        # 先读取目标项目；服务失败时保留旧项目和草稿。
-        rows = self.call(lambda: self._client().request(
-            "GET", "/internal/projects/{}/images".format(row["id"]))) if row else []
-        self.switching = True
+        directory = str(Path(directory).resolve())
+        if self.store and os.path.normcase(str(self.store.root)) == os.path.normcase(directory):
+            return
+        lock = QLockFile(str(Path(directory) / '.project.lock'))
+        lock.setStaleLockTime(0)
+        if not lock.tryLock(0):
+            raise RuntimeError('项目已被其他实例使用或目录不可写，未抢占项目锁。')
+        target = None
         try:
-            self.dialog._stop_ai_editing(silent=True)
-            self.dialog._discard_draft_session()
-            self.project, self.image = row, None
-            self.dialog._input_path = None
-            self.dialog._input_layer = None
-            self._set_inputs("", None)
-        finally:
-            self.switching = False
-        self._set_images(rows)
-        self._freeze_inputs(row is None)
-        self.label.setText("在输入区选择影像和可选 DEM，或选择项目中已有影像继续编辑。"
-                           if row else "请选择项目，或创建一个新项目。")
+            target = (LocalProject.create(directory, *create, lock=lock) if create is not None
+                      else LocalProject(directory, lock))
+            self.save(manual=False, reason='切换项目前自动保存')
+        except Exception:
+            target.close() if target else lock.unlock()
+            raise
+        self._detach_removed_image()
+        self.release_project()
+        self.store, self.project = target, target.project
+        self.destroyed.connect(lambda obj=None, store=target: store.close())
+        recent = [row for row in self._recent() if row.get('directory') != directory]
+        self.settings.setValue('LandCoverClassification/local_projects', json.dumps([self.project] + recent[:19], ensure_ascii=False))
+        self.refresh()
+        self._freeze_inputs(False)
+        self.label.setText('已打开本地项目：{}。请选择工作影像。'.format(self.project['name']))
 
     def _set_images(self, rows):
         self.images.blockSignals(True)
         try:
             self.images.clear()
-            self.images.addItem("选择项目影像继续编辑", None)
+            self.images.addItem('选择项目影像继续编辑', None)
             for row in rows:
-                self.images.addItem(row["name"] + ("（有草稿）" if row["draft_id"] else "（未生成成果）"), row)
+                self.images.addItem(row['name'] + ('（有草稿）' if row['recovery_id'] else '（未生成成果）'), row)
         finally:
             self.images.blockSignals(False)
         self._select_row(self.images, self.image)
 
     def refresh_images(self):
-        project = self.selected_project()
-        rows = self.call(lambda: self._client().request(
-            "GET", "/internal/projects/{}/images".format(project["id"])))
+        self.selected_project()
+        rows = self.store.images()
         self._set_images(rows)
         return rows
 
-    def _image_path(self, suffix=""):
-        return "/internal/projects/{}/images/{}{}".format(
-            self.project["id"], self.image["id"], suffix)
-
     def manage_images(self):
-        """独立列表管理关联，无需打开影像，也不切换当前编辑对象。"""
         from .history_dialogs import ImageManager
         self._show_history_window('_image_manager', ImageManager)
 
     def change_image_membership(self, row, removed):
-        """确认、保存和服务提交依次进行；结果未知时查询后再解除本地会话。"""
+        """移除前保存当前影像，仅修改工作关联。"""
         self._check_idle()
-        project = self.selected_project()
-        if row['project_id'] != project['id']:
+        if row['project_id'] != self.selected_project()['id']:
             raise ValueError('影像不属于当前项目。')
-        key = "LandCoverClassification/pending_project_publish/{}".format(project['id'])
-        if self.settings.value(key, ''):
-            raise RuntimeError('项目有待确认的发布请求，请先点击“发布项目版本”确认结果，再管理影像。')
         current = bool(self.image and self.image['id'] == row['id'])
         if removed:
-            message = ('将从项目工作列表移除“{}”。\n{}\n'
-                       '原始影像、DEM、草稿及发布历史均保留；后续发布不再包含该影像。\n'
-                       '当前对外版本不会立即变化；若全部成果移除，不能发布空版本。\n'
-                       '可从管理影像列表重新加入并接续原草稿。').format(row['name'], row['image_path'])
-            if QtWidgets.QMessageBox.question(
-                    self, '移除项目影像', message, QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes:
+            if QtWidgets.QMessageBox.question(self, '移除项目影像',
+                    '移除“{}”的工作关联？原始文件、草稿和历史均保留，可重新加入。'.format(row['name'])) != QtWidgets.QMessageBox.Yes:
                 return False
             if current:
                 self.save(manual=False, reason='移除影像前自动保存')
-                row = self.image.copy()
-        path = '/internal/projects/{}/images/{}'.format(project['id'], row['id'])
-        client = self._client()
-        try:
-            result = self.call(lambda: client.request(
-                'DELETE' if removed else 'POST', path if removed else path + '/restore',
-                {'base_draft_id': row['draft_id']} if removed else None))
-        except ProjectClientError as exc:
-            if exc.status is not None:
-                raise
-            rows = self.call(lambda: client.request(
-                'GET', '/internal/projects/{}/images?status=all'.format(project['id'])))
-            result = next((item for item in rows if item['id'] == row['id']), None)
-            if result is None or bool(result.get('removed_at')) != removed:
-                raise exc
-        if result['id'] != row['id'] or result['project_id'] != project['id'] or bool(result.get('removed_at')) != removed:
-            raise RuntimeError('影像管理响应与请求不一致，本地会话未清理，请重新读取。')
+        self.store.set_removed(row['id'], removed)
         if removed and current:
             self._detach_removed_image()
         self.refresh_images()
-        self.label.setText('影像已移除，历史仍保留；当前对外版本不变，全部移除后不能发布空版本。'
-                           if removed else '影像已重新加入，原草稿保留；选择该影像可继续编辑或使用恢复管理。')
+        self.label.setText('影像已移除，草稿和历史保留。' if removed else '影像已重新加入，沿用原编号和草稿。')
         return True
 
     def _detach_removed_image(self):
-        """只解除插件工作状态，保留用户的原始影像图层及已保存历史。"""
+        """解除工作状态，持久文件由项目独立持有。"""
         for name in ('_recovery_browser', '_attribute_browser'):
             window = getattr(self, name, None)
             if window is not None and not sip.isdeleted(window):
                 window.close()
         self.switching = True
         try:
-            dialog = self.dialog
-            dialog._stop_ai_editing(silent=True)
-            dialog._clear_drawn_roi()
-            dialog._discard_draft_session()
-            dialog._input_adapter_request_id += 1
-            dialog._input_adapter.clear()
-            dialog._input_path = dialog._input_layer = dialog._label_path = None
-            dialog._invalidate_fusion_undo()
+            d = self.dialog
+            d._stop_ai_editing(silent=True)
+            d._clear_drawn_roi()
+            d._discard_draft_session()
+            d._input_adapter_request_id += 1
+            d._input_adapter.clear()
+            d._input_path = d._input_layer = d._label_path = None
+            d._invalidate_fusion_undo()
             self.image = None
-            self._synced_generation = None
+            self._save_error = False
             self._set_inputs('', None)
-            dialog.exportRasterBtn.setEnabled(False)
-            dialog.undoFusionBtn.setEnabled(False)
+            d.exportRasterBtn.setEnabled(False)
         finally:
             self.switching = False
 
@@ -564,14 +379,13 @@ class ProjectPanel(QtWidgets.QWidget):
         self.dialog.mDemFile.setEnabled(not frozen)
 
     def _set_inputs(self, path, dem):
-        widgets = (self.dialog.fileRadio, self.dialog.layerRadio,
-                   self.dialog.inputFileWidget, self.dialog.mDemFile)
+        widgets = (self.dialog.fileRadio, self.dialog.layerRadio, self.dialog.inputFileWidget, self.dialog.mDemFile)
         for widget in widgets:
             widget.blockSignals(True)
         try:
             self.dialog.fileRadio.setChecked(True)
             self.dialog.inputFileWidget.setFilePath(path)
-            self.dialog.mDemFile.setFilePath(dem or "")
+            self.dialog.mDemFile.setFilePath(dem or '')
             self.dialog.inputFileWidget.setEnabled(True)
             self.dialog.layerCombo.setEnabled(False)
         finally:
@@ -579,136 +393,133 @@ class ProjectPanel(QtWidgets.QWidget):
                 widget.blockSignals(False)
 
     def bind_input(self, path):
-        """正常输入选择即完成登记；先保存旧景，再恢复目标影像草稿。"""
-        project = self.selected_project()
+        """同影像无操作绑定不拦截 AI 追加，真实切换仍检查忙碌状态。"""
+        self.selected_project()
         dem = self.dialog._resolve_dem_path()
         if dem is False:
-            raise RuntimeError("请选择有效的 DEM 文件。")
-        same = self.image and os.path.normcase(path) == os.path.normcase(self.image["image_path"])
-        if same and (dem or None) == self.image["dem_path"]:
-            # AI 追加只确认已有绑定，不触发登记或切换，不应拦截自身操作。
+            raise RuntimeError('请选择有效 DEM。')
+        path = os.path.normcase(os.path.realpath(path))
+        same = self.image and path == os.path.normcase(os.path.realpath(self.image['image_path']))
+        if same and (dem or None) == self.image['dem_path']:
             return
         self._check_idle()
         self.save(manual=False, reason='切换输入前自动保存')
-        row = self.call(lambda: self._client().request(
-            "POST", "/internal/projects/{}/images".format(project["id"]),
-            {"name": os.path.basename(path), "image_path": path, "dem_path": dem or None}))
+        row = self.store.register_image(path, dem, reference_grid(path))
         if same:
-            # 更新 DEM 只影响后续推理，保留当前手工编辑与已发布版本。
-            self.image["dem_path"] = row["dem_path"]
+            self.image = row
         else:
             self._activate_image(row, preserve_input=True)
         self.refresh_images()
-        if row.get('rejoined'):
-            self.label.setText('已将此前移除的影像重新加入项目，并接续原草稿。')
 
     def open_image(self):
         row = self.images.currentData()
-        if not row:
-            return
-        if self.image and row["id"] == self.image["id"]:
+        if not row or (self.image and row['id'] == self.image['id']):
             return
         self.save(manual=False, reason='切换影像前自动保存')
-        rows = self.refresh_images()
-        row = next((item for item in rows if item["id"] == row["id"]), None)
-        if row is None:
-            raise RuntimeError("项目影像已不存在。")
-        self._activate_image(row)
-        self._select_row(self.images, self.image)
+        self._activate_image(self.store.image(row['id'], writable=True))
 
     def _activate_image(self, row, preserve_input=False):
-        """恢复文件校验通过后再切换，旧草稿已经保存到服务端。"""
-        from .raster_input_adapter import inspect_with_qgis_gdal
-        inspect_with_qgis_gdal(row["image_path"])
-        if row["dem_path"] and not os.path.isfile(row["dem_path"]):
-            raise RuntimeError("当前 QGIS 无法读取项目 DEM。")
-        with self.request_directory("lcc_restore_") as directory:
-            restored = os.path.join(directory, "draft.gpkg")
-            if row["draft_id"]:
-                headers = self.call(lambda: self._client().request(
-                    "GET", "/internal/projects/{}/images/{}/draft".format(
-                        self.project["id"], row["id"]), download=restored))
-                row["draft_id"] = headers["X-Draft-ID"]
-                self.dialog._validate_draft_generation(restored)
-            self.switching = True
-            try:
-                self.dialog._stop_ai_editing(silent=True)
-                self.dialog._discard_draft_session()
-                self.image = row
-                self.dialog._input_path = None
-                if not preserve_input:
-                    self._set_inputs(row["image_path"], row["dem_path"])
-                self.dialog._initialize_working_image()
-                if self.dialog._input_path != row["image_path"]:
-                    raise RuntimeError("加载项目影像失败；已保存草稿仍在服务中。")
-                if row["draft_id"]:
-                    if not self.dialog._ensure_draft_session(row["image_path"]):
-                        raise RuntimeError("无法恢复草稿会话。")
-                    destination = self.dialog._draft_session.next_generation_path("restored")
-                    snapshot_gpkg(restored, destination)
+        """先验证输入和快照，再解除旧会话。"""
+        if not os.path.isfile(row['image_path']):
+            replacement, _ = QtWidgets.QFileDialog.getOpenFileName(self, '影像缺失，请重新定位原文件')
+            if not replacement:
+                raise RuntimeError('影像尚未重新定位，草稿仍保留。')
+            row = self.store.relocate(row['id'], replacement, reference_grid(replacement))
+        reference_grid(row['image_path'])
+        if input_fingerprint(row['image_path']) != row['fingerprint']:
+            raise ValueError('影像内容已改变，不能沿用原草稿身份。')
+        if row['dem_path'] and not os.path.isfile(row['dem_path']):
+            raise RuntimeError('DEM 路径失效，请在管理影像中更新或清除。')
+        source = self.store.snapshot(row['id'], row['recovery_id']) if row['recovery_id'] else None
+        if source:
+            from .recovery import validate_source
+            validate_source(self, source, image=row)
+        layer_input = preserve_input and self.dialog.layerRadio.isChecked()
+        self._detach_removed_image()
+        self.switching = True
+        try:
+            self.image = row
+            self._set_inputs(row['image_path'], row['dem_path'])
+            if layer_input:
+                self.dialog.fileRadio.blockSignals(True)
+                self.dialog.layerRadio.blockSignals(True)
+                try:
+                    self.dialog.layerRadio.setChecked(True)
+                    self.dialog.inputFileWidget.setEnabled(False)
+                    self.dialog.layerCombo.setEnabled(True)
+                finally:
+                    self.dialog.fileRadio.blockSignals(False)
+                    self.dialog.layerRadio.blockSignals(False)
+            self.dialog._initialize_working_image()
+            if os.path.normcase(self.dialog._input_path or '') != os.path.normcase(row['image_path']):
+                raise RuntimeError('无法加载影像，项目草稿和历史仍保留。')
+            if source:
+                if not self.dialog._ensure_draft_session(row['image_path']):
+                    raise RuntimeError('无法创建持久草稿工作目录。')
+                destination = self.dialog._draft_session.next_generation_path('opened')
+                snapshot_gpkg(source, destination)
+                self._opening_revision = row['revision']
+                try:
                     self.dialog._publish_draft_generation(destination)
-                    self.dialog.exportRasterBtn.setEnabled(True)
-            finally:
-                self.switching = False
+                finally:
+                    self._opening_revision = None
+        finally:
+            self.switching = False
+        self._select_row(self.images, self.image)
         self.dialog._suggest_output_paths()
         self._freeze_inputs(False)
-        self._synced_generation = ((row["id"], self.dialog._draft_session.generation_path)
-                                   if row["draft_id"] else None)
-        self.label.setText("当前影像：{}。切换前保存草稿；关闭时尽力保存，结果请查看提示。".format(row["name"]))
-        ui = getattr(self.dialog, "_workflow_ui", None)
-        if ui:
-            ui.schedule()
+        if not self._save_error:
+            self.label.setText('当前影像：{}；已载入最近已登记草稿。'.format(row['name']))
 
     def export_context(self):
-        """确保成果属性来自当前草稿所属的项目与影像。"""
-        if not self.active or self.image.get("project_id") != self.project["id"]:
-            raise ValueError("当前影像未关联到所选项目，无法生成成果属性。")
+        """生成或覆盖成果前核对项目、影像与草稿身份。"""
+        if not self.active or self.image['project_id'] != self.project['id']:
+            raise ValueError('当前影像未关联到所选项目。')
         session = self.dialog._draft_session
-        if (not session.is_active or os.path.normcase(os.path.realpath(session.input_path))
-                != os.path.normcase(os.path.realpath(self.image["image_path"]))):
-            raise ValueError("当前草稿与项目影像不一致，无法生成成果属性。")
-        result_context(self.image["id"], self.project.get("ztz"))
-        return {"image_id": self.image["id"], "ztz": self.project.get("ztz")}
+        if not session.is_active or os.path.normcase(os.path.realpath(session.input_path)) != os.path.normcase(os.path.realpath(self.image['image_path'])):
+            raise ValueError('当前草稿与项目影像不一致。')
+        result_context(self.image['id'], self.project.get('ztz'))
+        return {'image_id': self.image['id'], 'ztz': self.project.get('ztz')}
 
     def save(self, exiting=False, manual=True, reason='手动保存'):
-        """提交并快照当前草稿，退出专用传输不影响普通保存的超时。"""
-        if not self.active:
-            return
+        """提交、校验、保存；失败保留旧快照与当前工作文件。"""
         session = self.dialog._draft_session
-        if not session.is_active:
+        if not self.active or not session.is_active:
             return
-        if self.dialog._layer_is_usable(self.dialog._draft_layer):
-            if not self.dialog._commit_layer_if_needed(self.dialog._draft_layer):
-                raise RuntimeError("请解决草稿编辑提交失败后重试保存。")
-        if os.path.normcase(session.input_path) != os.path.normcase(self.image["image_path"]):
-            raise RuntimeError("当前草稿与项目影像不一致，保存已拒绝。")
-        if not manual and self._synced_generation == (self.image['id'], session.generation_path):
+        try:
+            self.export_context()
+            layer = self.dialog._draft_layer
+            if self.dialog._layer_is_usable(layer) and not self.dialog._commit_layer_if_needed(layer):
+                raise RuntimeError('草稿编辑提交失败，请解决后重试。')
+            from .recovery import validate_source
+            validate_source(self, session.generation_path)
+            self.image = self.store.save(self.image['id'], session.generation_path, manual, reason)
+            session.revision = self.image['revision']
+            self._save_error = False
+            self.refresh_images()
+            if not exiting:
+                self.label.setText('当前草稿已本地保存。')
+        except Exception:
+            self._save_error = True
+            raise
+
+    def record_recovery(self, reason='编辑会话'):
+        """登记失败单独显示，不能把新草稿误报为可靠保存。"""
+        session = self.dialog._draft_session
+        if not self.active or not session.is_active:
             return
-        with self.request_directory("lcc_save_") as directory:
-            snapshot = os.path.join(directory, "draft.gpkg")
-            snapshot_gpkg(session.generation_path, snapshot)
-            from urllib.parse import urlencode
-            path = self._image_path("/draft") + '?' + urlencode({
-                'save_kind': 'manual' if manual else 'automatic', 'save_reason': reason})
-            if self.image["draft_id"]:
-                path += "&base_draft_id=" + self.image["draft_id"]
-            client = self._client()
-            result = (client.request_on_exit(path, snapshot) if exiting else
-                      self.call(lambda: client.request("PUT", path, upload=snapshot)))
-        self.image["draft_id"] = result["draft_id"]
-        self._synced_generation = (self.image["id"], session.generation_path)
-        if manual:
-            from .recovery import mark_manual_saved
-            mark_manual_saved(self)
-        ui = getattr(self.dialog, "_workflow_ui", None)
-        if ui:
-            ui.schedule()
-        self.record_recovery(reason)
-        if not exiting:
-            self.label.setText("项目草稿已保存，可关闭后重新打开。")
+        try:
+            self.export_context()
+            self.image = self.store.register_generation(self.image['id'], session.generation_path, reason, self._opening_revision)
+            session.revision = self.image['revision']
+            self._save_error = False
+        except Exception as exc:
+            session.revision = None
+            self._save_error = True
+            self.label.setText('自动恢复登记失败，工作文件保留：{}'.format(session.generation_path))
+            self.exit_notice('自动恢复登记失败：{}；保留文件 {}'.format(exc, session.generation_path))
 
     def preview(self):
-        """复用非模态窗口，允许同时点选地图和检查单个滑坡。"""
         browser = getattr(self, '_attribute_browser', None)
         if browser is None or sip.isdeleted(browser) or not browser.valid():
             if browser is not None and not sip.isdeleted(browser):
@@ -721,19 +532,12 @@ class ProjectPanel(QtWidgets.QWidget):
         browser.activateWindow()
 
     def _create_result_preview(self):
-        """属性计算和地图联动由独立浏览器管理。"""
         if not self.dialog._layer_is_usable(self.dialog._draft_layer):
-            raise RuntimeError("当前没有草稿。")
+            raise RuntimeError('当前没有草稿。')
         from .attribute_browser import AttributeBrowser
         return AttributeBrowser(self)
 
-    def history(self):
-        """打开当前项目的只读版本对比窗口。"""
-        from .history_dialogs import VersionBrowser
-        self._show_history_window('_version_browser', VersionBrowser)
-
     def recovery(self):
-        """浏览当前影像的服务端快照与本地保留草稿。"""
         from .history_dialogs import RecoveryBrowser
         self._show_history_window('_recovery_browser', RecoveryBrowser)
 
@@ -748,57 +552,12 @@ class ProjectPanel(QtWidgets.QWidget):
         window.raise_()
         window.load()
 
-    def record_recovery(self, reason='编辑中断'):
-        """记录失败不得把已成功发布的 generation 误报为失败。"""
-        from .recovery import write_record
-        try:
-            write_record(self, reason=reason)
-        except Exception as exc:
-            QgsMessageLog.logMessage("本地恢复记录写入失败：{}".format(exc),
-                                     "LandCoverClassification", Qgis.Warning)
-
-    def publish(self):
-        """确认所有已有成果后一次发布，断线时保留整个项目的幂等请求。"""
-        project = self.selected_project()
-        self.save(manual=False, reason='发布前自动保存')
-        key = "LandCoverClassification/pending_project_publish/{}".format(project["id"])
-        raw = self.settings.value(key, "")
-        if raw:
-            payload = json.loads(raw)
-            if payload.pop("_service", None) != self._client().base_url:
-                raise RuntimeError("待确认发布属于另一个服务，请由管理员恢复原配置后重试。")
-        else:
-            self.refresh()
-            rows = self.refresh_images()
-            drafts = [{"image_id": row["id"], "draft_id": row["draft_id"]}
-                      for row in rows if row["draft_id"]]
-            if not drafts:
-                raise RuntimeError("项目还没有可发布的成果，请先完成推理或草稿编辑。")
-            omitted = len(rows) - len(drafts)
-            message = "将把项目内全部 {} 景成果整理为一个新版本。\n请确认已完成几何检查。".format(len(drafts))
-            if omitted:
-                message += "\n另有 {} 景尚未生成草稿，不纳入本次版本。".format(omitted)
-            if QtWidgets.QMessageBox.question(self, "发布项目版本", message) != QtWidgets.QMessageBox.Yes:
-                return
-            payload = {"drafts": drafts, "base_version": self.project["current_version"],
-                       "idempotency_key": str(uuid.uuid4()), "confirmed": True}
-            self.settings.setValue(key, json.dumps({**payload, "_service": self._client().base_url}))
-            self.settings.sync()
-        try:
-            result = self.call(lambda: self._client().request(
-                "POST", "/internal/projects/{}/publish".format(project["id"]), payload))
-        except ProjectClientError as exc:
-            if exc.status in (404, 409, 422):
-                self.settings.remove(key)
-                self.settings.sync()
-            raise
-        self.settings.remove(key)
-        self.settings.sync()
-        self.project["current_version"] = result["id"]
-        self.label.setText("项目版本已发布：{}（{} 景成果）。".format(result["id"], len(payload["drafts"])))
-        rows = self.refresh_images()
-        current = {row["id"]: row["draft_id"] for row in rows if row["draft_id"]}
-        published = {row["image_id"]: row["draft_id"] for row in payload["drafts"]}
-        if current != published:
-            self.label.setText("已确认上次版本发布成功；项目还有后续编辑，再次点击发布可生成新版本。")
-        return result
+    def upload_results(self):
+        """预留独立入口，不保存、不打包、不请求网络。"""
+        self.selected_project()
+        saved = [row for row in self.store.images() if row['draft_id']]
+        if not saved:
+            raise ValueError('项目没有有效已保存草稿。')
+        for row in saved:
+            self.store.snapshot(row['id'], row['draft_id'])
+        self.label.setText('成果上传功能尚未接入，当前成果已保存在本地，可通过导出功能生成文件。')

@@ -63,6 +63,17 @@ def resolve_source_path(path):
             ", ".join(sorted(matches))))
 
 
+def same_source_path(left, right):
+    """按宿主文件系统语义比较源影像，避免大小写或分隔符差异被当作切换。"""
+    if not left or not right:
+        return False
+    try:
+        return (os.path.normcase(os.path.realpath(resolve_source_path(left)))
+                == os.path.normcase(os.path.realpath(resolve_source_path(right))))
+    except (RasterInputError, OSError, ValueError):
+        return False
+
+
 def _dataset_metadata(dataset, gdal_module):
     driver = dataset.GetDriver()
     bands = []
