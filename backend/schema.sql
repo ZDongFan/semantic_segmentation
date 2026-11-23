@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS lcc_images (
     draft_id uuid, UNIQUE(project_id, image_path)
 );
 -- 显式初始化也用于已有数据库的无损升级，日常启动不执行。
-ALTER TABLE  ADD COLUMN IF NOT EXISTS removed_at timestamptz;
+ALTER TABLE lcc_images ADD COLUMN IF NOT EXISTS removed_at timestamptz;
 CREATE TABLE IF NOT EXISTS lcc_drafts (
     id uuid PRIMARY KEY, image_id uuid NOT NULL REFERENCES lcc_images(id),
     file_path text NOT NULL, sha256 text NOT NULL,
