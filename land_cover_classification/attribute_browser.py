@@ -5,11 +5,10 @@ from itertools import islice
 
 from qgis.PyQt import QtWidgets, sip
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSlot
-from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-                       QgsDistanceArea, QgsExpression, QgsFeatureRequest, QgsProject)
-from qgis.gui import QgsMapToolIdentifyFeature
+from qgis.core import QgsExpression, QgsFeatureRequest
 
-from .result_attributes import RESULT_FIELDS, build_result_attributes
+from .result_attributes import RESULT_FIELDS
+from .feature_attributes import COMMON_FIELDS, FeatureAttributes, format_attribute
 
 
 class AttributeBrowser(QtWidgets.QDialog):
@@ -29,19 +28,14 @@ class AttributeBrowser(QtWidgets.QDialog):
         self.offset = 0
         self.fids = []
         self._syncing = False
-        self.tool = None
-        self.previous_tool = None
         self.setWindowTitle("当前滑坡列表 · 只读")
         self.setModal(False)
         layout = QtWidgets.QVBoxLayout(self)
-        hint = QtWidgets.QLabel("地图点选可查看单个滑坡；单击表格高亮，双击定位。面积按 WGS84 椭球计算。\n"
+        hint = QtWidgets.QLabel("单击表格高亮，双击定位；地图点选请使用项目页的“查看单个滑坡属性”。\n"
                                 "空白表示未赋值；字段不写回草稿，发布和导出仍按各自规则计算。")
         hint.setWordWrap(True)
         layout.addWidget(hint)
         controls = QtWidgets.QHBoxLayout()
-        self.pick = QtWidgets.QPushButton("地图点选滑坡")
-        self.pick.clicked.connect(self.start_pick)
-        controls.addWidget(self.pick)
         self.selected = QtWidgets.QCheckBox("仅看选中滑坡")
         self.selected.toggled.connect(self.reset_page)
         controls.addWidget(self.selected)
@@ -86,7 +80,7 @@ class AttributeBrowser(QtWidgets.QDialog):
         layout.addLayout(footer)
         self.status = QtWidgets.QLabel()
         layout.addWidget(self.status)
-        self.common_fields = ("class_name", "mj", "perimeter_m", "center_lon", "center_lat", "ztz", "source_id")
+        self.common_fields = tuple(name for name, _ in COMMON_FIELDS)
         names = [name for name, _ in self.columns]
         for pos, name in enumerate(self.common_fields):
             header = self.table.horizontalHeader()
@@ -115,7 +109,6 @@ class AttributeBrowser(QtWidgets.QDialog):
 
     @pyqtSlot()
     def invalidate(self):
-        self.stop_pick()
         self.timer.stop()
         self.table.setRowCount(0)
         self.fids = []
@@ -159,10 +152,7 @@ class AttributeBrowser(QtWidgets.QDialog):
                 features = list(islice(iterator, self.offset, self.offset + self.PAGE_SIZE + 1))
             finally:
                 iterator.close()
-            distance = QgsDistanceArea()
-            distance.setSourceCrs(self.layer.crs(), QgsProject.instance().transformContext())
-            distance.setEllipsoid('WGS84')
-            converter = QgsCoordinateTransform(self.layer.crs(), QgsCoordinateReferenceSystem(4326), QgsProject.instance())
+            attributes = FeatureAttributes(self.layer, self.context)
             self._syncing = True
             self.table.setRowCount(0)
             self.fids = []
@@ -170,18 +160,13 @@ class AttributeBrowser(QtWidgets.QDialog):
                 geometry = feature.geometry()
                 if geometry.isEmpty():
                     continue
-                center = converter.transform(geometry.centroid().asPoint())
-                values = build_result_attributes(**self.context, mj=distance.measureArea(geometry))
-                values.update(feature_id=str(feature['feature_uuid']),
-                              **{name: feature[name] for name in ('class_id', 'class_name', 'source_id')},
-                              perimeter_m=distance.measurePerimeter(geometry), center_lon=center.x(), center_lat=center.y())
+                values = attributes.values(feature)
                 row = self.table.rowCount()
                 self.table.insertRow(row)
                 self.fids.append(feature.id())
                 for col, (name, _) in enumerate(self.columns):
                     value = values[name]
-                    text = '' if value is None else ('{:.3f}'.format(value) if name in ('mj', 'perimeter_m')
-                            else '{:.7f}'.format(value) if name in ('center_lon', 'center_lat') else str(value))
+                    text = format_attribute(name, value)
                     item = QtWidgets.QTableWidgetItem(text)
                     item.setData(Qt.UserRole, value)
                     item.setToolTip('未赋值' if value is None else str(value))
@@ -231,46 +216,9 @@ class AttributeBrowser(QtWidgets.QDialog):
             finally:
                 self._syncing = False
 
-    @pyqtSlot()
-    def start_pick(self):
-        if not self.valid() or self.dialog._workflow_ui.busy():
-            self.status.setText("请等待当前操作完成后点选。")
-            return
-        canvas = self.dialog.iface.mapCanvas()
-        if self.tool is None:
-            self.tool = QgsMapToolIdentifyFeature(canvas, self.layer)
-            self.tool.featureIdentified.connect(self.picked)
-        if canvas.mapTool() is not self.tool:
-            self.previous_tool = canvas.mapTool()
-        canvas.setMapTool(self.tool)
-        self.status.setText("请在地图上点击滑坡；关闭窗口后恢复之前的地图工具。")
-
-    def picked(self, feature):
-        if not self.valid():
-            return
-        self._syncing = True
-        self.layer.selectByIds([feature.id()])
-        self._syncing = False
-        self.selected.setChecked(True)
-        self.reset_page()
-        self.raise_()
-
-    def stop_pick(self):
-        canvas = self.dialog.iface.mapCanvas()
-        if self.tool and canvas.mapTool() is self.tool:
-            if self.previous_tool and not sip.isdeleted(self.previous_tool):
-                canvas.setMapTool(self.previous_tool)
-            else:
-                canvas.unsetMapTool(self.tool)
-
     def closeEvent(self, event):
-        self.stop_pick()
         self.timer.stop()
         super().closeEvent(event)
-
-    def done(self, result):
-        self.stop_pick()
-        super().done(result)
 
     def show_fields(self, index):
         for col, (name, _) in enumerate(self.columns):

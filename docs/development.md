@@ -14,7 +14,7 @@
 | 生产推理 | [pytorch_inference_runner.py](../land_cover_classification/pytorch_inference_runner.py) → [pytorch_inference_core.py](../land_cover_classification/pytorch_inference_core.py) 的 `run_inference()` → [pytorch_streaming.py](../land_cover_classification/pytorch_streaming.py) |
 | 草稿与导出 | [draft_session.py](../land_cover_classification/draft_session.py)、[ai_edit_controller.py](../land_cover_classification/ai_edit_controller.py)、[export_service.py](../land_cover_classification/export_service.py) |
 | 工作区状态 | [workflow_ui.py](../land_cover_classification/workflow_ui.py)：推导按钮条件、同步摘要和显示控制 |
-| 地图属性 | [attribute_browser.py](../land_cover_classification/attribute_browser.py)：非模态只读窗口、单个滑坡点选、双向选择、分页 |
+| 地图属性 | [attribute_browser.py](../land_cover_classification/attribute_browser.py)：非模态列表、双向选择与分页；[feature_inspector.py](../land_cover_classification/feature_inspector.py)：独立地图点选与非模态属性浮窗；[feature_attributes.py](../land_cover_classification/feature_attributes.py)：共享属性计算 |
 | 项目及历史窗口 | [project_panel.py](../land_cover_classification/project_panel.py)、[history_dialogs.py](../land_cover_classification/history_dialogs.py)：本地项目、影像管理和恢复入口 |
 | 本地恢复 | [recovery.py](../land_cover_classification/recovery.py)：身份记录、候选校验、恢复前备份和 generation 切换 |
 | 本地存储 | [local_project.py](../land_cover_classification/local_project.py)：SQLite 元数据、不可变快照及已登记引用 |

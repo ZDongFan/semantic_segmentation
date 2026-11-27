@@ -2979,6 +2979,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
     def keyPressEvent(self, event):
         """Escape 也走关闭保存路径，避免 QDialog 默认 reject 绕过项目持久化。"""
         if event.key() == Qt.Key_Escape and getattr(self, "_project_panel", None):
+            ui = getattr(self, "_workflow_ui", None)
+            if ui and ui.inspector.isVisible():
+                ui.inspector.close()
+                event.accept()
+                return
             self.close()
             event.accept()
             return

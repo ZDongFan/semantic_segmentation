@@ -161,6 +161,9 @@ class WorkflowUi(QObject):
             d.mainTabWidget.insertTab(index, scroll, title)
             tab.setProperty("workflow_scroll", scroll)
 
+        from .feature_inspector import FeatureInspector
+        self.inspector = FeatureInspector(d._project_panel)
+
     @pyqtSlot()
     def schedule(self, *args):
         """由 Qt 管理外部信号的接收者寿命，销毁后不再访问定时器。"""
@@ -278,6 +281,7 @@ class WorkflowUi(QObject):
             self.edit_hint.setText("原生编辑模式：{}。使用 QGIS 工具修改边界，提交后写入本地草稿。".format(
                 "已开启" if layer.isEditable() else "未开启"))
         p.update_actions(associated, busy)
+        self.inspector.sync_context(associated, busy)
         defaults = getattr(d, "_parameter_defaults", None)
         custom = bool(defaults and defaults != (d.thresholdSlider.value(), d.minAreaSpinBox.value()))
         self.parameter_hint.setText("本次使用自定义参数；不会修改模型文件。" if custom else "使用当前模型默认参数。")

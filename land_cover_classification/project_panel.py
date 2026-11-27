@@ -70,11 +70,14 @@ class ProjectPanel(QtWidgets.QWidget):
         layout.addLayout(form)
         for title, fn in [('新建项目', self.create_project),
                           ('保存当前草稿', self.save), ('预览当前滑坡列表', self.preview),
+                          ('查看单个滑坡属性', self.inspect_feature),
                           ('恢复管理', self.recovery), ('上传成果', self.upload_results)]:
             button = QtWidgets.QPushButton(title)
             button.clicked.connect(lambda checked=False, action=fn: self.invoke(action))
             layout.addWidget(button)
             self.buttons[fn.__name__] = button
+        self.buttons['inspect_feature'].setCheckable(True)
+        self.buttons['inspect_feature'].setObjectName('inspectSingleLandslide')
         self.action_hint = QtWidgets.QLabel()
         self.action_hint.setWordWrap(True)
         layout.addWidget(self.action_hint)
@@ -214,7 +217,7 @@ class ProjectPanel(QtWidgets.QWidget):
             combo.blockSignals(False)
 
     def update_actions(self, associated, busy):
-        for name in ('save', 'preview'):
+        for name in ('save', 'preview', 'inspect_feature'):
             self.buttons[name].setEnabled(associated and not busy)
         self.buttons['recovery'].setEnabled(self.active and not busy)
         uploadable = bool(self.store and any(self.store.has_saved_snapshot(row) for row in self.store.images()))
@@ -521,6 +524,10 @@ class ProjectPanel(QtWidgets.QWidget):
             self._save_error = True
             self.label.setText('自动恢复登记失败，工作文件保留：{}'.format(session.generation_path))
             self.exit_notice('自动恢复登记失败：{}；保留文件 {}'.format(exc, session.generation_path))
+
+    def inspect_feature(self):
+        """独立启用地图点选，在非模态浮窗展示单个滑坡属性。"""
+        self.dialog._workflow_ui.inspector.start_pick()
 
     def preview(self):
         browser = getattr(self, '_attribute_browser', None)
