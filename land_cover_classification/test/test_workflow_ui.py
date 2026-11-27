@@ -134,21 +134,26 @@ class WorkflowUiTest(unittest.TestCase):
         d._workflow_ui.refresh()
         self.assertFalse(d.undoFusionBtn.isEnabled())
 
-    def test_display_controls_survive_generation_publish(self):
+    def test_default_draft_display_survives_generation_publish(self):
         self.add_feature()
         d = self.dialog
-        ui = d._workflow_ui
-        ui.display.setCurrentIndex(1)
-        ui.opacity.setValue(45)
-        self.assertAlmostEqual(d._draft_layer.opacity(), 0.45)
-        ui.display.setCurrentIndex(2)
         node = QgsProject.instance().layerTreeRoot().findLayer(d._draft_layer.id())
-        self.assertFalse(node.itemVisibilityChecked())
-        d._publish_draft_generation(d._draft_session.generation_path)
-        self.assertAlmostEqual(d._draft_layer.opacity(), 0.45)
-        self.assertFalse(node.itemVisibilityChecked())
-        ui.display.setCurrentIndex(0)
         self.assertTrue(node.itemVisibilityChecked())
+        self.assertAlmostEqual(d._draft_layer.opacity(), 1.0)
+        d._publish_draft_generation(d._draft_session.generation_path)
+        self.assertTrue(node.itemVisibilityChecked())
+        self.assertAlmostEqual(d._draft_layer.opacity(), 1.0)
+
+    def test_input_and_model_details_stay_expanded_after_state_changes(self):
+        d = self.dialog
+        for busy in (False, True, False):
+            self.panel.busy = busy
+            d._workflow_ui.refresh()
+            for widget in (d.inputGroup, d.modelRootLabel, d.modelRootEdit,
+                           d.browseModelRootBtn, d.refreshModelsBtn, d.modelStatusLabel):
+                self.assertFalse(widget.isHidden())
+            self.assertEqual(d.inputGroup.isEnabled(), not busy)
+            self.assertEqual(d.modelGroup.isEnabled(), not busy)
 
     def test_common_fields_keep_full_values_and_headers(self):
         self.add_feature()
@@ -159,7 +164,14 @@ class WorkflowUiTest(unittest.TestCase):
             self.assertEqual(table.columnCount(), 24)
             visible = [table.horizontalHeaderItem(i).data(Qt.UserRole)
                        for i in range(table.columnCount()) if not table.isColumnHidden(i)]
-            self.assertEqual(set(visible), {"class_name", "mj", "perimeter_m", "ztz", "source_id"})
+            self.assertEqual(set(visible), {"class_name", "mj", "perimeter_m", "center_lon", "center_lat", "ztz", "source_id"})
+            names = [table.horizontalHeaderItem(i).data(Qt.UserRole) for i in range(table.columnCount())]
+            longitude = table.item(0, names.index("center_lon"))
+            latitude = table.item(0, names.index("center_lat"))
+            self.assertAlmostEqual(longitude.data(Qt.UserRole), 117.0002, places=3)
+            self.assertAlmostEqual(latitude.data(Qt.UserRole), 27.1226, places=3)
+            self.assertEqual(longitude.text(), '{:.7f}'.format(longitude.data(Qt.UserRole)))
+            self.assertEqual(latitude.text(), '{:.7f}'.format(latitude.data(Qt.UserRole)))
             combo.setCurrentIndex(1)
             self.assertFalse(any(table.isColumnHidden(i) for i in range(24)))
         finally:

@@ -8,7 +8,6 @@ from inspect import signature
 from qgis.PyQt import QtWidgets, sip
 from qgis.PyQt.QtCore import QObject, QTimer, Qt, QUrl, pyqtSlot
 from qgis.PyQt.QtGui import QDesktopServices
-from qgis.core import QgsProject
 
 from . import pytorch_deps_check
 from .inference_controller import BundleContractError, landslide_class_id
@@ -48,7 +47,6 @@ class WorkflowUi(QObject):
         self.image_key = None
         self.last_export = None
         self.layer_id = None
-        self.base_renderer = None
         self._build()
         for signal in (d.mainTabWidget.currentChanged,
                        d.modelCombo.currentIndexChanged,
@@ -72,14 +70,11 @@ class WorkflowUi(QObject):
 
     def _build(self):
         d = self.dialog
-        summary = QtWidgets.QGroupBox("当前工作", d)
+        summary = QtWidgets.QGroupBox("当前项目", d)
         layout = QtWidgets.QVBoxLayout(summary)
         self.summary = self._label()
         layout.addWidget(self.summary)
-        self.input_toggle = QtWidgets.QPushButton("更换影像／查看详情", summary)
-        self.input_toggle.setCheckable(True)
-        self.input_toggle.toggled.connect(d.inputGroup.setVisible)
-        layout.addWidget(self.input_toggle)
+        d.inputGroup.show()
         d.rootLayout.insertWidget(0, summary)
 
         self.scope = QtWidgets.QComboBox(d)
@@ -111,12 +106,9 @@ class WorkflowUi(QObject):
         self.reset_parameters = QtWidgets.QPushButton("恢复当前模型默认参数", d)
         self.reset_parameters.clicked.connect(d._on_model_changed)
         d.modelLayout.addWidget(self.reset_parameters)
-        self.model_details = QtWidgets.QPushButton("模型管理与详情", d)
-        self.model_details.setCheckable(True)
-        d.modelLayout.addWidget(self.model_details)
-        self.model_details.toggled.connect(self._show_model_details)
-        self.model_details.setToolTip("展开模型目录、刷新入口与模型扫描结果")
-        self._show_model_details(False)
+        for widget in (d.modelRootLabel, d.modelRootEdit, d.browseModelRootBtn,
+                       d.refreshModelsBtn, d.modelStatusLabel):
+            widget.show()
 
         draft = QtWidgets.QGroupBox("当前草稿", d.draftTab)
         grid = QtWidgets.QGridLayout(draft)
@@ -124,23 +116,12 @@ class WorkflowUi(QObject):
         grid.addWidget(self.draft_summary, 0, 0, 1, 2)
         self.attributes = QtWidgets.QPushButton("查看属性", draft)
         self.attributes.clicked.connect(lambda: d._project_panel.invoke(d._project_panel.preview))
-        self.locate = QtWidgets.QPushButton("定位选中对象", draft)
+        self.locate = QtWidgets.QPushButton("放大当前选中滑坡", draft)
         self.locate.clicked.connect(self._locate)
         grid.addWidget(self.attributes, 1, 0)
         grid.addWidget(self.locate, 1, 1)
-        self.display = QtWidgets.QComboBox(draft)
-        self.display.addItems(["填充＋轮廓", "仅轮廓", "隐藏草稿"])
-        self.display.currentIndexChanged.connect(self._apply_display)
-        grid.addWidget(self.display, 2, 0, 1, 2)
-        self.opacity = QtWidgets.QSlider(Qt.Horizontal, draft)
-        self.opacity.setRange(0, 100)
-        self.opacity.setValue(100)
-        self.opacity.valueChanged.connect(self._apply_display)
-        self.opacity_label = QtWidgets.QLabel("不透明度 100%", draft)
-        grid.addWidget(self.opacity_label, 3, 0)
-        grid.addWidget(self.opacity, 3, 1)
         self.edit_hint = self._label("使用 QGIS 原生编辑工具修改草稿边界；提交后写入本地草稿。")
-        grid.addWidget(self.edit_hint, 4, 0, 1, 2)
+        grid.addWidget(self.edit_hint, 2, 0, 1, 2)
         d.draftLayout.insertWidget(0, draft)
         self.ai_hint = self._label()
         # 窄侧栏按两列布局，长中文按钮不再挤在同一行。
@@ -179,12 +160,6 @@ class WorkflowUi(QObject):
             scroll.setWidget(tab)
             d.mainTabWidget.insertTab(index, scroll, title)
             tab.setProperty("workflow_scroll", scroll)
-
-    def _show_model_details(self, visible):
-        d = self.dialog
-        for widget in (d.modelRootLabel, d.modelRootEdit, d.browseModelRootBtn,
-                       d.refreshModelsBtn, d.modelStatusLabel):
-            widget.setVisible(visible)
 
     @pyqtSlot()
     def schedule(self, *args):
@@ -233,16 +208,11 @@ class WorkflowUi(QObject):
         image_key = ((p.project or {}).get("id"), (p.image or {}).get("id"), path)
         if image_key != self.image_key:
             self.image_key = image_key
-            self.input_toggle.setChecked(not image_ready)
-            d.inputGroup.setVisible(not image_ready)
             d.statusLabel.setText("尚未开始推理。")
             d.exportStatusLabel.setText("从当前影像草稿导出成果。")
             self.last_export = None
-        if not image_ready:
-            d.inputGroup.show()
-        self.input_toggle.setEnabled(bool(p.project) and not busy)
+        d.inputGroup.show()
         d.inputGroup.setEnabled(bool(p.project) and not busy)
-        self.input_toggle.setText("收起输入详情" if self.input_toggle.isChecked() else "更换影像／查看详情")
         self.draft_summary.setText("当前草稿：{} 个要素 · {}".format(count, state) if draft else "当前没有草稿，可直接启动 AI 编辑或模型推理。")
         self.export_summary.setText("导出对象：{}\n{}".format(image_name, self.draft_summary.text()))
 
@@ -304,8 +274,6 @@ class WorkflowUi(QObject):
             "可直接启动 AI 编辑，无需先运行模型推理。")
         self.attributes.setEnabled(associated and not busy)
         self.locate.setEnabled(draft and layer.selectedFeatureCount() > 0)
-        self.display.setEnabled(draft)
-        self.opacity.setEnabled(draft)
         if draft:
             self.edit_hint.setText("原生编辑模式：{}。使用 QGIS 工具修改边界，提交后写入本地草稿。".format(
                 "已开启" if layer.isEditable() else "未开启"))
@@ -326,36 +294,13 @@ class WorkflowUi(QObject):
         self.schedule()
 
     def bind_layer(self, layer):
-        """换代后重新记录样式；选择和编辑变化驱动摘要刷新。"""
+        """选择和编辑变化驱动摘要刷新，样式沿用草稿图层设置。"""
         if self.layer_id != layer.id():
             self.layer_id = layer.id()
             layer.selectionChanged.connect(self.schedule)
             layer.layerModified.connect(self.schedule)
             layer.editingStarted.connect(self.schedule)
             layer.editingStopped.connect(self.schedule)
-        self.base_renderer = layer.renderer().clone() if layer.renderer() else None
-        self._apply_display()
-
-    def _apply_display(self, *args):
-        d = self.dialog
-        layer = d._draft_layer
-        if not d._layer_is_usable(layer):
-            return
-        node = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
-        if node:
-            node.setItemVisibilityChecked(self.display.currentIndex() != 2)
-        if self.base_renderer:
-            renderer = self.base_renderer.clone()
-            if self.display.currentIndex() == 1:
-                from qgis.core import QgsRenderContext
-                for symbol in renderer.symbols(QgsRenderContext()):
-                    for part in symbol.symbolLayers():
-                        if hasattr(part, "setBrushStyle"):
-                            part.setBrushStyle(Qt.NoBrush)
-            layer.setRenderer(renderer)
-        layer.setOpacity(self.opacity.value() / 100.0)
-        self.opacity_label.setText("不透明度 {}%".format(self.opacity.value()))
-        layer.triggerRepaint()
 
     def _locate(self):
         layer = self.dialog._draft_layer

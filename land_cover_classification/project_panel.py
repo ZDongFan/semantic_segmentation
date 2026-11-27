@@ -61,7 +61,7 @@ class ProjectPanel(QtWidgets.QWidget):
         form.addRow('选择项目', project_row)
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.images, 1)
-        manage = QtWidgets.QPushButton('管理影像…')
+        manage = QtWidgets.QPushButton('管理影像')
         manage.setObjectName('manageProjectImages')
         manage.clicked.connect(lambda: self.invoke(self.manage_images))
         self.buttons['manage_images'] = manage
@@ -69,7 +69,7 @@ class ProjectPanel(QtWidgets.QWidget):
         form.addRow('项目影像', row)
         layout.addLayout(form)
         for title, fn in [('新建项目', self.create_project),
-                          ('保存当前草稿', self.save), ('预览当前成果属性', self.preview),
+                          ('保存当前草稿', self.save), ('预览当前滑坡列表', self.preview),
                           ('恢复管理', self.recovery), ('上传成果', self.upload_results)]:
             button = QtWidgets.QPushButton(title)
             button.clicked.connect(lambda checked=False, action=fn: self.invoke(action))
@@ -297,6 +297,8 @@ class ProjectPanel(QtWidgets.QWidget):
         try:
             target = (LocalProject.create(directory, *create, lock=lock) if create is not None
                       else LocalProject(directory, lock))
+            output_directory = target.root / 'output'
+            output_directory.mkdir(exist_ok=True)
             self.save(manual=False, reason='切换项目前自动保存')
         except Exception:
             target.close() if target else lock.unlock()
@@ -304,6 +306,7 @@ class ProjectPanel(QtWidgets.QWidget):
         self._detach_removed_image()
         self.release_project()
         self.store, self.project = target, target.project
+        self.dialog.outputDirWidget.setFilePath(str(output_directory))
         self.destroyed.connect(lambda obj=None, store=target: store.close())
         recent = [row for row in self._recent() if row.get('directory') != directory]
         self.settings.setValue('LandCoverClassification/local_projects', json.dumps([self.project] + recent[:19], ensure_ascii=False))

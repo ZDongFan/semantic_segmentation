@@ -31,7 +31,7 @@ class AttributeBrowser(QtWidgets.QDialog):
         self._syncing = False
         self.tool = None
         self.previous_tool = None
-        self.setWindowTitle("滑坡属性 · 只读")
+        self.setWindowTitle("当前滑坡列表 · 只读")
         self.setModal(False)
         layout = QtWidgets.QVBoxLayout(self)
         hint = QtWidgets.QLabel("地图点选可查看单个滑坡；单击表格高亮，双击定位。面积按 WGS84 椭球计算。\n"
@@ -86,9 +86,9 @@ class AttributeBrowser(QtWidgets.QDialog):
         layout.addLayout(footer)
         self.status = QtWidgets.QLabel()
         layout.addWidget(self.status)
-        common = ["class_name", "mj", "perimeter_m", "ztz", "source_id"]
+        self.common_fields = ("class_name", "mj", "perimeter_m", "center_lon", "center_lat", "ztz", "source_id")
         names = [name for name, _ in self.columns]
-        for pos, name in enumerate(common):
+        for pos, name in enumerate(self.common_fields):
             header = self.table.horizontalHeader()
             header.moveSection(header.visualIndex(names.index(name)), pos)
         self.show_fields(0)
@@ -273,9 +273,8 @@ class AttributeBrowser(QtWidgets.QDialog):
         super().done(result)
 
     def show_fields(self, index):
-        common = {'class_name', 'mj', 'perimeter_m', 'ztz', 'source_id'}
         for col, (name, _) in enumerate(self.columns):
-            self.table.setColumnHidden(col, index == 0 and name not in common)
+            self.table.setColumnHidden(col, index == 0 and name not in self.common_fields)
 
     @pyqtSlot()
     def locate(self):

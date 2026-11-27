@@ -141,6 +141,45 @@ class ProjectWorkflowTest(unittest.TestCase):
         self.assertEqual(self.project['directory'], directory)
         self.assertTrue(self.panel.is_saved)
 
+    def test_project_output_default_and_custom_directory(self):
+        expected = Path(self.project['directory']) / 'output'
+        self.assertTrue(expected.is_dir())
+        self.assertEqual(Path(self.dialog.outputDirWidget.filePath()), expected)
+        custom = str(Path(self.root) / 'custom_exports')
+        self.dialog.outputDirWidget.setFilePath(custom)
+        self.dialog._suggest_output_paths()
+        self.assertEqual(self.dialog.outputDirWidget.filePath(), custom)
+        self.dialog.outputDirWidget.setFilePath('')
+        self.dialog._suggest_output_paths()
+        self.assertEqual(Path(self.dialog.outputDirWidget.filePath()), expected)
+
+    def test_switching_projects_resets_export_directory(self):
+        other = Path(self.root) / '另一个项目'
+        other.mkdir()
+        self.panel.open_directory(str(other), create=('另一个项目', None))
+        expected = other / 'output'
+        self.assertTrue(expected.is_dir())
+        self.assertEqual(Path(self.dialog.outputDirWidget.filePath()), expected)
+        self.panel.open_directory(self.project['directory'])
+        self.assertEqual(Path(self.dialog.outputDirWidget.filePath()), Path(self.project['directory']) / 'output')
+
+    def test_invalid_output_directory_keeps_current_project_and_draft(self):
+        from land_cover_classification.local_project import LocalProject
+        self.add_feature()
+        generation = self.dialog._draft_session.generation_path
+        current = self.panel.store
+        output = self.dialog.outputDirWidget.filePath()
+        other = Path(self.root) / '无法导出项目'
+        other.mkdir()
+        target = LocalProject.create(str(other), '无法导出项目', None)
+        target.close()
+        (other / 'output').write_text('已有同名文件', encoding='utf-8')
+        with self.assertRaises(OSError):
+            self.panel.open_directory(str(other))
+        self.assertIs(self.panel.store, current)
+        self.assertEqual(self.dialog._draft_session.generation_path, generation)
+        self.assertEqual(self.dialog.outputDirWidget.filePath(), output)
+
     def test_edit_invalidates_save_and_automatic_recovers(self):
         self.add_feature()
         self.panel.save()

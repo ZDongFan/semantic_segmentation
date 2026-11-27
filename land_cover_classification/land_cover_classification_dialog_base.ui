@@ -448,7 +448,7 @@
              <bool>false</bool>
             </property>
             <property name="text">
-             <string>添加到滑坡草稿 · E</string>
+             <string>添加到滑坡草稿(快捷键E)</string>
             </property>
            </widget>
           </item>

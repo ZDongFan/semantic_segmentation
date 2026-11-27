@@ -2196,8 +2196,11 @@ class LandCoverClassificationDialog(QtWidgets.QDialog, FORM_CLASS):
         src = self._resolve_input_path()
         if not src or not os.path.exists(src):
             return
-        out_dir = os.path.dirname(src)
+        panel = getattr(self, "_project_panel", None)
+        out_dir = (os.path.join(panel.project['directory'], "output")
+                   if panel and panel.project else os.path.dirname(src))
         if out_dir and not self.outputDirWidget.filePath().strip():
+            os.makedirs(out_dir, exist_ok=True)
             self.outputDirWidget.setFilePath(out_dir)
         self.outputFileWidget.setFilePath(self._vector_output_path())
         self.rasterFileWidget.setFilePath(self._raster_output_path())
